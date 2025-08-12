@@ -1,0 +1,53 @@
+# Pre-Coding Essentials (Component: __________, Version/FormulaID: __________)
+
+## 1) Goal & Success
+- Problem this component solves (1–2 lines):
+- Success criteria (determinism, offline, correctness, perf bounds):
+
+## 2) Scope
+- In scope:
+- Out of scope:
+
+## 3) Inputs → Outputs (with schemas/IDs)
+- Inputs (paths/artifacts + schema): 
+  - ...
+- Outputs (artifacts + schema + ID rules e.g., RES:/RUN:):
+  - ...
+
+## 4) Entities/Tables (minimal)
+| Name           | Primary Key | Key Fields (type) | Schema file |
+|----------------|-------------|-------------------|-------------|
+|                |             |                   |             |
+
+## 5) Variables (only ones used here)
+| Code         | Type | Range/Units | Default | Used in step(s) | Notes |
+|--------------|------|-------------|---------|------------------|-------|
+| VM-VAR-____  |      |             |         |                  |       |
+
+## 6) Functions (signatures only)
+- `fn __________(args) -> Output`  — purpose (1 line), determinism note (ordering/rounding/RNG?)
+- `fn __________(args) -> Output`  — …
+
+## 7) Algorithm Outline (bullet steps)
+1) …
+2) …
+3) …
+
+## 8) State Flow (very short)
+- Steps executed (e.g., load → validate → tabulate → allocate → result → run_record)
+- Stop/continue rules (what halts the flow?)
+
+## 9) Determinism & Numeric Rules
+- Ordering keys:
+- Number type & rounding (where allowed):
+- Tie policy (pure order vs RNG; if RNG, seed recorded where?):
+- Hash inputs for IDs (exact bytes covered):
+
+## 10) Edge Cases & Failure Policy
+- Edge cases to handle (zero turnout, duplicates, overhang, empty options, …):
+- Failure behavior (error codes/messages):
+
+## 11) Test Checklist (must pass)
+- Fixtures used:
+- Acceptance checks (seat totals, thresholds, hashes):
+- Determinism check (repeat run → identical RES/RUN):

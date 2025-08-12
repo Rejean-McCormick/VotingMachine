@@ -1,0 +1,178 @@
+
+1. Cargo.toml — 30–70 LOC
+#
+2. rust-toolchain.toml — 2–5 LOC
+#
+3. .cargo/config.toml — 10–25 LOC
+#
+4. Makefile — 40–80 LOC
+#
+5. .gitignore — 25–60 LOC
+#
+6. .gitattributes — 4–12 LOC
+#
+7. .editorconfig — 8–20 LOC
+#
+8. .pre-commit-config.yaml — 20–60 LOC
+#
+9. README.md — 150–350 lines (≈1.5–3k words)
+#
+10. LICENSE — 200–350 lines
+#
+11. CONTRIBUTING.md — 50–150 lines
+#
+12. SECURITY.md — 15–40 lines
+#
+13. schemas/division\_registry.schema.json — 120–250 lines
+#
+14. schemas/ballots.schema.json — 150–300 lines
+#
+15. schemas/ballot\_tally.schema.json — 120–220 lines
+#
+16. schemas/parameter\_set.schema.json — 120–240 lines
+#
+17. schemas/manifest.schema.json — 80–160 lines
+#
+18. schemas/result.schema.json — 160–320 lines
+#
+19. schemas/run\_record.schema.json — 120–240 lines
+#
+20. schemas/frontier\_map.schema.json — 120–240 lines
+#
+21. crates/vm\_core/Cargo.toml — 10–30 LOC
+#
+22. crates/vm\_core/src/lib.rs — 60–120 LOC
+#
+23. crates/vm\_core/src/ids.rs — 200–400 LOC
+#
+24. crates/vm\_core/src/entities.rs — 250–500 LOC
+#
+25. crates/vm\_core/src/variables.rs — 300–650 LOC
+#
+26. crates/vm\_core/src/determinism.rs — 120–260 LOC
+#
+27. crates/vm\_core/src/rounding.rs — 80–160 LOC
+#
+28. crates/vm\_core/src/rng.rs — 60–120 LOC
+#
+29. crates/vm\_io/Cargo.toml — 10–30 LOC
+#
+30. crates/vm\_io/src/lib.rs — 40–80 LOC
+#
+31. crates/vm\_io/src/canonical\_json.rs — 180–320 LOC
+#
+32. crates/vm\_io/src/manifest.rs — 150–300 LOC
+#
+33. crates/vm\_io/src/hasher.rs — 120–220 LOC
+#
+34. crates/vm\_io/src/loader.rs — 220–420 LOC
+#
+35. crates/vm\_algo/Cargo.toml — 10–30 LOC
+#
+36. crates/vm\_algo/src/lib.rs — 60–120 LOC
+#
+37. crates/vm\_algo/src/tabulation/plurality.rs — 120–220 LOC
+#
+38. crates/vm\_algo/src/tabulation/approval.rs — 140–260 LOC
+#
+39. crates/vm\_algo/src/tabulation/score.rs — 180–320 LOC
+#
+40. crates/vm\_algo/src/tabulation/ranked\_irv.rs — 220–420 LOC
+#
+41. crates/vm\_algo/src/tabulation/ranked\_condorcet.rs — 260–520 LOC
+#
+42. crates/vm\_algo/src/allocation/wta.rs — 80–140 LOC
+#
+43. crates/vm\_algo/src/allocation/dhondt.rs — 180–320 LOC
+#
+44. crates/vm\_algo/src/allocation/sainte\_lague.rs — 160–280 LOC
+#
+45. crates/vm\_algo/src/allocation/largest\_remainder.rs — 180–320 LOC
+#
+46. crates/vm\_algo/src/mmp.rs — 260–520 LOC
+#
+47. crates/vm\_algo/src/gates\_frontier.rs — 220–420 LOC
+#
+48. crates/vm\_pipeline/Cargo.toml — 10–30 LOC
+#
+49. crates/vm\_pipeline/src/lib.rs — 60–120 LOC
+#
+50. crates/vm\_pipeline/src/load.rs — 120–240 LOC
+#
+51. crates/vm\_pipeline/src/validate.rs — 160–300 LOC
+#
+52. crates/vm\_pipeline/src/tabulate.rs — 120–240 LOC
+#
+53. crates/vm\_pipeline/src/allocate.rs — 120–240 LOC
+#
+54. crates/vm\_pipeline/src/aggregate.rs — 120–220 LOC
+#
+55. crates/vm\_pipeline/src/apply\_rules.rs — 140–260 LOC
+#
+56. crates/vm\_pipeline/src/map\_frontier.rs — 160–300 LOC
+#
+57. crates/vm\_pipeline/src/resolve\_ties.rs — 160–300 LOC
+#
+58. crates/vm\_pipeline/src/label.rs — 100–200 LOC
+#
+59. crates/vm\_pipeline/src/build\_result.rs — 160–320 LOC
+#
+60. crates/vm\_pipeline/src/build\_run\_record.rs — 140–260 LOC
+#
+61. crates/vm\_report/Cargo.toml — 10–30 LOC
+#
+62. crates/vm\_report/src/lib.rs — 40–80 LOC
+#
+63. crates/vm\_report/src/structure.rs — 160–300 LOC
+#
+64. crates/vm\_report/src/render\_json.rs — 160–320 LOC
+#
+65. crates/vm\_report/src/render\_html.rs — 220–420 LOC
+#
+66. crates/vm\_cli/Cargo.toml — 10–30 LOC
+#
+67. crates/vm\_cli/src/args.rs — 80–160 LOC
+#
+68. crates/vm\_cli/src/main.rs — 120–240 LOC
+#
+69. fixtures/annex\_b/part\_0/parameter\_set.json — 120–300 lines
+#
+70. fixtures/annex\_b/part\_0/division\_registry.json — 150–600 lines
+#
+71. fixtures/annex\_b/part\_0/ballots.json — 200–2,000 lines
+#
+72. fixtures/annex\_b/part\_0/manifest.json — 60–120 lines
+#
+73. fixtures/annex\_b/part\_0/expected\_result.json — 150–400 lines
+#
+74. tests/vm\_tst\_core.rs — 160–320 LOC
+#
+75. tests/vm\_tst\_gates.rs — 160–320 LOC
+#
+76. tests/vm\_tst\_ranked.rs — 200–400 LOC
+#
+77. tests/vm\_tst\_mmp.rs — 200–400 LOC
+#
+78. tests/determinism.rs — 140–260 LOC
+#
+79. crates/vm\_app/Cargo.toml — 10–30 LOC
+#
+80. crates/vm\_app/src-tauri/Cargo.toml — 10–30 LOC
+#
+81. crates/vm\_app/src-tauri/src/main.rs — 60–120 LOC
+#
+82. crates/vm\_app/src-tauri/tauri.conf.json — 100–200 lines
+#
+83. crates/vm\_app/src-tauri/icons/icon.png — binary (placeholder)
+#
+84. crates/vm\_app/ui/package.json — 60–140 lines
+#
+85. crates/vm\_app/ui/index.html — 40–100 lines
+#
+86. crates/vm\_app/ui/vite.config.ts — 40–80 LOC
+#
+87. crates/vm\_app/ui/src/main.ts — 100–200 LOC
+#
+88. crates/vm\_app/ui/public/map/style.json — 100–200 lines
+#
+89. crates/vm\_app/ui/public/map/tiles/world.mbtiles — binary (tiles DB, TBD)
