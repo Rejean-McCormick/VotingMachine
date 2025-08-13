@@ -1,0 +1,494 @@
+# bundle: root
+
+--------------------------------------------------------------------------------
+FILE: Cargo.toml
+--------------------------------------------------------------------------------
+# 01 - Workspace Manifest Cargo.toml
+# Component: Workspace Manifest (virtual workspace)
+# Version/FormulaID: VM-ENGINE v0
+
+[workspace]
+resolver = "2"
+
+members = [
+  "crates/vm_core",
+  "crates/vm_io",
+  "crates/vm_algo",
+  "crates/vm_pipeline",
+  "crates/vm_report",
+  "crates/vm_cli",
+  # Tauri Rust crate (kept out of default-members by default)
+  "crates/vm_app/src-tauri",
+]
+
+# Build by default without the Tauri app; include it explicitly when needed.
+default-members = [
+  "crates/vm_core",
+  "crates/vm_io",
+  "crates/vm_algo",
+  "crates/vm_pipeline",
+  "crates/vm_report",
+  "crates/vm_cli",
+]
+
+# Centralized, optional shared deps. Leave empty unless you want to pin exact versions workspace-wide.
+# (Pinning is useful for reproducibility but must match per-crate needs.)
+[workspace.dependencies]
+# serde = { version = "1.0", default-features = false, features = ["derive"] }
+# serde_json = { version = "1.0", default-features = false }
+# anyhow = "1"
+# thiserror = "1"
+
+# Deterministic-oriented profiles (release is the canonical path used for artifacts)
+[profile.dev]
+opt-level = 0
+debug-assertions = true
+overflow-checks = true
+incremental = true        # Dev convenience; determinism guaranteed in release.
+lto = "off"
+panic = "unwind"
+codegen-units = 256
+
+[profile.release]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+lto = "fat"
+panic = "abort"
+codegen-units = 1
+# `strip` is supported on many targets; if your toolchain/target doesn't support it, remove this line.
+strip = true
+
+# Keep tests consistent and reasonably fast; no incremental for cleaner comparisons.
+[profile.test]
+opt-level = 0
+debug-assertions = true
+overflow-checks = true
+incremental = false
+lto = "off"
+panic = "unwind"
+codegen-units = 256
+
+# Optional: bench profile mirrors release for determinism
+[profile.bench]
+inherits = "release"
+
+# Non-normative metadata for internal traceability; does not affect FID.
+[workspace.metadata.vm_engine]
+version = "v0"
+determinism.release_profile = true
+default_members_exclude_ui = true
+notes = "Renderer/UI (Tauri) is opt-in; CLI/core are default. Build with `--locked`."
+
+--------------------------------------------------------------------------------
+FILE: rust-toolchain.toml
+--------------------------------------------------------------------------------
+# 02 - rust-toolchain.toml — VM-ENGINE v0
+# Deterministic toolchain pin for the workspace.
+
+[toolchain]
+# Pin to an exact stable release (no toolchain drift).
+channel = "1.80.0"
+
+# Keep base install minimal; add only the components we require.
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+
+# If CI needs cross-OS builds, explicitly add targets (otherwise omit).
+# targets = [
+#   "x86_64-unknown-linux-gnu",
+#   "aarch64-unknown-linux-gnu",
+#   "x86_64-apple-darwin",
+#   "aarch64-apple-darwin",
+#   "x86_64-pc-windows-msvc",
+#   "aarch64-pc-windows-msvc",
+# ]
+
+--------------------------------------------------------------------------------
+FILE: .cargo/config.toml
+--------------------------------------------------------------------------------
+# 03 - .cargo/config.toml — VM-ENGINE v0
+
+[net]
+offline = true         # Default: no network. Temporarily override with CARGO_NET_OFFLINE=0 for initial fetch/vendor.
+retry = 0
+git-fetch-with-cli = true
+
+[registries.crates-io]
+protocol = "sparse"    # Faster, reproducible index access when not vendored.
+
+# --- Vendoring (optional) ---
+# If you commit a vendor/ directory, force Cargo to read from it exclusively:
+# [source.crates-io]
+# replace-with = "vendored-sources"
+# [source.vendored-sources]
+# directory = "vendor"
+
+[build]
+# Optional: set in CI if you want consistent parallelism; does not affect artifact bytes.
+# jobs = 4
+
+[alias]
+b = "build --locked"
+t = "test --locked"
+m = "metadata --no-deps"
+tree = "tree -e no-dev -e features"
+
+--------------------------------------------------------------------------------
+FILE: Makefile
+--------------------------------------------------------------------------------
+# 04 - Makefile — VM-ENGINE v0
+# Deterministic, offline-by-default build/test/package pipeline.
+# Use with a POSIX shell (Git Bash on Windows).
+
+# -------- Settings (override via: make <tgt> MK.PROFILE=release MK.OFFLINE=1 MK.SEED=42) ----------
+MK.PROFILE ?= release
+MK.OFFLINE ?= 1
+MK.SEED    ?= 42
+
+BIN_NAME   ?= vm_cli
+FIXDIR     ?= fixtures/annex_b
+ARTIFACTS  ?= artifacts
+DISTDIR    ?= dist
+STAGE      ?= .stage
+SOURCE_DATE_EPOCH ?= 0    # seconds since epoch; 0 = 1970-01-01 (reproducible mtimes)
+
+# Cargo runs offline unless explicitly overridden.
+CARGO = env CARGO_NET_OFFLINE=$(MK.OFFLINE) cargo
+
+# OS/ARCH detection for bundle names
+UNAME_S := $(shell uname -s 2>/dev/null || echo Windows)
+ifeq ($(findstring MINGW,$(UNAME_S)),MINGW)
+  OS := windows
+  EXE := .exe
+else ifeq ($(UNAME_S),Windows)
+  OS := windows
+  EXE := .exe
+else ifeq ($(UNAME_S),Darwin)
+  OS := macos
+  EXE :=
+else
+  OS := linux
+  EXE :=
+endif
+
+ARCH_RAW := $(shell uname -m 2>/dev/null || echo amd64)
+ifeq ($(ARCH_RAW),x86_64)
+  ARCH := x86_64
+else ifeq ($(ARCH_RAW),aarch64)
+  ARCH := aarch64
+else
+  ARCH := $(ARCH_RAW)
+endif
+
+BIN      := target/$(MK.PROFILE)/$(BIN_NAME)$(EXE)
+DISTNAME := $(BIN_NAME)-$(OS)-$(ARCH)
+DISTSTAGE := $(STAGE)/$(DISTNAME)
+
+.DEFAULT_GOAL := help
+.SHELLFLAGS := -eu -o pipefail -c
+
+.PHONY: help fmt lint build test fixtures verify hash dist clean ci
+
+# ----------------------------------- Meta -------------------------------------
+help:
+	@echo "Targets:"
+	@echo "  fmt        - cargo fmt (check)"
+	@echo "  lint       - cargo clippy (deny warnings)"
+	@echo "  build      - cargo build --locked (profile=$(MK.PROFILE), offline=$(MK.OFFLINE))"
+	@echo "  test       - cargo test --locked"
+	@echo "  fixtures   - run small Annex B set (VM-TST-001/2/3 if present) and compare to expected"
+	@echo "  verify     - determinism smoke test (repeat run, compare bytes)"
+	@echo "  hash       - SHA-256 for results/dist artifacts"
+	@echo "  dist       - reproducible archives (tar.gz, zip)"
+	@echo "  ci         - fmt → lint → build → test → fixtures → verify → hash"
+	@echo "  clean      - remove target/, artifacts/, dist/, .stage/"
+
+# --------------------------------- Quality ------------------------------------
+fmt:
+	$(CARGO) fmt --all -- --check
+
+lint:
+	$(CARGO) clippy --all-targets -- -D warnings
+
+# --------------------------------- Build/Test ---------------------------------
+build:
+	$(CARGO) build --locked --profile $(MK.PROFILE)
+
+test:
+	$(CARGO) test --locked --profile $(MK.PROFILE)
+
+# ------------------------------ Fixtures (Annex B) ----------------------------
+# Runs a minimal canonical pack if present:
+#   $(FIXDIR)/VM-TST-00{1,2,3}/manifest.json
+fixtures: build
+	@set -e; \
+	for T in VM-TST-001 VM-TST-002 VM-TST-003; do \
+	  if [ -d "$(FIXDIR)/$$T" ]; then \
+	    OUT="$(ARTIFACTS)/fixtures/$$T"; \
+	    mkdir -p "$$OUT"; \
+	    echo "==> Running $$T"; \
+	    "$(BIN)" run --manifest "$(FIXDIR)/$$T/manifest.json" --output "$$OUT" --rng-seed "$(MK.SEED)"; \
+	    if [ -f "$(FIXDIR)/$$T/expected/result.json" ]; then \
+	      if command -v jq >/dev/null 2>&1; then \
+	        diff -u <(jq -S . "$(FIXDIR)/$$T/expected/result.json") <(jq -S . "$$OUT/result.json"); \
+	      else \
+	        cmp -s "$(FIXDIR)/$$T/expected/result.json" "$$OUT/result.json"; \
+	      fi; \
+	    fi; \
+	    if [ -f "$(FIXDIR)/$$T/expected/run_record.json" ]; then \
+	      if command -v jq >/dev/null 2>&1; then \
+	        diff -u <(jq -S . "$(FIXDIR)/$$T/expected/run_record.json") <(jq -S . "$$OUT/run_record.json"); \
+	      else \
+	        cmp -s "$(FIXDIR)/$$T/expected/run_record.json" "$$OUT/run_record.json"; \
+	      fi; \
+	    fi; \
+	  fi; \
+	done
+
+# ---------------------------- Determinism (Smoke) -----------------------------
+# Repeat the same run twice with the same seed and compare bytes.
+verify: build
+	@set -e; \
+	TESTDIR="$(FIXDIR)/VM-TST-001"; \
+	if [ ! -d "$$TESTDIR" ]; then \
+	  echo "verify: $$TESTDIR not found; skipping (add Annex B minimal pack)."; \
+	  exit 0; \
+	fi; \
+	OUT="$(ARTIFACTS)/verify"; rm -rf "$$OUT"; mkdir -p "$$OUT/a" "$$OUT/b"; \
+	echo "==> Determinism check on VM-TST-001"; \
+	"$(BIN)" run --manifest "$$TESTDIR/manifest.json" --output "$$OUT/a" --rng-seed "$(MK.SEED)"; \
+	"$(BIN)" run --manifest "$$TESTDIR/manifest.json" --output "$$OUT/b" --rng-seed "$(MK.SEED)"; \
+	cmp -s "$$OUT/a/result.json" "$$OUT/b/result.json"; \
+	cmp -s "$$OUT/a/run_record.json" "$$OUT/b/run_record.json"
+
+# ---------------------------------- Hashes ------------------------------------
+hash:
+	@set -e; \
+	if [ -d "$(ARTIFACTS)" ]; then \
+	  find "$(ARTIFACTS)" -type f \( -name '*.json' -o -name '*.tar.gz' -o -name '*.zip' \) -print0 | \
+	  while IFS= read -r -d '' f; do \
+	    if command -v sha256sum >/dev/null 2>&1; then \
+	      sha256sum "$$f" > "$$f.sha256"; \
+	    else \
+	      shasum -a 256 "$$f" > "$$f.sha256"; \
+	    fi; \
+	  done; \
+	fi; \
+	if [ -d "$(DISTDIR)" ]; then \
+	  find "$(DISTDIR)" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 | \
+	  while IFS= read -r -d '' f; do \
+	    if command -v sha256sum >/dev/null 2>&1; then \
+	      sha256sum "$$f" > "$$f.sha256"; \
+	    else \
+	      shasum -a 256 "$$f" > "$$f.sha256"; \
+	    fi; \
+	  done; \
+	fi
+
+# ---------------------------------- Dist --------------------------------------
+# Produce reproducible tar.gz and zip bundles (sorted entries, fixed mtimes/owners).
+dist: build
+	@set -e; \
+	rm -rf "$(DISTSTAGE)"; mkdir -p "$(DISTSTAGE)"; \
+	cp -a "$(BIN)" "$(DISTSTAGE)/$(BIN_NAME)$(EXE)"; \
+	[ -f LICENSE ]   && cp -a LICENSE   "$(DISTSTAGE)/" || true; \
+	[ -f README.md ] && cp -a README.md "$(DISTSTAGE)/" || true; \
+	# Normalize mtimes for reproducibility:
+	find "$(DISTSTAGE)" -print0 | xargs -0r touch -d "@$(SOURCE_DATE_EPOCH)"; \
+	mkdir -p "$(DISTDIR)"; \
+	# Prefer GNU tar (gtar) for --sort=name; fall back to system tar if needed.
+	if command -v gtar >/dev/null 2>&1; then \
+	  gtar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@$(SOURCE_DATE_EPOCH) \
+	       -C "$(STAGE)" -czf "$(DISTDIR)/$(DISTNAME).tar.gz" "$(DISTNAME)"; \
+	else \
+	  tar --owner=0 --group=0 --numeric-owner --mtime=@$(SOURCE_DATE_EPOCH) \
+	      -C "$(STAGE)" -czf "$(DISTDIR)/$(DISTNAME).tar.gz" "$(DISTNAME)"; \
+	fi; \
+	# Zip without extra metadata; file order comes from directory listing (already normalized).
+	( cd "$(STAGE)" && zip -X -q -r "../$(DISTDIR)/$(DISTNAME).zip" "$(DISTNAME)" ); \
+	echo "Wrote: $(DISTDIR)/$(DISTNAME).tar.gz and .zip"
+
+# ----------------------------------- CI ---------------------------------------
+ci: fmt lint build test fixtures verify hash
+
+# ---------------------------------- Clean -------------------------------------
+clean:
+	@rm -rf target "$(ARTIFACTS)" "$(DISTDIR)" "$(STAGE)"
+
+--------------------------------------------------------------------------------
+FILE: .pre-commit-config.yaml
+--------------------------------------------------------------------------------
+# 08 - .pre-commit-config.yaml — VM-ENGINE v0
+# Fast local gates (pre-commit) + heavier gates (pre-push), offline-friendly.
+# Assumes POSIX shell (Git Bash on Windows). No networked hook repos required.
+
+minimum_pre_commit_version: "3.2.0"
+
+repos:
+  # ------------------------------- Pre-commit (fast) -------------------------------
+  - repo: local
+    hooks:
+      # Enforce LF + final newline on text files
+      - id: lf-and-final-newline
+        name: Enforce LF + final newline (text files)
+        language: system
+        stages: [commit]
+        types: [text]
+        entry: bash -lc '
+          set -euo pipefail;
+          for f in "$@"; do
+            [ -f "$f" ] || continue
+            # Normalize CRLF -> LF
+            tr -d "\r" < "$f" > "$f.__tmp__" && mv "$f.__tmp__" "$f"
+            # Ensure file ends with a single LF
+            if [ -s "$f" ]; then
+              tail -c1 "$f" | od -An -t u1 | grep -q " 10" || printf "\n" >> "$f"
+            fi
+          done
+        '
+
+      # Strip trailing whitespace (but NOT in Markdown, to preserve hard breaks)
+      - id: trailing-whitespace
+        name: Strip trailing whitespace (exclude *.md)
+        language: system
+        stages: [commit]
+        types: [text]
+        files: '^(?!.*\.md$).*$'
+        entry: bash -lc '
+          set -euo pipefail;
+          for f in "$@"; do
+            [ -f "$f" ] || continue
+            # Use portable Python for in-place editing across GNU/BSD sed differences
+            python - "$@" << "PY"
+import sys, re, pathlib
+for p in map(pathlib.Path, sys.argv[1:]):
+    try:
+        s = p.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+    except Exception:
+        continue
+    s = [re.sub(r"[ \t]+(?=\r?\n$)", "", line) for line in s]
+    p.write_text("".join(s), encoding="utf-8")
+PY
+          done
+        '
+
+      # Ban CR characters in staged files (mixed line endings)
+      - id: mixed-line-ending
+        name: Ban CR (no CRLF)
+        language: system
+        stages: [commit]
+        types: [text]
+        entry: bash -lc '
+          set -euo pipefail;
+          bad=0
+          for f in "$@"; do
+            [ -f "$f" ] || continue
+            if grep -Iq . "$f"; then
+              if LC_ALL=C grep -n $'\''\r'\'' "$f" >/dev/null; then
+                echo "CRLF found in: $f" >&2; bad=1
+              fi
+            fi
+          done
+          exit $bad
+        '
+
+      # JSON well-formedness (schemas, fixtures, sources)
+      - id: check-json
+        name: JSON syntax check (jq or python)
+        language: system
+        stages: [commit]
+        files: '\.json$'
+        entry: bash -lc '
+          set -euo pipefail;
+          for f in "$@"; do
+            [ -f "$f" ] || continue
+            if command -v jq >/dev/null 2>&1; then
+              jq -e . "$f" >/dev/null
+            else
+              python - <<PY "$f"
+import json, sys
+json.load(open(sys.argv[1], "rb"))
+PY
+            fi
+          done
+        '
+
+      # Rust formatting (fast; fail on diff)
+      - id: cargo-fmt
+        name: cargo fmt --all -- --check
+        language: system
+        stages: [commit]
+        pass_filenames: false
+        entry: bash -lc 'cargo fmt --all -- --check'
+
+      # Canonical JSON check: keys sorted + LF (normative dirs). Skips if jq missing.
+      - id: canonical-json
+        name: Canonical JSON (sorted keys, LF) — schemas/ & fixtures/
+        language: system
+        stages: [commit]
+        files: '^(schemas/|fixtures/).*\.json$'
+        exclude: '^(dist/|artifacts/|vendor/|node_modules/)'
+        entry: bash -lc '
+          set -euo pipefail;
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "canonical-json: jq not found; skipping." >&2; exit 0
+          fi
+          tmp="$(mktemp)"
+          trap '\''rm -f "$tmp"'\'' EXIT
+          for f in "$@"; do
+            [ -f "$f" ] || continue
+            jq -S . "$f" > "$tmp"
+            # ensure LF at EOF
+            tail -c1 "$tmp" | od -An -t u1 | grep -q " 10" || printf "\n" >> "$tmp"
+            if ! cmp -s "$tmp" "$f"; then
+              echo "Non-canonical JSON (sort keys / LF) → $f" >&2
+              exit 1
+            fi
+          done
+        '
+
+  # ------------------------------- Pre-push (heavier) -------------------------------
+  - repo: local
+    hooks:
+      # Clippy must be clean (deny warnings)
+      - id: cargo-clippy
+        name: cargo clippy --all-targets -D warnings
+        language: system
+        stages: [push]
+        pass_filenames: false
+        entry: bash -lc 'cargo clippy --all-targets -- -D warnings'
+
+      # Unit tests (locked, workspace)
+      - id: cargo-test
+        name: cargo test --locked --workspace
+        language: system
+        stages: [push]
+        pass_filenames: false
+        entry: bash -lc 'cargo test --locked --workspace'
+
+      # Determinism smoke: run one Annex B fixture twice with the same seed and compare bytes
+      - id: determinism-smoke
+        name: Determinism smoke (double-run VM-TST-001)
+        language: system
+        stages: [push]
+        pass_filenames: false
+        entry: bash -lc '
+          set -euo pipefail;
+          FIX="fixtures/annex_b/VM-TST-001/manifest.json"
+          if [ ! -f "$FIX" ]; then
+            echo "determinism-smoke: $FIX not found; skipping." >&2; exit 0
+          fi
+          BIN="${BIN:-vm_cli}"
+          if ! command -v "$BIN" >/dev/null 2>&1; then
+            echo "determinism-smoke: $BIN not found in PATH; skipping." >&2; exit 0
+          fi
+          SEED="${VM_SEED:-42}"
+          A="artifacts/prepush/a"; B="artifacts/prepush/b"
+          rm -rf "$A" "$B"; mkdir -p "$A" "$B"
+          CARGO_NET_OFFLINE="${CARGO_NET_OFFLINE:-1}" "$BIN" run --manifest "$FIX" --output "$A" --rng-seed "$SEED"
+          CARGO_NET_OFFLINE="${CARGO_NET_OFFLINE:-1}" "$BIN" run --manifest "$FIX" --output "$B" --rng-seed "$SEED"
+          cmp -s "$A/result.json"     "$B/result.json"
+          cmp -s "$A/run_record.json" "$B/run_record.json"
+        '

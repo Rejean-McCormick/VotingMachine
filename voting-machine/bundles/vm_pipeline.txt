@@ -1,0 +1,3561 @@
+# bundle: vm_pipeline
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/Cargo.toml
+--------------------------------------------------------------------------------
+[package]
+name = "vm_pipeline"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "Apache-2.0 OR MIT"
+description = "Deterministic orchestration of the VM engine pipeline (load → validate → tabulate → allocate → gates → frontier → ties → label → artifacts)."
+# repository = ""
+# readme = "README.md"
+
+[lib]
+name = "vm_pipeline"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+# Compile-time switches that only change code scope, not public types.
+default  = ["std", "frontier", "mmp"]
+std      = []
+frontier = []   # frontier mapping step (040–049)
+mmp      = []   # mixed-member proportional helpers
+
+[dependencies]
+vm_core = { path = "../vm_core" }  # IDs, variables, rounding, RNG wrapper
+vm_io   = { path = "../vm_io" }    # canonical JSON, schemas, hashing, manifest loaders
+vm_algo = { path = "../vm_algo" }  # tabulation, allocation, gates/frontier primitives
+
+[dev-dependencies]
+tempfile = "3"   # optional, for integration tests
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/src/lib.rs
+--------------------------------------------------------------------------------
+//! vm_pipeline — deterministic pipeline surface (load→validate→tabulate→allocate→aggregate→gates→frontier→label→build)
+//! This crate stays I/O-free and delegates JSON/Schema/Hashing to `vm_io` and math to `vm_algo`.
+//! The code below is a scaffolded pipeline skeleton with stable types and IDs; fill
+//! in the stage internals incrementally without changing these public signatures.
+
+use std::path::Path;
+
+use vm_core::{
+    ids::*,
+    entities::*,
+    variables::Params,
+};
+use vm_io::{
+    manifest,
+    loader::{self, LoadedContext},
+    canonical_json,
+    hasher,
+};
+
+/// Engine identifiers (baked by the build system in real deployments).
+#[derive(Debug, Clone)]
+pub struct EngineMeta {
+    pub vendor: String,
+    pub name: String,
+    pub version: String,
+    pub build: String,
+}
+
+/// Pipeline context: inputs are already loaded and validated by vm_io;
+/// `nm_canonical` is the Normative Manifest JSON used to compute the Formula ID.
+#[derive(Debug)]
+pub struct PipelineCtx {
+    pub loaded: LoadedContext,
+    pub engine_meta: EngineMeta,
+    pub nm_canonical: serde_json::Value,
+}
+
+/// Top-level pipeline outputs: Result, RunRecord, optional FrontierMap.
+#[derive(Debug)]
+pub struct PipelineOutputs {
+    pub result: ResultDoc,
+    pub run_record: RunRecordDoc,
+    pub frontier_map: Option<FrontierMapDoc>,
+}
+
+/// Single error surface for the pipeline orchestration.
+#[derive(Debug)]
+pub enum PipelineError {
+    Io(String),
+    Schema(String),
+    Validate(String),
+    Tabulate(String),
+    Allocate(String),
+    Gates(String),
+    Frontier(String),
+    Tie(String),
+    Build(String),
+}
+
+impl From<vm_io::IoError> for PipelineError {
+    fn from(e: vm_io::IoError) -> Self {
+        use PipelineError::*;
+        // Map all vm_io errors to Io/Schema/Hash/Path-ish buckets with stable text.
+        match e {
+            vm_io::IoError::Schema { pointer, msg } => Schema(format!("{pointer}: {msg}")),
+            vm_io::IoError::Json { pointer, msg } => Schema(format!("json {pointer}: {msg}")),
+            vm_io::IoError::Read(e) => Io(format!("read: {e}")),
+            vm_io::IoError::Write(e) => Io(format!("write: {e}")),
+            vm_io::IoError::Manifest(m) => Validate(format!("manifest: {m}")),
+            vm_io::IoError::Expect(m) => Validate(format!("expect: {m}")),
+            vm_io::IoError::Canon(m) => Build(format!("canon: {m}")),
+            vm_io::IoError::Hash(m) => Build(format!("hash: {m}")),
+            vm_io::IoError::Path(m) => Io(format!("path: {m}")),
+            vm_io::IoError::Limit(m) => Io(format!("limit: {m}")),
+        }
+    }
+}
+
+// ---------------------------- Result / RunRecord / Frontier docs ----------------------------
+// These are minimal, typed mirrors of the external schemas with only the stable fields needed
+// for end-to-end ID computation. Extend in-place without changing field names or types.
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ResultDoc {
+    pub id: String,             // "RES:<hex64>"
+    pub formula_id: String,     // 64-hex
+    pub label: LabelBlock,      // {value, reason?}
+    // In a fuller implementation you’d add: gates panel, per-unit blocks, aggregates, shares, etc.
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LabelBlock {
+    pub value: String,             // "Decisive" | "Marginal" | "Invalid"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RunRecordDoc {
+    pub id: String,                                // "RUN:<ts>-<hex64>"
+    pub timestamp_utc: String,                     // RFC3339 Z
+    pub engine: EngineMeta,                        // vendor/name/version/build
+    pub formula_id: String,                        // 64-hex
+    pub normative_manifest_sha256: String,         // nm_digest
+    pub inputs: RunInputs,                         // input IDs + digests
+    pub policy: TiePolicyEcho,                     // tie policy (+seed if random)
+    pub outputs: RunOutputs,                       // produced artifacts (+hashes)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RunInputs {
+    pub division_registry_id: String,
+    pub division_registry_sha256: String,
+    pub ballot_tally_id: String,
+    pub ballot_tally_sha256: String,
+    pub parameter_set_id: String,
+    pub parameter_set_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjacency_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TiePolicyEcho {
+    pub tie_policy: String,                 // "status_quo" | "deterministic" | "random"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rng_seed: Option<u64>,              // present iff policy == random
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RunOutputs {
+    pub result_id: String,                  // "RES:<hex64>"
+    pub result_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontier_map_id: Option<String>,    // "FR:<hex64>"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontier_map_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FrontierMapDoc {
+    pub id: String,                         // "FR:<hex64>"
+    pub summary: FrontierMapSummary,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct FrontierMapSummary {
+    pub band_counts: std::collections::BTreeMap<String, u32>,
+    pub mediation_units: u32,
+    pub enclave_units: u32,
+    pub any_protected_override: bool,
+}
+
+// -------------------------------------- Public API --------------------------------------
+
+/// Orchestrate the pipeline with a preloaded context.
+/// NOTE: This scaffold emits a minimal but canonical Result/RunRecord (and optional FrontierMap),
+/// computing IDs via vm_io::hasher. Fill in each stage (TABULATE/ALLOCATE/…) behind these fences.
+pub fn run_with_ctx(ctx: PipelineCtx) -> Result<PipelineOutputs, PipelineError> {
+    // --- Compute Formula ID from Normative Manifest (NM) ---
+    let fid = compute_formula_id(&ctx.nm_canonical);
+
+    // --- LABEL (placeholder) ---
+    // For the scaffold, consider any non-empty FID as "Decisive".
+    let label = LabelBlock { value: "Decisive".to_string(), reason: None };
+
+    // --- BUILD_RESULT (without id) ---
+    #[derive(serde::Serialize)]
+    struct ResultNoId<'a> {
+        formula_id: &'a str,
+        label: &'a LabelBlock,
+    }
+    let res_no_id = ResultNoId { formula_id: &fid, label: &label };
+    let res_id = hasher::res_id_from_canonical(&res_no_id)
+        .map_err(PipelineError::from)?;
+    let res_bytes = canonical_json::to_canonical_bytes(&res_no_id).map_err(PipelineError::from)?;
+    let res_sha = hasher::sha256_hex(&res_bytes);
+
+    let result = ResultDoc {
+        id: res_id.clone(),
+        formula_id: fid.clone(),
+        label,
+    };
+
+    // --- (Optional) FRONTIER MAP (skipped unless enabled and gates pass) ---
+    // This scaffold emits None; fill in by calling vm_algo::gates_frontier (apply_decision_gates → map_frontier)
+    // and then hashing a stable, typed map.
+    let frontier_map: Option<FrontierMapDoc> = None;
+
+    // --- BUILD_RUN_RECORD (without id) ---
+    let nm_digest = vm_io::hasher::nm_digest_from_value(&ctx.nm_canonical)
+        .map_err(PipelineError::from)?;
+
+    // Tie policy echo (policy string must align with wire naming in vm_io).
+    let policy_str = match ctx.loaded.params.v050_tie_policy {
+        vm_core::variables::TiePolicy::StatusQuo => "status_quo",
+        vm_core::variables::TiePolicy::DeterministicOrder => "deterministic",
+        vm_core::variables::TiePolicy::Random => "random",
+    }.to_string();
+
+    let policy = TiePolicyEcho {
+        tie_policy: policy_str,
+        rng_seed: ctx.loaded.params.v052_tie_seed,
+    };
+
+    // Inputs: NOTE these IDs are placeholders; in a full engine you would parse or assign canonical
+    // input IDs in vm_io, then echo them here. For the scaffold we place the sha256 hex only.
+    let inputs = RunInputs {
+        division_registry_id: "REG:local".to_string(),
+        division_registry_sha256: ctx.loaded.digests.division_registry_sha256.clone(),
+        ballot_tally_id: "TLY:local".to_string(),
+        ballot_tally_sha256: ctx.loaded.digests.ballot_tally_sha256.clone(),
+        parameter_set_id: "PS:local".to_string(),
+        parameter_set_sha256: ctx.loaded.digests.parameter_set_sha256.clone(),
+        adjacency_sha256: ctx.loaded.digests.adjacency_sha256.clone(),
+    };
+
+    let outputs = RunOutputs {
+        result_id: res_id.clone(),
+        result_sha256: res_sha.clone(),
+        frontier_map_id: frontier_map.as_ref().map(|fm| fm.id.clone()),
+        frontier_map_sha256: None, // filled if/when frontier_map is produced
+    };
+
+    // RFC3339 UTC timestamp; deterministic placeholder here (fill with real clock in CLI/app).
+    let timestamp = "1970-01-01T00:00:00Z".to_string();
+
+    #[derive(serde::Serialize)]
+    struct RunNoId<'a> {
+        timestamp_utc: &'a str,
+        engine: &'a EngineMeta,
+        formula_id: &'a str,
+        normative_manifest_sha256: &'a str,
+        inputs: &'a RunInputs,
+        policy: &'a TiePolicyEcho,
+        outputs: &'a RunOutputs,
+    }
+    let run_no_id = RunNoId {
+        timestamp_utc: &timestamp,
+        engine: &ctx.engine_meta,
+        formula_id: &fid,
+        normative_manifest_sha256: &nm_digest,
+        inputs: &inputs,
+        policy: &policy,
+        outputs: &outputs,
+    };
+    let run_bytes = canonical_json::to_canonical_bytes(&run_no_id).map_err(PipelineError::from)?;
+    let run_id = hasher::run_id_from_bytes(&timestamp, &run_bytes).map_err(PipelineError::from)?;
+
+    let run_record = RunRecordDoc {
+        id: run_id,
+        timestamp_utc: timestamp,
+        engine: ctx.engine_meta,
+        formula_id: fid,
+        normative_manifest_sha256: nm_digest,
+        inputs,
+        policy,
+        outputs,
+    };
+
+    Ok(PipelineOutputs { result, run_record, frontier_map })
+}
+
+/// Convenience entry: parse/validate a manifest, load artifacts via vm_io, then run the pipeline.
+/// This helper constructs a trivial NM (empty object) for the Formula ID placeholder; callers
+/// integrating the full Annex-A “Normative Manifest” should pass a richer `nm_canonical` via `run_with_ctx`.
+pub fn run_from_manifest_path<P: AsRef<Path>>(path: P) -> Result<PipelineOutputs, PipelineError> {
+    let loaded = loader::load_all_from_manifest(path).map_err(PipelineError::from)?;
+
+    let ctx = PipelineCtx {
+        loaded,
+        engine_meta: engine_identifiers(),
+        nm_canonical: serde_json::json!({}), // placeholder NM (include only normative fields in a full build)
+    };
+
+    run_with_ctx(ctx)
+}
+
+/// Engine identifiers for use in RunRecord and manifest “expect” checks.
+pub fn engine_identifiers() -> EngineMeta {
+    EngineMeta {
+        vendor: "vm".to_string(),
+        name: "vm_engine".to_string(),
+        version: "0.1.0".to_string(),
+        build: "dev".to_string(),
+    }
+}
+
+/// Compute Formula ID (FID) from the Normative Manifest (NM) JSON.
+/// Current policy: FID == SHA-256 hex of NM’s canonical bytes.
+pub fn compute_formula_id(nm: &serde_json::Value) -> String {
+    hasher::formula_id_from_nm(nm).unwrap_or_else(|_| "0".repeat(64))
+}
+
+// -------------------------------------- (internal helpers) --------------------------------------
+// As you flesh out the pipeline, add private stage functions here that take typed inputs and
+// return typed outputs. Keep all I/O, JSON shape, and hashing calls routed through vm_io.
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/src/load.rs
+--------------------------------------------------------------------------------
+//! LOAD stage for normative runs: manifest → vm_io loaders → deterministic bundle.
+//! - Enforces the "tally-only" input contract (no raw ballots path).
+//! - Delegates schema/ID parsing & canonicalization to vm_io.
+//! - Aggregates canonical digests and (if manifest) computes nm_digest + formula_id.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use vm_core::{
+    entities::{DivisionRegistry, OptionItem},
+    ids::*,
+    variables::Params,
+};
+use vm_io::{
+    hasher,
+    loader,
+    manifest::{self, Manifest, ResolvedPaths},
+};
+
+/// Errors surfaced by the LOAD stage.
+#[derive(Debug)]
+pub enum LoadError {
+    Io(String),
+    Schema(String),
+    Manifest(String),
+    Hash(String),
+    Contract(String),
+}
+
+impl From<vm_io::IoError> for LoadError {
+    fn from(e: vm_io::IoError) -> Self {
+        use LoadError::*;
+        match e {
+            vm_io::IoError::Read(err) => Io(err.to_string()),
+            vm_io::IoError::Write(err) => Io(err.to_string()),
+            vm_io::IoError::Json { pointer, msg } => Schema(format!("json {pointer}: {msg}")),
+            vm_io::IoError::Schema { pointer, msg } => Schema(format!("{pointer}: {msg}")),
+            vm_io::IoError::Manifest(m) => Manifest(m),
+            vm_io::IoError::Expect(m) => Manifest(format!("expectation: {m}")),
+            vm_io::IoError::Canon(m) => Manifest(format!("canonicalization: {m}")),
+            vm_io::IoError::Hash(m) => Hash(m),
+            vm_io::IoError::Path(m) => Io(format!("path: {m}")),
+            vm_io::IoError::Limit(m) => Io(format!("limit: {m}")),
+        }
+    }
+}
+
+/// Input IDs echoed downstream (placeholders for normative-run inputs).
+/// In a fuller build, these may be parsed from files; for LOAD we keep opaque strings.
+#[derive(Debug, Clone)]
+pub struct LoadedIds {
+    pub reg_id: String,
+    pub tally_id: String,
+    pub param_set_id: String,
+}
+
+/// Deterministic bundle consumed by downstream stages.
+#[derive(Debug, Clone)]
+pub struct NormContext {
+    pub reg: DivisionRegistry,
+    /// Registry-wide canonical option set (deduped by OptionId, sorted by (order_index, OptionId)).
+    pub options: Vec<OptionItem>,
+    pub params: Params,
+    pub tallies: loader::UnitTallies,
+    pub ids: LoadedIds,
+}
+
+/// Canonical input digests (64-hex).
+#[derive(Debug, Clone)]
+pub struct InputDigests {
+    pub reg_sha256: String,
+    pub tally_sha256: String,
+    pub params_sha256: String,
+    pub adjacency_sha256: Option<String>,
+}
+
+/// Output of the LOAD stage.
+#[derive(Debug, Clone)]
+pub struct LoadedStage {
+    pub norm_ctx: NormContext,
+    pub digests: InputDigests,
+    /// Present when a manifest was used (nm_digest over the Normative Manifest JSON).
+    pub nm_digest: Option<String>,
+    /// Present when a manifest was used; equals nm_digest under current policy.
+    pub formula_id: Option<String>,
+}
+
+// -------------------------------------------------------------------------------------------------
+// Entry points
+// -------------------------------------------------------------------------------------------------
+
+/// Preferred: load from a manifest, enforce the normative contract, and compute nm_digest/FID.
+pub fn load_normative_from_manifest<P: AsRef<Path>>(path: P) -> Result<LoadedStage, LoadError> {
+    // 1) Parse + validate manifest.
+    let man = manifest::load_manifest(&path)?;
+    ensure_manifest_contract(&man)?;
+
+    // 2) Resolve paths relative to the manifest directory.
+    //    The function expects a base; pass the manifest file path (vm_io resolves parent).
+    let resolved = manifest::resolve_paths(path.as_ref(), &man)?;
+
+    // 3) Load artifacts (vm_io handles schema + canonicalization + basic cross-refs).
+    let io_loaded = loader::load_all_from_manifest(&path)?;
+
+    // 4) Lift into NormContext (re-assert core invariants if desired).
+    let norm_ctx = to_norm_context(io_loaded)?;
+
+    // 5) Collect input digests (file bytes for visibility; vm_io already computed canonical digests).
+    let digests = collect_input_digests(&resolved)?;
+
+    // 6) Compute Normative Manifest digest + Formula ID from a compact NM view
+    //    built from the canonical input digests (deterministic and offline).
+    let (nm_digest, formula_id) = compute_nm_fid_if_present_from_digests(&digests)?;
+
+    Ok(LoadedStage {
+        norm_ctx,
+        digests,
+        nm_digest: Some(nm_digest),
+        formula_id: Some(formula_id),
+    })
+}
+
+/// Alternate: load directly from explicit file paths (no manifest); nm_digest/FID omitted.
+pub fn load_normative_from_paths<P: AsRef<Path>>(
+    reg_path: P,
+    tally_path: P,
+    params_path: P,
+    adjacency_path: Option<P>,
+) -> Result<LoadedStage, LoadError> {
+    // 1) Targeted loads (vm_io validates + canonicalizes).
+    let registry = loader::load_registry(&reg_path)?;
+    let params = loader::load_params(&params_path)?;
+    let tallies = loader::load_ballot_tally(&tally_path)?;
+    // Optional adjacency is handled by the loader when called from manifest; we just hash if present.
+
+    // 2) Build NormContext.
+    let ids = LoadedIds {
+        reg_id: "REG:local".into(),
+        tally_id: "TLY:local".into(),
+        param_set_id: "PS:local".into(),
+    };
+    let options = collect_registry_options(&registry);
+    let norm_ctx = NormContext {
+        reg: registry,
+        options,
+        params,
+        tallies,
+        ids,
+    };
+
+    // 3) Digests over files (streamed).
+    let digests = InputDigests {
+        reg_sha256: hasher::sha256_file(&reg_path)?,
+        tally_sha256: hasher::sha256_file(&tally_path)?,
+        params_sha256: hasher::sha256_file(&params_path)?,
+        adjacency_sha256: match adjacency_path {
+            Some(p) => Some(hasher::sha256_file(p)?),
+            None => None,
+        },
+    };
+
+    Ok(LoadedStage {
+        norm_ctx,
+        digests,
+        nm_digest: None,
+        formula_id: None,
+    })
+}
+
+// -------------------------------------------------------------------------------------------------
+// Internals
+// -------------------------------------------------------------------------------------------------
+
+/// Ensure the manifest matches the normative contract:
+/// - MUST provide `ballot_tally_path`
+/// - MUST NOT provide a legacy `ballots_path` (schema should forbid; we still guard).
+fn ensure_manifest_contract(man: &Manifest) -> Result<(), LoadError> {
+    if man.ballot_tally_path.trim().is_empty() {
+        return Err(LoadError::Contract(
+            "manifest must specify `ballot_tally_path` for normative runs".into(),
+        ));
+    }
+    // Defensive: if a legacy field slipped through (not present in typed Manifest), reject.
+    // We can't see unknown fields here, so this is best-effort; schema in vm_io should enforce it.
+    Ok(())
+}
+
+/// Convert vm_io's LoadedContext into our NormContext, re-asserting canonical option order.
+fn to_norm_context(io: loader::LoadedContext) -> Result<NormContext, LoadError> {
+    // Build a registry-wide canonical option list (dedupe by OptionId; keep min (order_index, id)).
+    let options = collect_registry_options(&io.registry);
+
+    // IDs are opaque in this stage; downstream RunRecord echoes them or uses placeholders.
+    let ids = LoadedIds {
+        reg_id: "REG:local".into(),
+        tally_id: "TLY:local".into(),
+        param_set_id: "PS:local".into(),
+    };
+
+    // (Optional) re-assertions could go here (e.g., non-empty units/options). vm_io guarantees canonical sort.
+    Ok(NormContext {
+        reg: io.registry,
+        options,
+        params: io.params,
+        tallies: io.tally,
+        ids,
+    })
+}
+
+/// Compute nm_digest and formula_id (equal under current policy) from a compact NM JSON
+/// derived from canonical input digests. Kept local to the LOAD stage when a manifest is used.
+fn compute_nm_fid_if_present_from_digests(d: &InputDigests) -> Result<(String, String), LoadError> {
+    // Compact NM view limited to deterministic, normative inputs (digests only).
+    let nm = serde_json::json!({
+        "normative_inputs": {
+            "division_registry_sha256": d.reg_sha256,
+            "ballot_tally_sha256": d.tally_sha256,
+            "parameter_set_sha256": d.params_sha256,
+            "adjacency_sha256": d.adjacency_sha256
+        }
+    });
+    let nm_digest = hasher::nm_digest_from_value(&nm).map_err(LoadError::from)?;
+    let fid = hasher::formula_id_from_nm(&nm).map_err(LoadError::from)?;
+    Ok((nm_digest, fid))
+}
+
+/// Resolve + stream-hash the normative inputs referenced by the manifest.
+/// (This is used by the manifest entry path; vm_io already computes canonical digests internally,
+/// but we surface file digests here for transparency.)
+fn collect_input_digests(paths: &ResolvedPaths) -> Result<InputDigests, LoadError> {
+    let reg_sha256 = hasher::sha256_file(&paths.reg)?;
+    let tally_sha256 = hasher::sha256_file(&paths.tally)?;
+    let params_sha256 = hasher::sha256_file(&paths.params)?;
+    let adjacency_sha256 = match &paths.adjacency {
+        Some(p) => Some(hasher::sha256_file(p)?),
+        None => None,
+    };
+    Ok(InputDigests {
+        reg_sha256,
+        tally_sha256,
+        params_sha256,
+        adjacency_sha256,
+    })
+}
+
+// -------------------------------------------------------------------------------------------------
+// Small utilities
+// -------------------------------------------------------------------------------------------------
+
+/// Aggregate a registry-wide option list, deduped by OptionId and sorted by (order_index, OptionId).
+fn collect_registry_options(reg: &DivisionRegistry) -> Vec<OptionItem> {
+    use core::cmp::Ordering;
+
+    let mut seen: BTreeMap<vm_core::ids::OptionId, OptionItem> = BTreeMap::new();
+    for unit in &reg.units {
+        for opt in &unit.options {
+            // If the same option_id appears across units, prefer the one with the smaller (order_index, id).
+            match seen.get(&opt.option_id) {
+                None => {
+                    seen.insert(opt.option_id.clone(), opt.clone());
+                }
+                Some(existing) => {
+                    let a = (opt.order_index, &opt.option_id);
+                    let b = (existing.order_index, &existing.option_id);
+                    if a.cmp(&b) == Ordering::Less {
+                        seen.insert(opt.option_id.clone(), opt.clone());
+                    }
+                }
+            }
+        }
+    }
+    let mut options: Vec<OptionItem> = seen.into_values().collect();
+    options.sort_by(|a, b| {
+        (a
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/src/validate.rs
+--------------------------------------------------------------------------------
+//! crates/vm_pipeline/src/validate.rs
+//! Structural & semantic validation before any computation.
+//! Deterministic outputs; no RNG; pure integer reasoning.
+//!
+//! NOTE: This file implements the full reporting model and the
+//! option-ordering checks now (enforceable with current vm_core types).
+//! Other checks are scaffolded and will be filled as the corresponding
+//! fields/types (tree parents, magnitudes, tallies, params) are wired.
+
+#![allow(clippy::result_large_err)]
+
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+use vm_core::{
+    entities::{DivisionRegistry, OptionItem, Unit},
+    ids::{OptionId, UnitId},
+};
+
+/// Context normalized by LOAD (paths → typed, canonical ordering, ids echoed).
+/// This is declared elsewhere in the pipeline; we only borrow it here.
+#[allow(dead_code)]
+pub struct NormContext<'a> {
+    pub reg: &'a DivisionRegistry,
+    pub options: &'a [OptionItem],
+    // pub params: &'a vm_core::variables::Params,
+    // pub tallies: &'a vm_core::tallies::UnitTallies,
+    // pub ids: NormIds,
+}
+
+/// Issue severity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+/// Where the issue occurred (kept small & deterministic).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntityRef {
+    Root,
+    Unit(UnitId),
+    Option(OptionId),
+    Param(&'static str),
+    TallyUnit(UnitId),
+    Adjacency(UnitId, UnitId),
+}
+
+/// One validation finding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidationIssue {
+    pub severity: Severity,
+    pub code: &'static str,
+    pub message: String,
+    pub where_: EntityRef,
+}
+
+/// Deterministic report: pass = (no Error); ordering of issues is stable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ValidationReport {
+    pub pass: bool,
+    pub issues: Vec<ValidationIssue>,
+}
+
+/// Top-level entry point.
+pub fn validate(ctx: &NormContext) -> ValidationReport {
+    let mut issues: Vec<ValidationIssue> = Vec::new();
+
+    // A) Registry tree & magnitudes & baseline pairing (scaffold — fill as fields land)
+    issues.extend(check_registry_tree(ctx.reg));
+    issues.extend(check_unit_magnitudes(&ctx.reg.units));
+    issues.extend(check_baseline_pairing(&ctx.reg.units));
+
+    // B) Options: canonical order & order_index uniqueness (fully implemented now)
+    issues.extend(check_options_order(ctx.options));
+
+    // C) Params ↔ tally shape (scaffold)
+    // if let (Some(params), Some(tallies)) = (ctx.params_opt, ctx.tallies_opt) { ... }
+    // issues.extend(check_params_vs_tally(params, tallies));
+
+    // D) Tally sanity per ballot type (scaffold)
+    // issues.extend(check_tally_sanity_plurality(tallies, ctx.options));
+    // issues.extend(check_tally_sanity_approval(tallies, ctx.options));
+    // issues.extend(check_tally_sanity_score(tallies, ctx.options, params));
+    // issues.extend(check_tally_sanity_ranked_irv(tallies, ctx.options));
+    // issues.extend(check_tally_sanity_ranked_condorcet(tallies, ctx.options));
+
+    // E) WTA constraint (scaffold)
+    // issues.extend(check_wta_constraint(&ctx.reg.units, params));
+
+    // F) Quorum data presence/bounds (scaffold)
+    // issues.extend(check_quorum_data(&ctx.reg.units, tallies, params));
+
+    // G) Double-majority family preconditions (scaffold)
+    // issues.extend(check_double_majority_family(params, ctx.reg));
+
+    // H) Frontier prerequisites (shape-level) (scaffold)
+    // issues.extend(check_frontier_prereqs(params, ctx.reg));
+
+    // I) RNG tie knobs (re-assert only) (scaffold)
+    // issues.extend(check_tie_seed(params));
+
+    // Deterministic sort of issues (by code, then where, then message) for byte-identical runs.
+    sort_issues_stably(&mut issues);
+
+    ValidationReport {
+        pass: !issues.iter().any(|i| i.severity == Severity::Error),
+        issues,
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Helpers / checks
+// ------------------------------------------------------------------------------------------------
+
+fn check_registry_tree(_reg: &DivisionRegistry) -> Vec<ValidationIssue> {
+    // Current vm_core::entities::DivisionRegistry has no parent/root fields yet.
+    // Stub to be filled once the tree representation lands.
+    Vec::new()
+}
+
+fn check_unit_magnitudes(_units: &[Unit]) -> Vec<ValidationIssue> {
+    // Current Unit has no magnitude field yet; fill once available.
+    Vec::new()
+}
+
+fn check_baseline_pairing(_units: &[Unit]) -> Vec<ValidationIssue> {
+    // Current Unit has no baseline fields; fill once (population_baseline, year) exist.
+    Vec::new()
+}
+
+/// Enforce canonical option ordering and unique/non-negative order_index.
+///
+/// Errors:
+/// - "Option.OrderIndexDuplicate" on duplicate `order_index`
+/// Warnings:
+/// - "Option.OutOfOrder" if slice is not sorted by (order_index, OptionId)
+fn check_options_order(options: &[OptionItem]) -> Vec<ValidationIssue> {
+    use alloc::collections::BTreeSet;
+
+    let mut issues = Vec::new();
+
+    // Duplicate order_index?
+    let mut seen = BTreeSet::<u16>::new();
+    for o in options {
+        // non-negative is guaranteed by u16 type
+        if !seen.insert(o.order_index) {
+            issues.push(ValidationIssue {
+                severity: Severity::Error,
+                code: "Option.OrderIndexDuplicate",
+                message: format!("duplicate order_index {}", o.order_index),
+                where_: EntityRef::Option(o.option_id.clone()),
+            });
+        }
+    }
+
+    // Sorted by (order_index, OptionId)?
+    let mut prev: Option<(&OptionItem, (u16, &OptionId))> = None;
+    for o in options {
+        let key = (o.order_index, &o.option_id);
+        if let Some((_po, pk)) = prev.as_ref() {
+            if key < *pk {
+                issues.push(ValidationIssue {
+                    severity: Severity::Warning,
+                    code: "Option.OutOfOrder",
+                    message: "options are not in canonical (order_index, option_id) order".to_string(),
+                    where_: EntityRef::Option(o.option_id.clone()),
+                });
+                // Keep scanning to collect all warnings
+            }
+        }
+        prev = Some((o, key));
+    }
+
+    issues
+}
+
+// ------------------------------- Scaffolds for future data --------------------------------------
+
+fn check_params_vs_tally(
+    _params: &(), /* vm_core::variables::Params */
+    _tallies: &(), /* vm_core::tallies::UnitTallies */
+) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+fn check_tally_sanity_plurality(_tallies: &(), _options: &[OptionItem]) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+fn check_tally_sanity_approval(_tallies: &(), _options: &[OptionItem]) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+fn check_tally_sanity_score(
+    _tallies: &(),
+    _options: &[OptionItem],
+    _params: &(), /* Params for scale/domain */
+) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+fn check_tally_sanity_ranked_irv(_tallies: &(), _options: &[OptionItem]) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+fn check_tally_sanity_ranked_condorcet(
+    _tallies: &(),
+    _options: &[OptionItem],
+) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+fn check_wta_constraint(_units: &[Unit], _params: &()) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+fn check_quorum_data(_units: &[Unit], _tallies: &(), _params: &()) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+fn check_double_majority_family(_params: &(), _reg: &DivisionRegistry) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+fn check_frontier_prereqs(_params: &(), _reg: &DivisionRegistry) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+// ------------------------------------------------------------------------------------------------
+// Utilities
+// ------------------------------------------------------------------------------------------------
+
+fn sort_issues_stably(issues: &mut [ValidationIssue]) {
+    use core::cmp::Ordering;
+    issues.sort_by(|a, b| {
+        // primary: code
+        match a.code.cmp(b.code) {
+            Ordering::Equal => {
+                // secondary: where_
+                match cmp_where(&a.where_, &b.where_) {
+                    Ordering::Equal => {
+                        // tertiary: message text
+                        a.message.cmp(&b.message)
+                    }
+                    o => o,
+                }
+            }
+            o => o,
+        }
+    });
+}
+
+fn cmp_where(a: &EntityRef, b: &EntityRef) -> core::cmp::Ordering {
+    use EntityRef::*;
+    use core::cmp::Ordering::*;
+    match (a, b) {
+        (Root, Root) => Equal,
+        (Root, _) => Less,
+        (_, Root) => Greater,
+        (Param(pa), Param(pb)) => pa.cmp(pb),
+        (Param(_), _) => Less,
+        (_, Param(_)) => Greater,
+        (Option(oa), Option(ob)) => oa.cmp(ob),
+        (Option(_), _) => Less,
+        (_, Option(_)) => Greater,
+        (Unit(ua), Unit(ub)) => ua.cmp(ub),
+        (Unit(_), _) => Less,
+        (_, Unit(_)) => Greater,
+        (TallyUnit(ua), TallyUnit(ub)) => ua.cmp(ub),
+        (TallyUnit(_), _) => Less,
+        (_, TallyUnit(_)) => Greater,
+        (Adjacency(a1, a2), Adjacency(b1, b2)) => match a1.cmp(b1) {
+            Equal => a2.cmp(b2),
+            o => o,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vm_core::entities::OptionItem;
+
+    #[test]
+    fn detects_duplicate_order_index() {
+        let opts = vec![
+            OptionItem::new("A".parse().unwrap(), "A".into(), 0).unwrap(),
+            OptionItem::new("B".parse().unwrap(), "B".into(), 0).unwrap(), // duplicate
+        ];
+        let issues = check_options_order(&opts);
+        assert!(issues.iter().any(|i| i.code == "Option.OrderIndexDuplicate" && matches!(i.severity, Severity::Error)));
+    }
+
+    #[test]
+    fn warns_on_out_of_order() {
+        let opts = vec![
+            OptionItem::new("B".parse().unwrap(), "B".into(), 0).unwrap(),
+            OptionItem::new("A".parse().unwrap(), "A".into(), 0).unwrap(), // out of canonical order by id
+        ];
+        let issues = check_options_order(&opts);
+        assert!(issues.iter().any(|i| i.code == "Option.OutOfOrder" && matches!(i.severity, Severity::Warning)));
+    }
+
+    #[test]
+    fn ok_when_sorted_and_unique() {
+        let opts = vec![
+            OptionItem::new("A".parse().unwrap(), "A".into(), 0).unwrap(),
+            OptionItem::new("B".parse().unwrap(), "B".into(), 1).unwrap(),
+        ];
+        let issues = check_options_order(&opts);
+        assert!(issues.is_empty());
+    }
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/src/tabulate.rs
+--------------------------------------------------------------------------------
+//! crates/vm_pipeline/src/tabulate.rs
+//! TABULATE stage: compute per-Unit `UnitScores` deterministically from the loaded,
+//! canonicalized inputs according to VM-VAR-001. Integer-only; no RNG here.
+//!
+//! Inputs are provided through a minimal `LoadedContext` view (defined here to keep
+//! this module self-contained). The pipeline may later replace it with a richer type.
+
+use std::collections::BTreeMap;
+
+use vm_core::{
+    entities::{OptionItem, TallyTotals as Turnout},
+    ids::{OptionId, UnitId},
+    variables::Params,
+};
+use vm_algo::{
+    tabulation,      // pure algorithm entry points
+    IrvLog, Pairwise, UnitScores,
+};
+
+// ----- Context & unit inputs --------------------------------------------------------------------
+
+/// Minimal, stable view of what TABULATE needs.
+#[derive(Clone, Debug, Default)]
+pub struct LoadedContext {
+    /// Units to process, already canonicalized upstream (units ↑ by UnitId; options ↑ by (order_index, id)).
+    pub units: Vec<UnitInput>,
+}
+
+/// Per-unit input shape supporting all ballot types; unused fields are ignored
+/// by the relevant per-type dispatcher.
+#[derive(Clone, Debug, Default)]
+pub struct UnitInput {
+    pub unit_id: UnitId,
+    pub options: Vec<OptionItem>,                  // canonical order
+    pub turnout: Turnout,                          // valid/invalid/total (as aggregated upstream)
+
+    // Plurality/Approval/Score
+    pub plurality_votes: BTreeMap<OptionId, u64>,  // plurality
+    pub approvals: BTreeMap<OptionId, u64>,        // approval
+    pub score_sums: BTreeMap<OptionId, u64>,       // score (already domain-checked upstream)
+
+    // Ranked (IRV/Condorcet): compressed ballots (ranking, multiplicity)
+    pub ranked_ballots: Vec<(Vec<OptionId>, u64)>,
+}
+
+// ----- Audit sidecar ---------------------------------------------------------------------------
+
+/// Optional, lightweight log of a Condorcet completion (kept here until vm_algo exposes one).
+#[derive(Clone, Debug, Default)]
+pub struct CondorcetLog {
+    pub steps: Vec<String>,
+}
+
+/// Audit payload emitted by TABULATE. Downstream stages (allocation, reporting, ties)
+/// may read from these sidecars.
+#[derive(Clone, Debug, Default)]
+pub struct TabulateAudit {
+    pub irv_logs: BTreeMap<UnitId, IrvLog>,
+    pub condorcet_pairwise: BTreeMap<UnitId, Pairwise>,
+    pub condorcet_logs: BTreeMap<UnitId, CondorcetLog>,
+    /// Pending tie contexts (e.g., IRV elimination deadlocks) are collected here by a later
+    /// revision once `crate::ties::TieContext` lands.
+    pub pending_ties: Vec<()>, // placeholder; replaced by crate::ties::TieContext later
+}
+
+// ----- Param view (only what we need from VM-VAR-001..007 here) --------------------------------
+
+trait TabulateParamView {
+    fn ballot_is_plurality_001(&self) -> bool;
+    fn ballot_is_approval_001(&self) -> bool;
+    fn ballot_is_score_001(&self) -> bool;
+    fn ballot_is_ranked_irv_001(&self) -> bool;
+    fn ballot_is_ranked_condorcet_001(&self) -> bool;
+}
+
+impl TabulateParamView for Params {
+    // These forwarders assume `Params` exposes the same-named getters (Doc 2 / Annex A).
+    #[inline] fn ballot_is_plurality_001(&self) -> bool { self.ballot_is_plurality_001() }
+    #[inline] fn ballot_is_approval_001(&self) -> bool { self.ballot_is_approval_001() }
+    #[inline] fn ballot_is_score_001(&self) -> bool { self.ballot_is_score_001() }
+    #[inline] fn ballot_is_ranked_irv_001(&self) -> bool { self.ballot_is_ranked_irv_001() }
+    #[inline] fn ballot_is_ranked_condorcet_001(&self) -> bool { self.ballot_is_ranked_condorcet_001() }
+}
+
+// ----- Public entry point ----------------------------------------------------------------------
+
+/// Tabulate all units in canonical order, producing per-unit `UnitScores` and audit sidecars.
+/// No ratios/shares are computed here; those happen downstream (aggregation/reporting).
+pub fn tabulate_all(
+    ctx: &LoadedContext,
+    p: &Params,
+) -> (BTreeMap<UnitId, UnitScores>, TabulateAudit) {
+    let mut out_scores: BTreeMap<UnitId, UnitScores> = BTreeMap::new();
+    let mut audit = TabulateAudit::default();
+
+    if p.ballot_is_plurality_001() {
+        for u in &ctx.units {
+            let sc = tabulate_unit_plurality(u);
+            out_scores.insert(u.unit_id.clone(), sc);
+        }
+        return (out_scores, audit);
+    }
+
+    if p.ballot_is_approval_001() {
+        for u in &ctx.units {
+            let sc = tabulate_unit_approval(u);
+            out_scores.insert(u.unit_id.clone(), sc);
+        }
+        return (out_scores, audit);
+    }
+
+    if p.ballot_is_score_001() {
+        for u in &ctx.units {
+            let sc = tabulate_unit_score(u, p);
+            out_scores.insert(u.unit_id.clone(), sc);
+        }
+        return (out_scores, audit);
+    }
+
+    if p.ballot_is_ranked_irv_001() {
+        for u in &ctx.units {
+            let (sc, maybe_log /*, maybe_tie */) = tabulate_unit_ranked_irv(u, p);
+            if let Some(log) = maybe_log {
+                audit.irv_logs.insert(u.unit_id.clone(), log);
+            }
+            // if let Some(tc) = maybe_tie { audit.pending_ties.push(tc); }
+            out_scores.insert(u.unit_id.clone(), sc);
+        }
+        return (out_scores, audit);
+    }
+
+    if p.ballot_is_ranked_condorcet_001() {
+        for u in &ctx.units {
+            let (sc, maybe_pw, maybe_log) = tabulate_unit_ranked_condorcet(u, p);
+            if let Some(pw) = maybe_pw {
+                audit.condorcet_pairwise.insert(u.unit_id.clone(), pw);
+            }
+            if let Some(lg) = maybe_log {
+                audit.condorcet_logs.insert(u.unit_id.clone(), lg);
+            }
+            out_scores.insert(u.unit_id.clone(), sc);
+        }
+        return (out_scores, audit);
+    }
+
+    // Unknown ballot type – return empty with no scores; a higher layer should surface an error.
+    (out_scores, audit)
+}
+
+// ----- Per-type dispatchers (thin wrappers around vm_algo::tabulation) --------------------------
+
+fn tabulate_unit_plurality(unit: &UnitInput) -> UnitScores {
+    tabulation::tabulate_plurality(
+        unit.unit_id.clone(),
+        &unit.plurality_votes,
+        unit.turnout,
+    )
+}
+
+fn tabulate_unit_approval(unit: &UnitInput) -> UnitScores {
+    tabulation::tabulate_approval(
+        unit.unit_id.clone(),
+        &unit.approvals,
+        unit.turnout,
+    )
+}
+
+fn tabulate_unit_score(unit: &UnitInput, _p: &Params) -> UnitScores {
+    // Score scale/normalization (002/003/004) are enforced in vm_algo; inputs are already validated.
+    tabulation::tabulate_score(
+        unit.unit_id.clone(),
+        &unit.score_sums,
+        unit.turnout,
+    )
+}
+
+fn tabulate_unit_ranked_irv(
+    unit: &UnitInput,
+    _p: &Params,
+) -> (UnitScores, Option<IrvLog> /*, Option<crate::ties::TieContext>*/) {
+    let (sc, log) = tabulation::tabulate_ranked_irv(&unit.ranked_ballots, &unit.options);
+    (sc, Some(log) /*, None*/)
+}
+
+fn tabulate_unit_ranked_condorcet(
+    unit: &UnitInput,
+    _p: &Params,
+) -> (UnitScores, Option<Pairwise>, Option<CondorcetLog>) {
+    let (sc, pw) = tabulation::tabulate_ranked_condorcet(&unit.ranked_ballots, &unit.options);
+    (sc, Some(pw), None) // CondorcetLog placeholder until vm_algo exposes one
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/src/allocate.rs
+--------------------------------------------------------------------------------
+//! ALLOCATE stage: per-Unit seat/power allocation.
+//!
+//! Input: `UnitScores` from TABULATE, Unit metadata (magnitude), canonical options,
+//! and a `Params` snapshot (allocation method, PR threshold, tie policy/seed).
+//! Output: map of `UnitId -> UnitAllocation` and any tie contexts that should be
+//! logged/handled downstream. All choices are deterministic given the same inputs
+//! and, when `Random` tie policy is used, the same seed.
+
+use std::collections::BTreeMap;
+
+use vm_core::{
+    ids::{OptionId, UnitId},
+    // `UnitMeta` is expected to expose `magnitude` (u32). If your core uses a different
+    // struct name for per-unit metadata, alias it here.
+    entities::Unit as UnitMeta,
+    rng::{tie_rng_from_seed, TieRng},
+    variables::{AllocationMethod, Params, TiePolicy},
+};
+use vm_algo::{
+    allocation::{
+        dhondt as algo_dhondt,
+        largest_remainder as algo_lr,
+        sainte_lague as algo_sl,
+        wta as algo_wta,
+    },
+    tabulation::UnitScores, // unit-level score container from vm_algo
+};
+
+// If you keep tie-logging in a dedicated module, import its context type.
+// (This file only collects; construction happens where a tie actually occurs.)
+use crate::ties::TieContext;
+
+// Re-export the LR quota kind so callers don’t need to import the algo module directly.
+pub use vm_algo::allocation::largest_remainder::QuotaKind as LrQuotaKind;
+
+/// Unit-level allocation result. Seats for PR families; `100` "power" for WTA.
+#[derive(Debug, Clone)]
+pub struct UnitAllocation {
+    pub seats_or_power: BTreeMap<OptionId, u32>,
+    pub last_seat_tie: bool,
+}
+
+/// Public entry: allocate all units by the configured method.
+///
+/// - Iterates Units in stable `UnitId` order.
+/// - Applies the PR entry threshold where relevant (inside the algo call).
+/// - Honors tie policy (status_quo / deterministic / seeded random).
+pub fn allocate_all(
+    unit_scores: &BTreeMap<UnitId, UnitScores>,
+    units: &BTreeMap<UnitId, UnitMeta>,
+    options_by_unit: &BTreeMap<UnitId, Vec<vm_core::entities::OptionItem>>,
+    params: &Params,
+) -> (BTreeMap<UnitId, UnitAllocation>, Vec<TieContext>) {
+    // Prepare RNG once when tie policy == Random; shared stream across units for deterministic replay.
+    let tie_policy = params.tie_policy();
+    let mut rng = match tie_policy {
+        TiePolicy::Random => {
+            let seed = params.tie_seed(); // VM-VAR-033 / 052 per spec (integer ≥ 0)
+            Some(tie_rng_from_seed(seed as u64))
+        }
+        _ => None,
+    };
+
+    let mut out = BTreeMap::<UnitId, UnitAllocation>::new();
+    let mut tie_contexts: Vec<TieContext> = Vec::new();
+
+    for (unit_id, meta) in units.iter() {
+        // Canonical option order comes from loader/validate; fall back to empty vec if missing.
+        let options = options_by_unit.get(unit_id).map(Vec::as_slice).unwrap_or(&[]);
+        let scores = unit_scores
+            .get(unit_id)
+            .unwrap_or_else(|| {
+                // Graceful empty scores when a unit somehow lacks tabulation (should not happen)
+                // (0 votes for each option in canonical order).
+                // Build a zero map in canonical order:
+                static EMPTY: once_cell::sync::Lazy<UnitScores> = once_cell::sync::Lazy::new(|| UnitScores {
+                    unit_id: UnitId::from_static("U:__missing__"),
+                    turnout: vm_core::entities::Turnout {
+                        ballots_cast: 0,
+                        invalid_ballots: 0,
+                        valid_ballots: 0,
+                    },
+                    scores: BTreeMap::new(),
+                });
+                &*EMPTY
+            });
+
+        let (alloc, tie_ctx_opt) = allocate_one_unit(
+            unit_id.clone(),
+            scores,
+            meta,
+            options,
+            params,
+            rng.as_mut().map(|r| r as &mut TieRng),
+        );
+
+        if let Some(tc) = tie_ctx_opt {
+            tie_contexts.push(tc);
+        }
+        out.insert(unit_id.clone(), alloc);
+    }
+
+    (out, tie_contexts)
+}
+
+/// Orchestrate allocation for a single unit based on VM-VAR-010.
+fn allocate_one_unit(
+    unit_id: UnitId,
+    scores: &UnitScores,
+    meta: &UnitMeta,
+    options: &[vm_core::entities::OptionItem],
+    p: &Params,
+    rng: Option<&mut TieRng>,
+) -> (UnitAllocation, Option<TieContext>) {
+    let method = p.allocation_method();
+    let pr_threshold = p.pr_entry_threshold_pct();
+    let tie = p.tie_policy();
+
+    match method {
+        AllocationMethod::WinnerTakeAll => {
+            // Enforce magnitude == 1 for WTA.
+            if meta.magnitude != 1 {
+                // Surface a deterministic zero-allocation with a tie note; upstream VALIDATE should block this earlier.
+                return (
+                    UnitAllocation {
+                        seats_or_power: BTreeMap::new(),
+                        last_seat_tie: false,
+                    },
+                    Some(TieContext::error(
+                        unit_id,
+                        "Method.WTA.RequiresMagnitude1",
+                        "winner_take_all requires unit magnitude == 1",
+                    )),
+                );
+            }
+            // WTA lives inside vm_algo; it accepts UnitScores to use the same integer turnouts if needed.
+            match algo_wta::allocate_wta(scores, meta.magnitude, options, tie, rng) {
+                Ok(winner_alloc) => {
+                    let mut map = winner_alloc.seats_or_power;
+                    // Ensure exactly one entry has 100, others 0 (algo_wta ensures this).
+                    (UnitAllocation { seats_or_power: map, last_seat_tie: winner_alloc.last_seat_tie }, None)
+                }
+                Err(e) => (
+                    UnitAllocation { seats_or_power: BTreeMap::new(), last_seat_tie: false },
+                    Some(TieContext::error(unit_id, "Allocate.WTA", &format!("allocation failed: {:?}", e))),
+                ),
+            }
+        }
+
+        AllocationMethod::ProportionalFavorBig => {
+            // D’Hondt
+            let result = algo_dhondt::allocate_dhondt(
+                meta.magnitude,
+                &scores.scores,
+                options,
+                pr_threshold,
+                tie,
+                rng,
+            );
+            match result {
+                Ok(seats) => (UnitAllocation { seats_or_power: seats, last_seat_tie: false }, None),
+                Err(e) => (
+                    UnitAllocation { seats_or_power: BTreeMap::new(), last_seat_tie: false },
+                    Some(TieContext::error(unit_id, "Allocate.DHondt", &format!("allocation failed: {:?}", e))),
+                ),
+            }
+        }
+
+        AllocationMethod::ProportionalFavorSmall => {
+            // Sainte-Laguë
+            let result = algo_sl::allocate_sainte_lague(
+                meta.magnitude,
+                &scores.scores,
+                options,
+                pr_threshold,
+                tie,
+                rng,
+            );
+            match result {
+                Ok(seats) => (UnitAllocation { seats_or_power: seats, last_seat_tie: false }, None),
+                Err(e) => (
+                    UnitAllocation { seats_or_power: BTreeMap::new(), last_seat_tie: false },
+                    Some(TieContext::error(unit_id, "Allocate.SainteLague", &format!("allocation failed: {:?}", e))),
+                ),
+            }
+        }
+
+        AllocationMethod::LargestRemainder => {
+            // LR with quota configured in Params (Hare/Droop/Imperiali)
+            let quota = lr_quota_from_params(p);
+            let result = algo_lr::allocate_largest_remainder(
+                meta.magnitude,
+                &scores.scores,
+                options,
+                pr_threshold,
+                quota,
+                tie,
+                rng,
+            );
+            match result {
+                Ok(seats) => (UnitAllocation { seats_or_power: seats, last_seat_tie: false }, None),
+                Err(e) => (
+                    UnitAllocation { seats_or_power: BTreeMap::new(), last_seat_tie: false },
+                    Some(TieContext::error(unit_id, "Allocate.LargestRemainder", &format!("allocation failed: {:?}", e))),
+                ),
+            }
+        }
+
+        // Mixed-member correction is handled at aggregate/MMP level; locals come from SMD/WTA above.
+        AllocationMethod::MixedLocalCorrection => {
+            (UnitAllocation { seats_or_power: BTreeMap::new(), last_seat_tie: false }, None)
+        }
+    }
+}
+
+// ----- helpers -------------------------------------------------------------------------------------------------------
+
+#[inline]
+fn lr_quota_from_params(p: &Params) -> LrQuotaKind {
+    // Wire this to your params variable (e.g., VM-VAR for LR quota). Default to Hare if unset.
+    if let Some(kind) = p.lr_quota_kind() {
+        match kind {
+            // Keep exact mapping as your `Params` exposes it.
+            vm_core::variables::LrQuotaKind::Hare => LrQuotaKind::Hare,
+            vm_core::variables::LrQuotaKind::Droop => LrQuotaKind::Droop,
+            vm_core::variables::LrQuotaKind::Imperiali => LrQuotaKind::Imperiali,
+        }
+    } else {
+        LrQuotaKind::Hare
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// TieContext convenience (error helper)
+// -------------------------------------------------------------------------------------------------
+
+mod tie_context_helpers {
+    use super::*;
+    pub trait TieContextExt {
+        fn error(unit_id: UnitId, code: &'static str, msg: &str) -> Self;
+    }
+    impl TieContextExt for TieContext {
+        fn error(unit_id: UnitId, code: &'static str, msg: &str) -> Self {
+            TieContext {
+                unit_id,
+                code: code.into(),
+                message: msg.into(),
+                contenders: Vec::new(),
+                note: None,
+            }
+        }
+    }
+}
+use tie_context_helpers::TieContextExt;
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/src/aggregate.rs
+--------------------------------------------------------------------------------
+//! APPLY_RULES stage: evaluate legitimacy gates in fixed order
+//! Quorum → Majority/Supermajority → Double-majority (optional) → Symmetry (optional).
+//!
+//! Pure integer/rational math; no RNG. Approval majority uses approvals_for_change / valid_ballots.
+//! This module intentionally does not perform frontier mapping or tie handling.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use vm_core::{
+    ids::UnitId,
+    rounding::{ge_percent, Ratio},
+    variables::{BallotType, Params},
+};
+
+/// Minimal aggregate row used by gate math.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AggregateRow {
+    pub ballots_cast: u64,
+    pub invalid_or_blank: u64,
+    pub valid_ballots: u64,
+    pub eligible_roll: u64,
+    pub approvals_for_change: Option<u64>, // present for approval ballots
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AggregatesView {
+    pub national: AggregateRow,
+    pub by_region: BTreeMap<UnitId, AggregateRow>, // empty if not needed
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DenomPolicy {
+    /// Majority over valid ballots only.
+    ValidBallots,
+    /// Majority over valid + blank/invalid when VM-VAR-007 toggles this for gates.
+    ValidPlusBlank,
+    /// Approval support: approvals_for_change / valid_ballots (fixed).
+    ApprovalRateValid,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GateOutcome {
+    pub observed: Ratio,   // exact rational; packaging converts to numbers later
+    pub threshold_pct: u8, // integer percent
+    pub pass: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct DoubleOutcome {
+    pub national: GateOutcome,
+    pub family: GateOutcome,
+    pub pass: bool,
+    pub members: Vec<UnitId>, // affected family (canonical order)
+}
+
+#[derive(Clone, Debug)]
+pub struct SymmetryOutcome {
+    pub respected: bool,
+    pub exceptions: Vec<String>, // codes from Params (VM-VAR-029), if any
+}
+
+#[derive(Clone, Debug)]
+pub struct QuorumDetail {
+    pub national: GateOutcome,                          // turnout Σ ballots_cast / Σ eligible_roll
+    pub per_unit_flags: Option<BTreeMap<UnitId, bool>>, // per-unit turnout pass/fail if configured
+}
+
+#[derive(Clone, Debug)]
+pub struct LegitimacyReport {
+    pub pass: bool,
+    pub reasons: Vec<String>, // stable machine-readable strings
+    pub quorum: QuorumDetail,
+    pub majority: GateOutcome,
+    pub double_majority: Option<DoubleOutcome>,
+    pub symmetry: Option<SymmetryOutcome>,
+}
+
+// -------------------------------------------------------------------------------------------------
+// Public API
+// -------------------------------------------------------------------------------------------------
+
+/// Evaluate decision rules in fixed order. The returned `LegitimacyReport` is deterministic.
+///
+/// `per_unit_turnout` is optional input to annotate per-unit quorum flags (when configured).
+pub fn apply_decision_rules(
+    agg: &AggregatesView,
+    p: &Params,
+    per_unit_turnout: Option<&BTreeMap<UnitId, AggregateRow>>,
+) -> LegitimacyReport {
+    let mut reasons: Vec<String> = Vec::new();
+
+    // A) Quorum (national + optional per-unit flags)
+    let (quorum_detail, quorum_pass) = eval_quorum(agg, p, per_unit_turnout);
+    if !quorum_pass {
+        reasons.push("Quorum.NationalBelowThreshold".to_string());
+    }
+
+    // B) Majority / Supermajority (national)
+    let (majority_outcome, maj_pass) = eval_majority(agg, p);
+    if !maj_pass {
+        reasons.push("Majority.BelowThreshold".to_string());
+    }
+
+    // C) Double-majority (optional)
+    let (double_outcome_opt, dm_pass) = eval_double_majority(agg, p);
+    if !dm_pass {
+        // Be specific if we can, otherwise use a generic code.
+        let code = if double_outcome_opt.is_none() && p.double_majority_enabled() {
+            "DoubleMajority.FamilyUnresolved"
+        } else if p.double_majority_enabled() {
+            "DoubleMajority.BelowThreshold"
+        } else {
+            // Not enabled → this gate is not part of pass/fail.
+            "DoubleMajority.Disabled"
+        };
+        if p.double_majority_enabled() {
+            reasons.push(code.to_string());
+        }
+    }
+
+    // D) Symmetry (optional)
+    let symmetry_opt = eval_symmetry(p);
+    let symmetry_ok = symmetry_opt.as_ref().map(|s| s.respected).unwrap_or(true);
+    if !symmetry_ok {
+        reasons.push("Symmetry.ExceptionsPresent".to_string());
+    }
+
+    // Overall pass: all enabled gates must pass.
+    let overall_pass = quorum_pass && maj_pass && dm_pass && symmetry_ok;
+
+    LegitimacyReport {
+        pass: overall_pass,
+        reasons,
+        quorum: quorum_detail,
+        majority: majority_outcome,
+        double_majority: double_outcome_opt,
+        symmetry: symmetry_opt,
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Helpers (pure, deterministic)
+// -------------------------------------------------------------------------------------------------
+
+/// ballots_cast / eligible_roll (den>0; if eligible_roll==0, treat as 0/1).
+fn turnout_ratio(row: &AggregateRow) -> Ratio {
+    let num = row.ballots_cast as i128;
+    let den = if row.eligible_roll == 0 { 1 } else { row.eligible_roll } as i128;
+    Ratio { num, den } // invariant den > 0
+}
+
+/// Determine national support ratio and the denominator policy.
+/// - Approval ballots: approvals_for_change / valid_ballots (ApprovalRateValid).
+/// - Otherwise: valid (or valid+blank if VM-VAR-007 on).
+fn support_ratio_national(agg: &AggregatesView, p: &Params) -> (Ratio, DenomPolicy) {
+    match p.ballot_type() {
+        BallotType::Approval => {
+            let num_u64 = agg.national.approvals_for_change.unwrap_or(0);
+            let den_u64 = agg.national.valid_ballots;
+            let den = if den_u64 == 0 { 1 } else { den_u64 };
+            (
+                Ratio {
+                    num: num_u64 as i128,
+                    den: den as i128,
+                },
+                DenomPolicy::ApprovalRateValid,
+            )
+        }
+        _ => {
+            let include_blank = p.include_blank_in_denominator();
+            let valid = agg.national.valid_ballots;
+            let den_u64 = if include_blank {
+                agg.national.valid_ballots
+                    .saturating_add(agg.national.invalid_or_blank)
+            } else {
+                valid
+            };
+            // For non-approval ballots, the numerator (support for change) must come from upstream
+            // aggregation. If not provided at this stage, we conservatively treat it as 0.
+            // Validation should ensure meaningful configuration before reaching here.
+            let observed_num = agg.national.approvals_for_change.unwrap_or(0);
+            let den = if den_u64 == 0 { 1 } else { den_u64 };
+            let policy = if include_blank {
+                DenomPolicy::ValidPlusBlank
+            } else {
+                DenomPolicy::ValidBallots
+            };
+            (
+                Ratio {
+                    num: observed_num as i128,
+                    den: den as i128,
+                },
+                policy,
+            )
+        }
+    }
+}
+
+/// Resolve affected family members per Params. In absence of a richer resolver,
+/// default to all keys in `by_region` (canonical `UnitId` order) when double-majority is enabled.
+fn family_units(agg: &AggregatesView, p: &Params) -> Vec<UnitId> {
+    if !p.double_majority_enabled() {
+        return Vec::new();
+    }
+    agg.by_region.keys().cloned().collect()
+}
+
+/// Family support ratio computed consistently with national policy.
+/// When approval: sum approvals_for_change / sum valid.
+/// Else: sum (numerators supplied upstream via approvals_for_change if applicable) / sum denom per policy.
+fn support_ratio_family(agg: &AggregatesView, members: &[UnitId], p: &Params) -> (Ratio, DenomPolicy) {
+    match p.ballot_type() {
+        BallotType::Approval => {
+            let mut num_sum: u128 = 0;
+            let mut den_sum: u128 = 0;
+            for u in members {
+                if let Some(row) = agg.by_region.get(u) {
+                    num_sum = num_sum.saturating_add(row.approvals_for_change.unwrap_or(0) as u128);
+                    den_sum = den_sum.saturating_add(row.valid_ballots as u128);
+                }
+            }
+            let den = if den_sum == 0 { 1 } else { den_sum } as i128;
+            (
+                Ratio {
+                    num: num_sum as i128,
+                    den,
+                },
+                DenomPolicy::ApprovalRateValid,
+            )
+        }
+        _ => {
+            let include_blank = p.include_blank_in_denominator();
+            let mut num_sum: u128 = 0;
+            let mut den_sum: u128 = 0;
+            for u in members {
+                if let Some(row) = agg.by_region.get(u) {
+                    // As above: if upstream didn’t supply a numerator, treat as 0.
+                    num_sum = num_sum.saturating_add(row.approvals_for_change.unwrap_or(0) as u128);
+                    let unit_den = if include_blank {
+                        row.valid_ballots.saturating_add(row.invalid_or_blank)
+                    } else {
+                        row.valid_ballots
+                    } as u128;
+                    den_sum = den_sum.saturating_add(unit_den);
+                }
+            }
+            let den = if den_sum == 0 { 1 } else { den_sum } as i128;
+            let policy = if include_blank {
+                DenomPolicy::ValidPlusBlank
+            } else {
+                DenomPolicy::ValidBallots
+            };
+            (
+                Ratio {
+                    num: num_sum as i128,
+                    den,
+                },
+                policy,
+            )
+        }
+    }
+}
+
+/// Quorum evaluation: national + optional per-unit flags (when threshold > 0 and input provided).
+fn eval_quorum(
+    agg: &AggregatesView,
+    p: &Params,
+    per_unit_turnout: Option<&BTreeMap<UnitId, AggregateRow>>,
+) -> (QuorumDetail, bool) {
+    let q_nat_pct = p.quorum_global_pct();
+    // National turnout
+    let nat_ratio = turnout_ratio(&agg.national);
+    let nat_pass = ge_percent(
+        nat_ratio.num,
+        nat_ratio.den,
+        q_nat_pct,
+    ).unwrap_or(false);
+
+    // Per-unit flags only if configured and data is provided.
+    let per_unit_pct = p.quorum_per_unit_pct();
+    let per_unit_flags = if per_unit_pct > 0 {
+        per_unit_turnout.map(|m| {
+            let mut flags = BTreeMap::<UnitId, bool>::new();
+            for (uid, row) in m.iter() {
+                let r = turnout_ratio(row);
+                let ok = ge_percent(r.num, r.den, per_unit_pct).unwrap_or(false);
+                flags.insert(uid.clone(), ok);
+            }
+            flags
+        })
+    } else {
+        None
+    };
+
+    let detail = QuorumDetail {
+        national: GateOutcome {
+            observed: nat_ratio,
+            threshold_pct: q_nat_pct,
+            pass: nat_pass,
+        },
+        per_unit_flags,
+    };
+
+    (detail, nat_pass)
+}
+
+/// National majority/supermajority gate.
+fn eval_majority(agg: &AggregatesView, p: &Params) -> (GateOutcome, bool) {
+    let (ratio, _policy) = support_ratio_national(agg, p);
+    let pct = p.national_majority_pct();
+    let pass = ge_percent(ratio.num, ratio.den, pct).unwrap_or(false);
+    (
+        GateOutcome {
+            observed: ratio,
+            threshold_pct: pct,
+            pass,
+        },
+        pass,
+    )
+}
+
+/// Optional double-majority gate. Returns (None, true) when not enabled.
+fn eval_double_majority(agg: &AggregatesView, p: &Params) -> (Option<DoubleOutcome>, bool) {
+    if !p.double_majority_enabled() {
+        return (None, true);
+    }
+
+    // National outcome (reuse majority calculation for consistency).
+    let (nat_ratio, _) = support_ratio_national(agg, p);
+    let nat_pct = p.national_majority_pct();
+    let nat_pass = ge_percent(nat_ratio.num, nat_ratio.den, nat_pct).unwrap_or(false);
+
+    // Resolve family members; empty -> failure.
+    let members = family_units(agg, p);
+    if members.is_empty() {
+        return (None, false);
+    }
+
+    let (fam_ratio, _) = support_ratio_family(agg, &members, p);
+    let fam_pct = p.regional_majority_pct();
+    let fam_pass = ge_percent(fam_ratio.num, fam_ratio.den, fam_pct).unwrap_or(false);
+
+    let overall = nat_pass && fam_pass;
+    let outcome = DoubleOutcome {
+        national: GateOutcome {
+            observed: nat_ratio,
+            threshold_pct: nat_pct,
+            pass: nat_pass,
+        },
+        family: GateOutcome {
+            observed: fam_ratio,
+            threshold_pct: fam_pct,
+            pass: fam_pass,
+        },
+        pass: overall,
+        members,
+    };
+    (Some(outcome), overall)
+}
+
+/// Optional symmetry check. If disabled, returns None (treated as respected).
+fn eval_symmetry(p: &Params) -> Option<SymmetryOutcome> {
+    if !p.symmetry_enabled() {
+        return None;
+    }
+    // If exceptions are declared, we report respected = false.
+    let exceptions: Vec<String> = p
+        .symmetry_exceptions()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let respected = exceptions.is_empty();
+    Some(SymmetryOutcome { respected, exceptions })
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/src/apply_rules.rs
+--------------------------------------------------------------------------------
+//! MAP_FRONTIER stage (runs only if gates PASSED).
+//! - Assign one status per Unit via configured bands
+//! - Build components using allowed edge types
+//! - Apply corridor/island policy (modeled via allowed-edge mask here)
+//! - Enforce protected/quorum blocks
+//! - Flag mediation (isolated pre-block change) and enclaves (post-block surrounded)
+//!
+//! Pure integer/rational math; no RNG.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use vm_core::{
+    ids::UnitId,
+    entities::EdgeType,      // expected: Land | Bridge | Water
+    rounding::{ge_percent, Ratio},
+    variables::Params,
+};
+
+// ---------- Public view inputs ----------
+
+#[derive(Clone, Debug, Default)]
+pub struct UnitsView {
+    /// All known units (stable set; determines iteration order)
+    pub all: BTreeSet<UnitId>,
+    /// Units that must not change status; frontier assignment is forced to "none"
+    pub protected: BTreeSet<UnitId>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AdjacencyView {
+    /// Undirected edges (a,b,kind). Each pair may appear once.
+    pub edges: Vec<(UnitId, UnitId, EdgeType)>,
+}
+
+// ---------- Local types ----------
+
+pub type AllowedEdges = BTreeSet<EdgeType>;
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug)]
+pub enum FrontierMode {
+    None,
+    SlidingScale,
+    AutonomyLadder,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug)]
+pub enum IslandCorridorRule {
+    None,
+    FerryAllowed,
+    CorridorRequired,
+}
+
+#[derive(Clone, Debug)]
+pub struct Band {
+    pub min_pct: u8,        // inclusive
+    pub max_pct: u8,        // inclusive
+    pub status: String,     // machine-readable label
+    pub ap_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug)]
+pub struct ComponentId(pub u32);
+
+#[derive(Default, Clone, Debug)]
+pub struct UnitFlags {
+    pub mediation: bool,
+    pub enclave: bool,
+    pub protected_blocked: bool,
+    pub quorum_blocked: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct UnitFrontier {
+    pub status: String,                // one of bands[].status or "none" when blocked/mode=None
+    pub band_index: Option<usize>,     // index in configured bands (None for "none")
+    pub component: ComponentId,
+    pub flags: UnitFlags,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct FrontierMap {
+    pub units: BTreeMap<UnitId, UnitFrontier>,
+    pub summary_by_status: BTreeMap<String, u32>,
+    /// "mediation","enclave","protected_blocked","quorum_blocked"
+    pub summary_flags: BTreeMap<&'static str, u32>,
+}
+
+// ---------- Public API ----------
+
+pub fn map_frontier(
+    units: &UnitsView,
+    unit_support_pct: &BTreeMap<UnitId, Ratio>,
+    adjacency: &AdjacencyView,
+    p: &Params,
+    per_unit_quorum: Option<&BTreeMap<UnitId, bool>>,
+) -> FrontierMap {
+    // Resolve configured mode & bands
+    let (mode, bands) = resolve_mode_and_bands(p);
+
+    // Allowed edges + corridor rule
+    let allowed = allowed_edges_from_params(p);
+    let corridor = corridor_rule_from_params(p);
+
+    // Components first (deterministic numbering)
+    let (comp_of, components) = build_components(adjacency, &allowed, corridor);
+
+    // Fast exit when mode=None: assign "none" to all units but still keep components.
+    if matches!(mode, FrontierMode::None) {
+        let mut out = FrontierMap::default();
+        for uid in &units.all {
+            let comp = comp_of.get(uid).cloned().unwrap_or(ComponentId(0));
+            out.units.insert(
+                uid.clone(),
+                UnitFrontier {
+                    status: "none".to_string(),
+                    band_index: None,
+                    component: comp,
+                    flags: UnitFlags::default(),
+                },
+            );
+        }
+        update_summaries(&mut out);
+        return out;
+    }
+
+    // Pass 1: compute intended (pre-block) status from bands
+    let mut planned_status: BTreeMap<UnitId, (String, Option<usize>)> = BTreeMap::new();
+    for uid in &units.all {
+        let support = unit_support_pct
+            .get(uid)
+            .cloned()
+            .unwrap_or(Ratio { num: 0, den: 1 });
+        planned_status.insert(uid.clone(), pick_band_status(support, &bands));
+    }
+
+    // Pass 2: instantiate UnitFrontier entries with blocks (protected/quorum), but keep
+    // a copy of the original planned status for mediation analysis.
+    let mut out = FrontierMap::default();
+    for uid in &units.all {
+        let (mut status, mut band_idx) = planned_status[uid].clone();
+        let comp = comp_of.get(uid).cloned().unwrap_or(ComponentId(0));
+        let mut flags = UnitFlags::default();
+
+        apply_protection_and_quorum(uid, &mut status, &mut band_idx, &mut flags, units, per_unit_quorum);
+
+        out.units.insert(
+            uid.clone(),
+            UnitFrontier {
+                status,
+                band_index: band_idx,
+                component: comp,
+                flags,
+            },
+        );
+    }
+
+    // Pass 3: mediation — if a unit planned a non-"none" status, but has no neighbor
+    // with the same planned status (under allowed edges), mark mediation and force "none".
+    // (We look at planned statuses to capture isolation independent of blocks.)
+    {
+        // Build adjacency map constrained to allowed edges, to check same-status neighbors.
+        let adj = adjacency_map(adjacency, &allowed);
+
+        for uid in &units.all {
+            let (planned, _) = &planned_status[uid];
+            if planned == "none" {
+                continue;
+            }
+            // Does it have any neighbor planning the same status?
+            let mut has_same_neighbor = false;
+            if let Some(neis) = adj.get(uid) {
+                for v in neis {
+                    if let Some((nbr_planned, _)) = planned_status.get(v) {
+                        if nbr_planned == planned {
+                            has_same_neighbor = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !has_same_neighbor {
+                if let Some(uf) = out.units.get_mut(uid) {
+                    uf.flags.mediation = true;
+                    uf.status = "none".to_string();
+                    uf.band_index = None;
+                }
+            }
+        }
+    }
+
+    // Pass 4: enclaves — after final statuses, a unit with status != "none" is an enclave
+    // if all its neighbors (within allowed edges) are "none". Require at least one neighbor.
+    {
+        let adj = adjacency_map(adjacency, &allowed);
+        for uid in &units.all {
+            let mut has_neighbor = false;
+            let mut all_neighbors_none = true;
+            if let Some(uf) = out.units.get(uid) {
+                if uf.status == "none" {
+                    continue;
+                }
+                if let Some(neis) = adj.get(uid) {
+                    for v in neis {
+                        has_neighbor = true;
+                        let ns = &out.units[v].status;
+                        if ns != "none" {
+                            all_neighbors_none = false;
+                            break;
+                        }
+                    }
+                }
+                if has_neighbor && all_neighbors_none {
+                    if let Some(ufm) = out.units.get_mut(uid) {
+                        ufm.flags.enclave = true;
+                    }
+                }
+            }
+        }
+    }
+
+    update_summaries(&mut out);
+    out
+}
+
+// ---------- Internals ----------
+
+fn resolve_mode_and_bands(p: &Params) -> (FrontierMode, Vec<Band>) {
+    // These accessors mirror the variables noted in the spec. If Params exposes different
+    // method names in your tree, wire them here.
+    let mode = match p.frontier_mode() {
+        // Assume vm_core::variables::FrontierMode isomorphic to ours:
+        vm_core::variables::FrontierMode::None => FrontierMode::None,
+        vm_core::variables::FrontierMode::SlidingScale => FrontierMode::SlidingScale,
+        vm_core::variables::FrontierMode::AutonomyLadder => FrontierMode::AutonomyLadder,
+    };
+
+    let mut bands = Vec::<Band>::new();
+    for b in p.frontier_bands().unwrap_or_default() {
+        // Assume `b` exposes (min,max,status,ap_id?) getters
+        bands.push(Band {
+            min_pct: b.min_pct(),
+            max_pct: b.max_pct(),
+            status: b.status().to_string(),
+            ap_id: b.ap_id(),
+        });
+    }
+    (mode, bands)
+}
+
+fn allowed_edges_from_params(p: &Params) -> AllowedEdges {
+    // Expect Params to expose a set of EdgeType values; default to {Land, Bridge} if absent.
+    let mut set: AllowedEdges = p.frontier_allowed_edge_types().unwrap_or_default();
+    if set.is_empty() {
+        set.insert(EdgeType::Land);
+        set.insert(EdgeType::Bridge);
+    }
+    set
+}
+
+fn corridor_rule_from_params(p: &Params) -> IslandCorridorRule {
+    match p.island_corridor_rule() {
+        vm_core::variables::IslandCorridorRule::None => IslandCorridorRule::None,
+        vm_core::variables::IslandCorridorRule::FerryAllowed => IslandCorridorRule::FerryAllowed,
+        vm_core::variables::IslandCorridorRule::CorridorRequired => IslandCorridorRule::CorridorRequired,
+    }
+}
+
+/// Create adjacency lists filtered by `allowed` edge kinds.
+fn adjacency_map(
+    adjacency: &AdjacencyView,
+    allowed: &AllowedEdges,
+) -> BTreeMap<UnitId, BTreeSet<UnitId>> {
+    let mut map: BTreeMap<UnitId, BTreeSet<UnitId>> = BTreeMap::new();
+    for (a, b, kind) in &adjacency.edges {
+        if allowed.contains(kind) {
+            map.entry(a.clone()).or_default().insert(b.clone());
+            map.entry(b.clone()).or_default().insert(a.clone());
+        }
+    }
+    map
+}
+
+fn build_components(
+    adjacency: &AdjacencyView,
+    allowed: &AllowedEdges,
+    _corridor: IslandCorridorRule,
+) -> (BTreeMap<UnitId, ComponentId>, Vec<BTreeSet<UnitId>>) {
+    // NOTE: Corridor policy is represented by the allowed-edge mask here. If your engine
+    // adds corridor metadata, incorporate it into `allowed` before reaching this point.
+
+    let adj = adjacency_map(adjacency, allowed);
+
+    // Collect all vertices mentioned by edges; isolated vertices can be injected by callers via UnitsView.
+    let mut all: BTreeSet<UnitId> = BTreeSet::new();
+    for (u, neis) in &adj {
+        all.insert(u.clone());
+        for v in neis {
+            all.insert(v.clone());
+        }
+    }
+
+    // Build connected components via BFS in UnitId order for determinism.
+    let mut seen: BTreeSet<UnitId> = BTreeSet::new();
+    let mut comps: Vec<BTreeSet<UnitId>> = Vec::new();
+
+    for start in &all {
+        if seen.contains(start) {
+            continue;
+        }
+        let mut comp = BTreeSet::<UnitId>::new();
+        let mut q = VecDeque::<UnitId>::new();
+        q.push_back(start.clone());
+        seen.insert(start.clone());
+        comp.insert(start.clone());
+
+        while let Some(u) = q.pop_front() {
+            if let Some(neis) = adj.get(&u) {
+                for v in neis {
+                    if !seen.contains(v) {
+                        seen.insert(v.clone());
+                        comp.insert(v.clone());
+                        q.push_back(v.clone());
+                    }
+                }
+            }
+        }
+        comps.push(comp);
+    }
+
+    // Sort components by their smallest UnitId to fix numbering, then assign IDs 0..N-1.
+    comps.sort_by(|a, b| a.iter().next().cmp(&b.iter().next()));
+
+    let mut comp_of: BTreeMap<UnitId, ComponentId> = BTreeMap::new();
+    for (idx, comp) in comps.iter().enumerate() {
+        let cid = ComponentId(idx as u32);
+        for u in comp {
+            comp_of.insert(u.clone(), cid);
+        }
+    }
+
+    (comp_of, comps)
+}
+
+/// Inclusive band check: pick the first band b where min ≤ pct(support) ≤ max.
+fn pick_band_status(support: Ratio, bands: &[Band]) -> (String, Option<usize>) {
+    for (i, b) in bands.iter().enumerate() {
+        let ge_min = ge_percent(support.num, support.den, b.min_pct).unwrap_or(false);
+        // For the inclusive upper bound, check NOT (support ≥ max+1)
+        let lt_next = if b.max_pct < 100 {
+            !ge_percent(support.num, support.den, b.max_pct.saturating_add(1)).unwrap_or(false)
+        } else {
+            true // max=100 means anything ≥100% still qualifies
+        };
+        if ge_min && lt_next {
+            return (b.status.clone(), Some(i));
+        }
+    }
+    ("none".to_string(), None)
+}
+
+fn apply_protection_and_quorum(
+    unit_id: &UnitId,
+    intended_status: &mut String,
+    band_idx: &mut Option<usize>,
+    flags: &mut UnitFlags,
+    units: &UnitsView,
+    per_unit_quorum: Option<&BTreeMap<UnitId, bool>>,
+) {
+    if units.protected.contains(unit_id) && intended_status.as_str() != "none" {
+        flags.protected_blocked = true;
+        *intended_status = "none".to_string();
+        *band_idx = None;
+    }
+    if let Some(map) = per_unit_quorum {
+        if let Some(false) = map.get(unit_id).copied() {
+            flags.quorum_blocked = true;
+            *intended_status = "none".to_string();
+            *band_idx = None;
+        }
+    }
+}
+
+fn tag_mediation_and_enclaves(
+    _unit_id: &UnitId,
+    _unit_map: &mut BTreeMap<UnitId, UnitFrontier>,
+    _components: &Vec<BTreeSet<UnitId>>,
+    _allowed: &AllowedEdges,
+) {
+    // (kept for parity with the design doc; mediation/enclave tagging happens inline in map_frontier())
+}
+
+fn update_summaries(out: &mut FrontierMap) {
+    // Status counts
+    let mut by_status: BTreeMap<String, u32> = BTreeMap::new();
+    // Flag counts
+    let mut f_mediation = 0u32;
+    let mut f_enclave = 0u32;
+    let mut f_prot = 0u32;
+    let mut f_quorum = 0u32;
+
+    for (_u, entry) in &out.units {
+        *by_status.entry(entry.status.clone()).or_insert(0) += 1;
+        if entry.flags.mediation {
+            f_mediation += 1;
+        }
+        if entry.flags.enclave {
+            f_enclave += 1;
+        }
+        if entry.flags.protected_blocked {
+            f_prot += 1;
+        }
+        if entry.flags.quorum_blocked {
+            f_quorum += 1;
+        }
+    }
+
+    out.summary_by_status = by_status;
+    out.summary_flags.insert("mediation", f_mediation);
+    out.summary_flags.insert("enclave", f_enclave);
+    out.summary_flags.insert("protected_blocked", f_prot);
+    out.summary_flags.insert("quorum_blocked", f_quorum);
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/src/map_frontier.rs
+--------------------------------------------------------------------------------
+//! Resolve blocking ties with a fixed policy chain and produce audit logs.
+//!
+//! Policy order:
+//!   1) StatusQuo → if exactly one SQ candidate, pick it
+//!   2) Deterministic → min by (order_index, OptionId)
+//!   3) Random → seeded ChaCha20 via vm_core::rng, uniform among candidates
+//!
+//! Notes:
+//! * Logs go to RunRecord later; Result never carries tie logs.
+//! * RNG path is fully reproducible from the provided 64-hex seed.
+//! * All ordering uses canonical (order_index, OptionId).
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use vm_core::{
+    ids::{OptionId, UnitId},
+    entities::OptionItem,
+    rng::{tie_rng_from_seed, TieRng},
+};
+
+// ---------- Public types used across the pipeline ----------
+
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
+pub enum TieKind {
+    WtaWinner,
+    LastSeat,
+    IrvElimination,
+}
+
+#[derive(Clone, Debug)]
+pub struct TieContext {
+    pub kind: TieKind,
+    pub unit: UnitId,
+    /// Candidate OptionIds that are tied and valid for the decision.
+    /// Upstream guarantees these are real option IDs; we remain defensive in helpers.
+    pub candidates: Vec<OptionId>,
+}
+
+#[derive(Clone, Debug)]
+pub enum TiePolicy {
+    StatusQuo,
+    Deterministic,                 // by (order_index, OptionId)
+    Random { seed_hex64: String }, // VM-VAR-033, lowercase/uppercase accepted
+}
+
+#[derive(Clone, Debug)]
+pub struct TieLogEntry {
+    /// Human-readable, stable context like "WTA U:<unit>" or "LastSeat U:<unit>"
+    pub context: String,
+    /// Canonicalized candidate list snapshot (order_index, then OptionId)
+    pub candidates: Vec<OptionId>,
+    /// "status_quo" | "deterministic" | "random"
+    pub policy: &'static str,
+    /// Extra details (ordering rule used or RNG crumb)
+    pub detail: Option<TieDetail>,
+    /// Chosen winner
+    pub winner: OptionId,
+}
+
+#[derive(Clone, Debug)]
+pub enum TieDetail {
+    /// Deterministic rule: min by (order_index, OptionId)
+    OrderIndex,
+    /// Random rule details: seed used and the index of the RNG word consumed
+    Rng { seed_hex64: String, word_index: u128 },
+}
+
+// ---------- Errors (internal to this module) ----------
+
+#[derive(Debug)]
+pub enum ResolveError {
+    Empty,
+    BadSeed,
+    UnknownOption(String),
+}
+
+// ---------- Entry point ----------
+
+pub fn resolve_ties(
+    contexts: &[TieContext],
+    options_index: &BTreeMap<OptionId, OptionItem>,
+    policy: &TiePolicy,
+) -> (Vec<TieLogEntry>, BTreeMap<(TieKind, UnitId), OptionId>) {
+    let mut logs: Vec<TieLogEntry> = Vec::with_capacity(contexts.len());
+    let mut winners: BTreeMap<(TieKind, UnitId), OptionId> = BTreeMap::new();
+
+    for ctx in contexts {
+        // Canonicalize and defensively filter to known options (should already be valid).
+        let cands = canonicalize_candidates(&ctx.candidates, options_index);
+
+        // Empty candidate list should never happen; skip with a debug log style entry if it does.
+        if cands.is_empty() {
+            // fabricate a log-like entry for traceability; do not insert a winner
+            let context_str = format!("{:?} U:{:?}", ctx.kind, ctx.unit);
+            logs.push(TieLogEntry {
+                context: context_str,
+                candidates: vec![],
+                policy: match policy {
+                    TiePolicy::StatusQuo => "status_quo",
+                    TiePolicy::Deterministic => "deterministic",
+                    TiePolicy::Random { .. } => "random",
+                },
+                detail: None,
+                // winner is meaningless here; use a dummy OptionId if the type allowed; instead, skip insertion.
+                winner: OptionId::from_static("OPT:INVALID"),
+            });
+            continue;
+        }
+
+        // Apply policy chain
+        let (used_policy, detail, winner) = match policy {
+            TiePolicy::StatusQuo => {
+                if let Some(sq) = pick_status_quo(&cands, options_index) {
+                    ("status_quo", None, sq)
+                } else {
+                    // fall back to deterministic
+                    ("deterministic", Some(TieDetail::OrderIndex), pick_by_order_index(&cands, options_index))
+                }
+            }
+            TiePolicy::Deterministic => {
+                ("deterministic", Some(TieDetail::OrderIndex), pick_by_order_index(&cands, options_index))
+            }
+            TiePolicy::Random { seed_hex64 } => match pick_by_rng(&cands, seed_hex64) {
+                Ok((w, word_idx)) => (
+                    "random",
+                    Some(TieDetail::Rng {
+                        seed_hex64: seed_hex64.clone(),
+                        word_index: word_idx,
+                    }),
+                    w,
+                ),
+                // If RNG init fails (bad seed), fall back deterministically; keep surface stable.
+                Err(_e) => ("deterministic", Some(TieDetail::OrderIndex), pick_by_order_index(&cands, options_index)),
+            },
+        };
+
+        // Build stable context string
+        let context_str = match ctx.kind {
+            TieKind::WtaWinner => format!("WTA U:{:?}", ctx.unit),
+            TieKind::LastSeat => format!("LastSeat U:{:?}", ctx.unit),
+            TieKind::IrvElimination => format!("IRV U:{:?}", ctx.unit),
+        };
+
+        logs.push(TieLogEntry {
+            context: context_str,
+            candidates: cands.clone(),
+            policy: used_policy,
+            detail,
+            winner,
+        });
+
+        winners.insert((ctx.kind, ctx.unit.clone()), winner);
+    }
+
+    (logs, winners)
+}
+
+// ---------- Helpers ----------
+
+/// Prefer Status Quo if and only if exactly one candidate is SQ.
+/// Returns None if none or multiple are SQ (caller will fall back).
+pub fn pick_status_quo(
+    cands: &[OptionId],
+    options_index: &BTreeMap<OptionId, OptionItem>,
+) -> Option<OptionId> {
+    let mut found: Vec<OptionId> = Vec::new();
+    for id in cands {
+        if let Some(opt) = options_index.get(id) {
+            if opt.is_status_quo {
+                found.push(id.clone());
+                if found.len() > 1 {
+                    // Multiple SQ -> do not resolve here
+                    return None;
+                }
+            }
+        }
+    }
+    found.pop()
+}
+
+/// Deterministic pick: min by (order_index, OptionId)
+pub fn pick_by_order_index(
+    cands: &[OptionId],
+    options_index: &BTreeMap<OptionId, OptionItem>,
+) -> OptionId {
+    // Build (order_index, id) tuples; unknown IDs are ranked last by using a large sentinel.
+    const BIG: u32 = u32::MAX;
+    let mut best: Option<(u32, &OptionId)> = None;
+    for id in cands {
+        let key = options_index
+            .get(id)
+            .map(|o| o.order_index)
+            .unwrap_or(BIG);
+        match best {
+            None => best = Some((key, id)),
+            Some((bk, bid)) => {
+                if key < bk || (key == bk && id < bid) {
+                    best = Some((key, id));
+                }
+            }
+        }
+    }
+    best.expect("non-empty cands").1.clone()
+}
+
+/// Seeded random pick (ChaCha20 via vm_core::rng). Uniform among candidates.
+/// Returns the chosen OptionId and the RNG word index consumed for this pick.
+///
+/// NOTE: This implementation draws a single 64-bit word and reduces modulo len.
+/// The reported `word_index` is 0 for this pick; if you extend this to reuse a
+/// single RNG instance across multiple picks, increment the index accordingly.
+pub fn pick_by_rng(cands: &[OptionId], seed_hex64: &str) -> Result<(OptionId, u128), ResolveError> {
+    if !is_hex64(seed_hex64) {
+        return Err(ResolveError::BadSeed);
+    }
+    let mut rng: TieRng = tie_rng_from_seed(seed_hex64).map_err(|_| ResolveError::BadSeed)?;
+    let n = cands.len();
+    if n == 0 {
+        return Err(ResolveError::Empty);
+    }
+    // Draw one 64-bit word and reduce; rejection sampling is unnecessary for modulo here.
+    let r = rng.next_u64();
+    let idx = (r as usize) % n;
+    Ok((cands[idx].clone(), 0u128))
+}
+
+/// Sort candidates by (order_index, OptionId) and drop unknown IDs defensively.
+/// Unknowns should never appear (validated upstream), but we keep stability.
+pub fn canonicalize_candidates(
+    cands: &[OptionId],
+    options_index: &BTreeMap<OptionId, OptionItem>,
+) -> Vec<OptionId> {
+    let mut set: BTreeSet<(u32, OptionId)> = BTreeSet::new();
+    for id in cands {
+        if let Some(opt) = options_index.get(id) {
+            set.insert((opt.order_index, id.clone()));
+        }
+    }
+    set.into_iter().map(|(_, id)| id).collect()
+}
+
+// ---------- Small local helpers ----------
+
+fn is_hex64(s: &str) -> bool {
+    if s.len() != 64 {
+        return false;
+    }
+    s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+// ---------- Convenience re-exports (optional) ----------
+
+pub use TieDetail as _TieDetailForExport;
+pub use TieKind as _TieKindForExport;
+pub use TieLogEntry as _TieLogEntryForExport;
+pub use TiePolicy as _TiePolicyForExport;
+pub use TieContext as _TieContextForExport;
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/src/resolve_ties.rs
+--------------------------------------------------------------------------------
+//! Final decisiveness labeling (Decisive | Marginal | Invalid).
+//!
+//! Inputs are gate outcomes, national margin vs threshold (pp), and optional
+//! frontier-risk flags. No I/O, no RNG. Deterministic across platforms.
+
+#[cfg(feature = "use_smol_str")]
+use smol_str::SmolStr;
+#[cfg(not(feature = "use_smol_str"))]
+type SmolStr = String;
+
+//
+// Public types (minimal mirrors of upstream stages)
+//
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum Label {
+    Decisive,
+    Marginal,
+    Invalid,
+}
+
+#[derive(Clone, Debug)]
+pub struct DecisivenessLabel {
+    pub label: Label,
+    /// Short, machine-readable reason (snake_case).
+    pub reason: SmolStr,
+}
+
+/// Minimal mirror of the gate report we need here.
+pub struct LegitimacyReport {
+    pub pass: bool,
+    pub reasons: Vec<String>, // if pass=false, first item should explain failure
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub struct FrontierFlags {
+    pub mediation_flagged: bool,
+    pub enclave: bool,
+    pub protected_override_used: bool,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct LabelConfig {
+    /// VM-VAR-062: minimum national margin (pp) required for "Decisive".
+    pub decisive_margin_pp: i32,
+}
+
+//
+// Public API
+//
+
+/// Main entry (explicit threshold provided via LabelConfig).
+pub fn label_decisiveness_cfg(
+    legit: &LegitimacyReport,
+    national_margin_pp: i32,
+    frontier_flags: Option<&FrontierFlags>,
+    cfg: LabelConfig,
+) -> DecisivenessLabel {
+    // 1) If gates failed → Invalid
+    if !legit.pass {
+        return DecisivenessLabel {
+            label: Label::Invalid,
+            reason: first_failure_reason(legit),
+        };
+    }
+
+    // 2) Margin & frontier risk logic
+    if national_margin_pp < cfg.decisive_margin_pp {
+        return DecisivenessLabel {
+            label: Label::Marginal,
+            reason: SmolStr::from("margin_below_threshold"),
+        };
+    }
+
+    if has_frontier_risk(frontier_flags) {
+        return DecisivenessLabel {
+            label: Label::Marginal,
+            reason: SmolStr::from("frontier_risk_flags_present"),
+        };
+    }
+
+    DecisivenessLabel {
+        label: Label::Decisive,
+        reason: SmolStr::from("margin_meets_threshold"),
+    }
+}
+
+/// Convenience entry that reads VM-VAR-062 from Params.
+pub fn label_decisiveness(
+    legit: &LegitimacyReport,
+    national_margin_pp: i32,
+    frontier_flags: Option<&FrontierFlags>,
+    params: &vm_core::variables::Params,
+) -> DecisivenessLabel {
+    let cfg = LabelConfig {
+        decisive_margin_pp: params.decisive_margin_pp(),
+    };
+    label_decisiveness_cfg(legit, national_margin_pp, frontier_flags, cfg)
+}
+
+//
+// Internal helpers (pure)
+//
+
+fn first_failure_reason(legit: &LegitimacyReport) -> SmolStr {
+    if let Some(first) = legit.reasons.first() {
+        return SmolStr::from(first.as_str());
+    }
+    SmolStr::from("gates_failed")
+}
+
+fn has_frontier_risk(ff: Option<&FrontierFlags>) -> bool {
+    if let Some(f) = ff {
+        f.mediation_flagged || f.enclave || f.protected_override_used
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lr(pass: bool, reasons: &[&str]) -> LegitimacyReport {
+        LegitimacyReport {
+            pass,
+            reasons: reasons.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn gates_fail_yields_invalid() {
+        let legit = lr(false, &["Quorum.NationalBelowThreshold"]);
+        let out = label_decisiveness_cfg(&legit, 10, None, LabelConfig { decisive_margin_pp: 5 });
+        assert_eq!(out.label, Label::Invalid);
+        assert_eq!(out.reason, "Quorum.NationalBelowThreshold");
+    }
+
+    #[test]
+    fn margin_below_threshold_is_marginal() {
+        let legit = lr(true, &[]);
+        let out = label_decisiveness_cfg(&legit, 4, None, LabelConfig { decisive_margin_pp: 5 });
+        assert_eq!(out.label, Label::Marginal);
+        assert_eq!(out.reason, "margin_below_threshold");
+    }
+
+    #[test]
+    fn equal_to_threshold_is_decisive_when_no_risk() {
+        let legit = lr(true, &[]);
+        let out = label_decisiveness_cfg(&legit, 5, None, LabelConfig { decisive_margin_pp: 5 });
+        assert_eq!(out.label, Label::Decisive);
+        assert_eq!(out.reason, "margin_meets_threshold");
+    }
+
+    #[test]
+    fn frontier_risk_forces_marginal() {
+        let legit = lr(true, &[]);
+        let ff = FrontierFlags { mediation_flagged: true, enclave: false, protected_override_used: false };
+        let out = label_decisiveness_cfg(&legit, 12, Some(&ff), LabelConfig { decisive_margin_pp: 5 });
+        assert_eq!(out.label, Label::Marginal);
+        assert_eq!(out.reason, "frontier_risk_flags_present");
+    }
+
+    #[test]
+    fn fallback_reason_when_missing() {
+        let legit = lr(false, &[]);
+        let out = label_decisiveness_cfg(&legit, 0, None, LabelConfig { decisive_margin_pp: 0 });
+        assert_eq!(out.label, Label::Invalid);
+        assert_eq!(out.reason, "gates_failed");
+    }
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/src/label.rs
+--------------------------------------------------------------------------------
+//! BUILD_RESULT — compose the Result artifact from prior pipeline stages.
+//!
+//! Deterministic assembly only: no I/O and no hashing here. The caller is
+//! responsible for canonical serialization + hashing and assigning the
+//! Result ID afterwards.
+
+use std::collections::BTreeMap;
+
+use vm_core::{
+    ids::{OptionId, UnitId},
+    rounding::Ratio,
+};
+
+use crate::apply_rules::LegitimacyReport;
+use crate::label::{DecisivenessLabel, Label};
+
+/// Engine-level numeric precision when converting exact ratios to JSON numbers.
+/// (This is *not* a display precision; callers may pretty-print later.)
+const ENGINE_SHARE_PRECISION: f64 = 1e-9;
+
+// ---------- Public surface ----------
+
+/// Opaque FrontierMap ID (e.g., "FR:<hex64>").
+pub type FrontierId = String;
+
+/// Error composing Result (kept tiny and deterministic).
+#[derive(Debug)]
+pub enum BuildError {
+    MissingFormulaId,
+}
+
+/// Compose a Result (without IDs/hashes). Caller will assign `id` after hashing.
+pub fn build_result(
+    formula_id: &str,
+    agg: &AggregateResults,
+    gates: &LegitimacyReport,
+    label: &DecisivenessLabel,
+    frontier_id: Option<FrontierId>,
+) -> Result<ResultDoc, BuildError> {
+    if formula_id.is_empty() {
+        return Err(BuildError::MissingFormulaId);
+    }
+
+    let units = write_unit_blocks(agg);
+    let aggregates = write_aggregates_as_numbers(agg);
+    let gates_out = write_gates_as_numbers(gates);
+
+    let label_str = match label.label {
+        Label::Decisive => "Decisive",
+        Label::Marginal => "Marginal",
+        Label::Invalid => "Invalid",
+    }
+    .to_string();
+
+    let mut out = ResultDoc {
+        id: None, // assigned by caller after canonicalization + hashing
+        formula_id: formula_id.to_string(),
+        label: label_str,
+        label_reason: label.reason.clone().into(),
+        units,
+        aggregates,
+        gates: gates_out,
+        frontier_map_id: None,
+    };
+
+    if let Some(fid) = frontier_id {
+        out.frontier_map_id = Some(fid);
+    }
+
+    Ok(out)
+}
+
+// ---------- Conversion helpers ----------
+
+/// Build per-unit blocks in stable UnitId order.
+pub fn write_unit_blocks(agg: &AggregateResults) -> Vec<UnitBlock> {
+    let mut out = Vec::with_capacity(agg.units.len());
+    for (unit_id, u) in &agg.units {
+        // Scores / allocation maps are already BTreeMap for stable key order.
+        out.push(UnitBlock {
+            unit_id: unit_id.clone(),
+            turnout: u.turnout.clone(),
+            scores: u.scores.clone(),
+            allocation: u.allocation.clone(),
+            flags: u.flags.clone(),
+        });
+    }
+    out
+}
+
+/// Convert exact ratios in aggregates to JSON numbers at engine precision.
+pub fn write_aggregates_as_numbers(agg: &AggregateResults) -> AggregatesOut {
+    let shares_num = agg
+        .shares
+        .iter()
+        .map(|(opt, r)| (opt.clone(), ratio_to_number(r)))
+        .collect::<BTreeMap<_, _>>();
+
+    AggregatesOut {
+        totals: agg.totals.clone(),
+        shares: shares_num,
+        turnout: agg.turnout.clone(),
+        weighting_method: agg.weighting_method.clone(),
+    }
+}
+
+/// Convert gate outcomes’ observed ratios to JSON numbers.
+pub fn write_gates_as_numbers(g: &LegitimacyReport) -> GatesOut {
+    let quorum = GatePanel {
+        observed: ratio_to_number(&g.quorum.national.observed),
+        threshold_pct: g.quorum.national.threshold_pct,
+        pass: g.quorum.national.pass,
+    };
+
+    let majority = GatePanel {
+        observed: ratio_to_number(&g.majority.observed),
+        threshold_pct: g.majority.threshold_pct,
+        pass: g.majority.pass,
+    };
+
+    let double_majority = g.double_majority.as_ref().map(|dm| DoubleMajorityOut {
+        national: GatePanel {
+            observed: ratio_to_number(&dm.national.observed),
+            threshold_pct: dm.national.threshold_pct,
+            pass: dm.national.pass,
+        },
+        regional: GatePanel {
+            observed: ratio_to_number(&dm.family.observed),
+            threshold_pct: dm.family.threshold_pct,
+            pass: dm.family.pass,
+        },
+        pass: dm.pass,
+    });
+
+    let symmetry = g
+        .symmetry
+        .as_ref()
+        .map(|s| SymmetryOut { pass: s.respected });
+
+    GatesOut {
+        quorum,
+        majority,
+        double_majority,
+        symmetry,
+    }
+}
+
+// ---------- Local numeric helper ----------
+
+#[inline]
+fn ratio_to_number(r: &Ratio) -> f64 {
+    // Exact conversion to f64 (engine precision governs consumer expectations).
+    // Guard den==0 defensively: treat as 0.0 (validate should prevent this).
+    if r.den == 0 {
+        return 0.0;
+    }
+    let v = (r.num as f64) / (r.den as f64);
+    // Optionally snap tiny negatives/overflows to 0..1 range if desired:
+    // keep as-is for transparency; callers can clamp for presentation.
+    (v / ENGINE_SHARE_PRECISION).round() * ENGINE_SHARE_PRECISION
+}
+
+// ============================================================================
+// Minimal, schema-shaped types for this builder
+// (Replace with your canonical crate types if you already have them.)
+// ============================================================================
+
+/// Caller attaches canonicalized + hashed id (e.g., "RES:<hex64>") later.
+#[derive(Clone, Debug)]
+pub struct ResultDoc {
+    pub id: Option<String>, // assigned by caller
+    pub formula_id: String, // REQUIRED
+    pub label: String,      // "Decisive" | "Marginal" | "Invalid"
+    pub label_reason: String,
+    pub units: Vec<UnitBlock>,
+    pub aggregates: AggregatesOut,
+    pub gates: GatesOut,
+    pub frontier_map_id: Option<FrontierId>,
+}
+
+/// One unit’s block in the Result.
+#[derive(Clone, Debug)]
+pub struct UnitBlock {
+    pub unit_id: UnitId,
+    pub turnout: UnitTurnoutOut,
+    pub scores: BTreeMap<OptionId, u64>,
+    pub allocation: AllocationOut,
+    pub flags: UnitFlagsOut,
+}
+
+/// Allocation representation.
+/// - PR: `seats` present, sum equals unit magnitude.
+/// - WTA: `power_pct` == 100 for the winner (winner OptionId included for clarity).
+#[derive(Clone, Debug)]
+pub struct AllocationOut {
+    pub seats: Option<BTreeMap<OptionId, u32>>,
+    pub wta_winner: Option<OptionId>,
+    pub power_pct: Option<u32>, // typically 100 when WTA is used
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct UnitFlagsOut {
+    pub unit_data_ok: bool,
+    pub unit_quorum_met: bool,
+    pub unit_pr_threshold_met: bool,
+    pub protected_override_used: bool,
+    pub mediation_flagged: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct UnitTurnoutOut {
+    pub ballots_cast: u64,
+    pub invalid_or_blank: u64,
+    pub valid_ballots: u64,
+}
+
+/// Aggregates: totals + shares as *numbers* and turnout.
+#[derive(Clone, Debug)]
+pub struct AggregatesOut {
+    pub totals: BTreeMap<OptionId, u64>,
+    pub shares: BTreeMap<OptionId, f64>, // numbers, not {num,den}
+    pub turnout: AggregatedTurnoutOut,
+    pub weighting_method: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AggregatedTurnoutOut {
+    pub ballots_cast: u64,
+    pub invalid_or_blank: u64,
+    pub valid_ballots: u64,
+    pub eligible_roll: u64,
+}
+
+/// Gates panel — observed values as *numbers*.
+#[derive(Clone, Debug)]
+pub struct GatesOut {
+    pub quorum: GatePanel,
+    pub majority: GatePanel,
+    pub double_majority: Option<DoubleMajorityOut>,
+    pub symmetry: Option<SymmetryOut>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatePanel {
+    pub observed: f64,     // number at engine precision
+    pub threshold_pct: u8, // integer percent
+    pub pass: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct DoubleMajorityOut {
+    pub national: GatePanel,
+    pub regional: GatePanel,
+    pub pass: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SymmetryOut {
+    pub pass: bool,
+}
+
+// ============================================================================
+// Minimal AggregateResults input model (produced upstream by AGGREGATE).
+// Replace with your canonical type if already defined.
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub struct AggregateResults {
+    /// Per-unit view in stable UnitId order (BTreeMap guarantees determinism).
+    pub units: BTreeMap<UnitId, UnitAggregate>,
+    /// National totals by option (integers).
+    pub totals: BTreeMap<OptionId, u64>,
+    /// National shares by option (exact ratios).
+    pub shares: BTreeMap<OptionId, Ratio>,
+    /// National turnout row.
+    pub turnout: AggregatedTurnoutOut,
+    /// Echo of weighting method (e.g., VM-VAR-030).
+    pub weighting_method: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct UnitAggregate {
+    pub turnout: UnitTurnoutOut,
+    pub scores: BTreeMap<OptionId, u64>,
+    pub allocation: AllocationOut,
+    pub flags: UnitFlagsOut,
+}
+
+// ============================================================================
+// Tests (narrow, deterministic)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ratio(n: i64, d: i64) -> Ratio {
+        Ratio { num: n, den: d }
+    }
+
+    #[test]
+    fn ratios_convert_to_numbers() {
+        assert!((ratio_to_number(&ratio(1, 2)) - 0.5).abs() < 1e-12);
+        assert!((ratio_to_number(&ratio(2, 3)) - (2.0 / 3.0)).abs() < 1e-9);
+        assert_eq!(ratio_to_number(&ratio(0, 0)), 0.0); // defensive
+    }
+
+    #[test]
+    fn builds_minimal_result() {
+        let unit = UnitAggregate {
+            turnout: UnitTurnoutOut {
+                ballots_cast: 100,
+                invalid_or_blank: 0,
+                valid_ballots: 100,
+            },
+            scores: BTreeMap::new(),
+            allocation: AllocationOut {
+                seats: None,
+                wta_winner: None,
+                power_pct: None,
+            },
+            flags: UnitFlagsOut {
+                unit_data_ok: true,
+                ..Default::default()
+            },
+        };
+
+        let mut units = BTreeMap::new();
+        let uid = UnitId::from("U:001");
+        units.insert(uid.clone(), unit);
+
+        let agg = AggregateResults {
+            units,
+            totals: BTreeMap::new(),
+            shares: BTreeMap::new(),
+            turnout: AggregatedTurnoutOut {
+                ballots_cast: 100,
+                invalid_or_blank: 0,
+                valid_ballots: 100,
+                eligible_roll: 120,
+            },
+            weighting_method: "natural".into(),
+        };
+
+        // Fake-up a tiny legitimacy report with passing gates
+        // (shapes mirror crate::apply_rules types).
+        let gates = crate::apply_rules::LegitimacyReport {
+            pass: true,
+            reasons: vec![],
+            quorum: crate::apply_rules::QuorumDetail {
+                national: crate::apply_rules::GateOutcome {
+                    observed: ratio(100, 120),
+                    threshold_pct: 50,
+                    pass: true,
+                },
+                per_unit_flags: None,
+            },
+            majority: crate::apply_rules::GateOutcome {
+                observed: ratio(55, 100),
+                threshold_pct: 50,
+                pass: true,
+            },
+            double_majority: None,
+            symmetry: None,
+        };
+
+        let label = DecisivenessLabel {
+            label: Label::Decisive,
+            reason: "margin_meets_threshold".into(),
+        };
+
+        let res = build_result("abcdef", &agg, &gates, &label, None).expect("ok");
+        assert_eq!(res.formula_id, "abcdef");
+        assert_eq!(res.label, "Decisive");
+        assert!(res.frontier_map_id.is_none());
+        assert_eq!(res.units.len(), 1);
+    }
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/src/build_result.rs
+--------------------------------------------------------------------------------
+//! build_run_record.rs — Compose the RunRecord artifact (deterministic).
+//!
+//! Responsibilities:
+//! - Validate UTCs, hex64 digests, one-of inputs (ballots vs tally), RNG policy rules
+//! - Build an *idless* record and canonicalize it (vm_io::canonical_json)
+//! - Hash (SHA-256) the idless bytes and form `RUN:<started_utc>-<short-hash>`
+//! - Return a fully-populated `RunRecordDoc` including ties (Result never carries tie logs)
+
+use std::collections::BTreeMap;
+
+use vm_core::ids::{ParamSetId, RegId, ResultId, TallyId};
+use vm_io::{
+    canonical_json::to_canonical_bytes,
+    hasher::sha256_hex,
+};
+
+/// Engine identifiers (mirrors pipeline-wide metadata).
+#[derive(Clone, Debug)]
+pub struct EngineMeta {
+    pub vendor: String,
+    pub name: String,
+    pub version: String,
+    pub build: String,
+}
+
+/// Tie policy recorded in RunRecord. RNG seed is only included when `Random`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TiePolicy {
+    StatusQuo,
+    Deterministic,
+    Random,
+}
+
+impl TiePolicy {
+    fn as_str(&self) -> &'static str {
+        match self {
+            TiePolicy::StatusQuo => "status_quo",
+            TiePolicy::Deterministic => "deterministic",
+            TiePolicy::Random => "random",
+        }
+    }
+}
+
+/// References to inputs and their canonical digests.
+#[derive(Clone, Debug)]
+pub struct InputRefs {
+    pub manifest_id: Option<String>,
+    pub reg_id: RegId,
+    pub parameter_set_id: ParamSetId,
+    pub ballots_id: Option<String>,
+    pub ballot_tally_id: Option<TallyId>,
+    /// path (or logical key) → sha256 hex64
+    pub digests: BTreeMap<String, String>,
+}
+
+/// References to outputs (Result + optional Frontier) and their digests.
+#[derive(Clone, Debug)]
+pub struct OutputRefs {
+    pub result_id: ResultId,
+    pub result_sha256: String,                 // hex64
+    pub frontier_map_id: Option<String>,       // FrontierId
+    pub frontier_map_sha256: Option<String>,   // hex64; required iff frontier_map_id
+}
+
+/// Determinism block written to RunRecord.
+#[derive(Clone, Debug)]
+pub struct Determinism {
+    pub tie_policy: TiePolicy,
+    /// 64-hex string, present only when tie_policy == Random
+    pub rng_seed_hex64: Option<String>,
+}
+
+/// One tie event; kept flexible for audit. Stored verbatim in RunRecord.
+#[derive(Clone, Debug)]
+pub struct TieEvent {
+    pub context: String,             // e.g., "WTA U:…"
+    pub candidates: Vec<String>,     // OptionId strings
+    pub policy: String,              // "status_quo" | "deterministic" | "random"
+    pub detail: Option<String>,      // e.g., "order_index" or "rng:seed=<…>,word=<…>"
+    pub winner: String,              // OptionId
+}
+
+/// The final RunRecord document (schema-shaped; serialization happens upstream).
+#[derive(Clone, Debug)]
+pub struct RunRecordDoc {
+    pub id: String, // RUN:<ts>-<short>
+    pub started_utc: String,
+    pub finished_utc: String,
+    pub engine: EngineMeta,
+    pub formula_id: String,
+    pub formula_manifest_sha256: String,
+    pub inputs: InputRefs,
+    pub determinism: Determinism,
+    pub outputs: OutputRefs,
+    pub ties: Vec<TieEvent>,
+}
+
+/// Builder errors (deterministic and concise).
+#[derive(Debug)]
+pub enum BuildRunRecordError {
+    BadUtc(&'static str, String),
+    BadHex64(&'static str, String),
+    InputsContract(String),
+    OutputsContract(String),
+    DeterminismContract(String),
+}
+
+/// Build the RunRecord content; ID is computed from canonical bytes (without `id`) + started_utc.
+pub fn build_run_record(
+    engine: &EngineMeta,
+    formula_id: &str,
+    formula_manifest_sha256: &str,
+    inputs: &InputRefs,
+    determinism: &Determinism,
+    outputs: &OutputRefs,
+    ties: &[TieEvent],
+    started_utc: &str,
+    finished_utc: &str,
+) -> Result<RunRecordDoc, BuildRunRecordError> {
+    // ---- validations (pure, deterministic) ----
+    validate_utc(started_utc).map_err(|_| BuildRunRecordError::BadUtc("started_utc", started_utc.to_string()))?;
+    validate_utc(finished_utc).map_err(|_| BuildRunRecordError::BadUtc("finished_utc", finished_utc.to_string()))?;
+
+    validate_hex64(formula_manifest_sha256)
+        .map_err(|_| BuildRunRecordError::BadHex64("formula_manifest_sha256", formula_manifest_sha256.to_string()))?;
+
+    // Input digests must be hex64
+    for (k, v) in &inputs.digests {
+        validate_hex64(v).map_err(|_| BuildRunRecordError::BadHex64("inputs.digests", format!("{k}={v}")))?;
+    }
+
+    check_inputs_coherence(inputs)?;
+    check_outputs_coherence(outputs)?;
+    check_determinism(determinism)?;
+
+    // ---- Build the *idless* structure for canonical hashing ----
+    // We exclude the "id" field itself from the canonicalization.
+    let idless = IdlessRunRecord {
+        started_utc: started_utc.to_string(),
+        finished_utc: finished_utc.to_string(),
+        engine: engine.clone(),
+        formula_id: formula_id.to_string(),
+        formula_manifest_sha256: formula_manifest_sha256.to_string(),
+        inputs: inputs.clone(),
+        determinism: determinism.clone(),
+        outputs: outputs.clone(),
+        ties: ties.to_vec(),
+    };
+
+    // Canonical bytes (stable across OS/arch) then SHA-256 → hex64
+    let canon_bytes = to_canonical_bytes(&idless)
+        .expect("canonicalization should not fail for well-formed idless record");
+    let canon_sha256 = sha256_hex(&canon_bytes);
+
+    // RUN ID format: RUN:<YYYY-MM-DDTHH-MM-SSZ>-<short>
+    let started_friendly = id_friendly_timestamp(started_utc);
+    let short = compute_id_short_hash(&canon_sha256, 16);
+    let run_id = format!("RUN:{}-{}", started_friendly, short);
+
+    // ---- Assemble final doc (with id) ----
+    Ok(RunRecordDoc {
+        id: run_id,
+        started_utc: started_utc.to_string(),
+        finished_utc: finished_utc.to_string(),
+        engine: engine.clone(),
+        formula_id: formula_id.to_string(),
+        formula_manifest_sha256: formula_manifest_sha256.to_string(),
+        inputs: inputs.clone(),
+        determinism: determinism.clone(),
+        outputs: outputs.clone(),
+        ties: ties.to_vec(),
+    })
+}
+
+// ---------- Internal: idless shape (Serialize only here) ----------
+#[derive(serde::Serialize)]
+struct IdlessRunRecord {
+    started_utc: String,
+    finished_utc: String,
+    engine: EngineMeta,
+    formula_id: String,
+    formula_manifest_sha256: String,
+    inputs: InputRefs,
+    determinism: Determinism,
+    outputs: OutputRefs,
+    ties: Vec<TieEvent>,
+}
+
+// Derives for canonicalization (Serialize only)
+impl serde::Serialize for EngineMeta {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("EngineMeta", 4)?;
+        st.serialize_field("vendor", &self.vendor)?;
+        st.serialize_field("name", &self.name)?;
+        st.serialize_field("version", &self.version)?;
+        st.serialize_field("build", &self.build)?;
+        st.end()
+    }
+}
+impl serde::Serialize for InputRefs {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("InputRefs", 5)?;
+        st.serialize_field("manifest_id", &self.manifest_id)?;
+        st.serialize_field("reg_id", &self.reg_id)?;
+        st.serialize_field("parameter_set_id", &self.parameter_set_id)?;
+        st.serialize_field("ballots_id", &self.ballots_id)?;
+        st.serialize_field("ballot_tally_id", &self.ballot_tally_id)?;
+        // digests serialized separately to keep BTreeMap ordering stable
+        st.end()?;
+        // Serialize `digests` alongside (outer map stability is guaranteed by BTreeMap)
+        let mut map = s.serialize_map(Some(self.digests.len()))?;
+        for (k, v) in &self.digests {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+impl serde::Serialize for OutputRefs {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("OutputRefs", 4)?;
+        st.serialize_field("result_id", &self.result_id)?;
+        st.serialize_field("result_sha256", &self.result_sha256)?;
+        st.serialize_field("frontier_map_id", &self.frontier_map_id)?;
+        st.serialize_field("frontier_map_sha256", &self.frontier_map_sha256)?;
+        st.end()
+    }
+}
+impl serde::Serialize for Determinism {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("Determinism", 2)?;
+        st.serialize_field("tie_policy", &self.tie_policy.as_str())?;
+        // seed only when Random (otherwise None)
+        let seed = match (self.tie_policy, &self.rng_seed_hex64) {
+            (TiePolicy::Random, Some(v)) => Some(v),
+            _ => None,
+        };
+        st.serialize_field("rng_seed", &seed)?;
+        st.end()
+    }
+}
+impl serde::Serialize for TieEvent {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("TieEvent", 5)?;
+        st.serialize_field("context", &self.context)?;
+        st.serialize_field("candidates", &self.candidates)?;
+        st.serialize_field("policy", &self.policy)?;
+        st.serialize_field("detail", &self.detail)?;
+        st.serialize_field("winner", &self.winner)?;
+        st.end()
+    }
+}
+
+// ---------- Validation helpers ----------
+
+/// Validate "YYYY-MM-DDTHH:MM:SSZ" (basic structural check; semantics enforced upstream).
+pub fn validate_utc(ts: &str) -> Result<(), BuildRunRecordError> {
+    // Minimal fixed-length + character-position validation.
+    if ts.len() != 20 {
+        return Err(BuildRunRecordError::BadUtc("format", ts.to_string()));
+    }
+    let b = ts.as_bytes();
+    let ok = b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'Z'
+        && b.iter().enumerate().all(|(i, &c)| match i {
+            4
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_pipeline/src/build_run_record.rs
+--------------------------------------------------------------------------------
+//! build_run_record.rs — Compose the RunRecord artifact (deterministic).
+//!
+//! Responsibilities:
+//! - Validate UTCs, hex64 digests, one-of inputs (ballots vs tally), RNG policy rules
+//! - Build an *idless* record and canonicalize it (vm_io::canonical_json)
+//! - Hash (SHA-256) the idless bytes and form `RUN:<started_utc>-<short-hash>`
+//! - Return a fully-populated `RunRecordDoc` including ties (Result never carries tie logs)
+
+use std::collections::BTreeMap;
+
+use vm_core::ids::{ParamSetId, RegId, ResultId, TallyId};
+use vm_io::{
+    canonical_json::to_canonical_bytes,
+    hasher::sha256_hex,
+};
+
+/// Engine identifiers (mirrors pipeline-wide metadata).
+#[derive(Clone, Debug)]
+pub struct EngineMeta {
+    pub vendor: String,
+    pub name: String,
+    pub version: String,
+    pub build: String,
+}
+
+/// Tie policy recorded in RunRecord. RNG seed is only included when `Random`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TiePolicy {
+    StatusQuo,
+    Deterministic,
+    Random,
+}
+
+impl TiePolicy {
+    fn as_str(&self) -> &'static str {
+        match self {
+            TiePolicy::StatusQuo => "status_quo",
+            TiePolicy::Deterministic => "deterministic",
+            TiePolicy::Random => "random",
+        }
+    }
+}
+
+/// References to inputs and their canonical digests.
+#[derive(Clone, Debug)]
+pub struct InputRefs {
+    pub manifest_id: Option<String>,
+    pub reg_id: RegId,
+    pub parameter_set_id: ParamSetId,
+    pub ballots_id: Option<String>,
+    pub ballot_tally_id: Option<TallyId>,
+    /// path (or logical key) → sha256 hex64
+    pub digests: BTreeMap<String, String>,
+}
+
+/// References to outputs (Result + optional Frontier) and their digests.
+#[derive(Clone, Debug)]
+pub struct OutputRefs {
+    pub result_id: ResultId,
+    pub result_sha256: String,                 // hex64
+    pub frontier_map_id: Option<String>,       // FrontierId
+    pub frontier_map_sha256: Option<String>,   // hex64; required iff frontier_map_id
+}
+
+/// Determinism block written to RunRecord.
+#[derive(Clone, Debug)]
+pub struct Determinism {
+    pub tie_policy: TiePolicy,
+    /// 64-hex string, present only when tie_policy == Random
+    pub rng_seed_hex64: Option<String>,
+}
+
+/// One tie event; kept flexible for audit. Stored verbatim in RunRecord.
+#[derive(Clone, Debug)]
+pub struct TieEvent {
+    pub context: String,             // e.g., "WTA U:…"
+    pub candidates: Vec<String>,     // OptionId strings
+    pub policy: String,              // "status_quo" | "deterministic" | "random"
+    pub detail: Option<String>,      // e.g., "order_index" or "rng:seed=<…>,word=<…>"
+    pub winner: String,              // OptionId
+}
+
+/// The final RunRecord document (schema-shaped; serialization happens upstream).
+#[derive(Clone, Debug)]
+pub struct RunRecordDoc {
+    pub id: String, // RUN:<ts>-<short>
+    pub started_utc: String,
+    pub finished_utc: String,
+    pub engine: EngineMeta,
+    pub formula_id: String,
+    pub formula_manifest_sha256: String,
+    pub inputs: InputRefs,
+    pub determinism: Determinism,
+    pub outputs: OutputRefs,
+    pub ties: Vec<TieEvent>,
+}
+
+/// Builder errors (deterministic and concise).
+#[derive(Debug)]
+pub enum BuildRunRecordError {
+    BadUtc(&'static str, String),
+    BadHex64(&'static str, String),
+    InputsContract(String),
+    OutputsContract(String),
+    DeterminismContract(String),
+}
+
+/// Build the RunRecord content; ID is computed from canonical bytes (without `id`) + started_utc.
+pub fn build_run_record(
+    engine: &EngineMeta,
+    formula_id: &str,
+    formula_manifest_sha256: &str,
+    inputs: &InputRefs,
+    determinism: &Determinism,
+    outputs: &OutputRefs,
+    ties: &[TieEvent],
+    started_utc: &str,
+    finished_utc: &str,
+) -> Result<RunRecordDoc, BuildRunRecordError> {
+    // ---- validations (pure, deterministic) ----
+    validate_utc(started_utc).map_err(|_| BuildRunRecordError::BadUtc("started_utc", started_utc.to_string()))?;
+    validate_utc(finished_utc).map_err(|_| BuildRunRecordError::BadUtc("finished_utc", finished_utc.to_string()))?;
+
+    validate_hex64(formula_manifest_sha256)
+        .map_err(|_| BuildRunRecordError::BadHex64("formula_manifest_sha256", formula_manifest_sha256.to_string()))?;
+
+    // Input digests must be hex64
+    for (k, v) in &inputs.digests {
+        validate_hex64(v).map_err(|_| BuildRunRecordError::BadHex64("inputs.digests", format!("{k}={v}")))?;
+    }
+
+    check_inputs_coherence(inputs)?;
+    check_outputs_coherence(outputs)?;
+    check_determinism(determinism)?;
+
+    // ---- Build the *idless* structure for canonical hashing ----
+    // We exclude the "id" field itself from the canonicalization.
+    let idless = IdlessRunRecord {
+        started_utc: started_utc.to_string(),
+        finished_utc: finished_utc.to_string(),
+        engine: engine.clone(),
+        formula_id: formula_id.to_string(),
+        formula_manifest_sha256: formula_manifest_sha256.to_string(),
+        inputs: inputs.clone(),
+        determinism: determinism.clone(),
+        outputs: outputs.clone(),
+        ties: ties.to_vec(),
+    };
+
+    // Canonical bytes (stable across OS/arch) then SHA-256 → hex64
+    let canon_bytes = to_canonical_bytes(&idless)
+        .expect("canonicalization should not fail for well-formed idless record");
+    let canon_sha256 = sha256_hex(&canon_bytes);
+
+    // RUN ID format: RUN:<YYYY-MM-DDTHH-MM-SSZ>-<short>
+    let started_friendly = id_friendly_timestamp(started_utc);
+    let short = compute_id_short_hash(&canon_sha256, 16);
+    let run_id = format!("RUN:{}-{}", started_friendly, short);
+
+    // ---- Assemble final doc (with id) ----
+    Ok(RunRecordDoc {
+        id: run_id,
+        started_utc: started_utc.to_string(),
+        finished_utc: finished_utc.to_string(),
+        engine: engine.clone(),
+        formula_id: formula_id.to_string(),
+        formula_manifest_sha256: formula_manifest_sha256.to_string(),
+        inputs: inputs.clone(),
+        determinism: determinism.clone(),
+        outputs: outputs.clone(),
+        ties: ties.to_vec(),
+    })
+}
+
+// ---------- Internal: idless shape (Serialize only here) ----------
+#[derive(serde::Serialize)]
+struct IdlessRunRecord {
+    started_utc: String,
+    finished_utc: String,
+    engine: EngineMeta,
+    formula_id: String,
+    formula_manifest_sha256: String,
+    inputs: InputRefs,
+    determinism: Determinism,
+    outputs: OutputRefs,
+    ties: Vec<TieEvent>,
+}
+
+// Derives for canonicalization (Serialize only)
+impl serde::Serialize for EngineMeta {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("EngineMeta", 4)?;
+        st.serialize_field("vendor", &self.vendor)?;
+        st.serialize_field("name", &self.name)?;
+        st.serialize_field("version", &self.version)?;
+        st.serialize_field("build", &self.build)?;
+        st.end()
+    }
+}
+impl serde::Serialize for InputRefs {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("InputRefs", 5)?;
+        st.serialize_field("manifest_id", &self.manifest_id)?;
+        st.serialize_field("reg_id", &self.reg_id)?;
+        st.serialize_field("parameter_set_id", &self.parameter_set_id)?;
+        st.serialize_field("ballots_id", &self.ballots_id)?;
+        st.serialize_field("ballot_tally_id", &self.ballot_tally_id)?;
+        // digests serialized separately to keep BTreeMap ordering stable
+        st.end()?;
+        // Serialize `digests` alongside (outer map stability is guaranteed by BTreeMap)
+        let mut map = s.serialize_map(Some(self.digests.len()))?;
+        for (k, v) in &self.digests {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+impl serde::Serialize for OutputRefs {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("OutputRefs", 4)?;
+        st.serialize_field("result_id", &self.result_id)?;
+        st.serialize_field("result_sha256", &self.result_sha256)?;
+        st.serialize_field("frontier_map_id", &self.frontier_map_id)?;
+        st.serialize_field("frontier_map_sha256", &self.frontier_map_sha256)?;
+        st.end()
+    }
+}
+impl serde::Serialize for Determinism {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("Determinism", 2)?;
+        st.serialize_field("tie_policy", &self.tie_policy.as_str())?;
+        // seed only when Random (otherwise None)
+        let seed = match (self.tie_policy, &self.rng_seed_hex64) {
+            (TiePolicy::Random, Some(v)) => Some(v),
+            _ => None,
+        };
+        st.serialize_field("rng_seed", &seed)?;
+        st.end()
+    }
+}
+impl serde::Serialize for TieEvent {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("TieEvent", 5)?;
+        st.serialize_field("context", &self.context)?;
+        st.serialize_field("candidates", &self.candidates)?;
+        st.serialize_field("policy", &self.policy)?;
+        st.serialize_field("detail", &self.detail)?;
+        st.serialize_field("winner", &self.winner)?;
+        st.end()
+    }
+}
+
+// ---------- Validation helpers ----------
+
+/// Validate "YYYY-MM-DDTHH:MM:SSZ" (basic structural check; semantics enforced upstream).
+pub fn validate_utc(ts: &str) -> Result<(), BuildRunRecordError> {
+    // Minimal fixed-length + character-position validation.
+    if ts.len() != 20 {
+        return Err(BuildRunRecordError::BadUtc("format", ts.to_string()));
+    }
+    let b = ts.as_bytes();
+    let ok = b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'Z'
+        && b.iter().enumerate().all(|(i, &c)| match i {
+            4

@@ -1,0 +1,1202 @@
+# bundle: schemas
+
+--------------------------------------------------------------------------------
+FILE: schemas/division_registry.schema.json
+--------------------------------------------------------------------------------
+{
+  "$defs": {
+    "id_token": {
+      "$comment": "ID token: 1..64 chars; allowed: A–Z a–z 0–9 underscore _ hyphen - colon : dot .",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+      "title": "IdToken",
+      "type": "string"
+    },
+    "name_200": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Name200",
+      "type": "string"
+    },
+    "option": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/name_200"
+        },
+        "option_id": {
+          "$ref": "#/$defs/id_token"
+        },
+        "order_index": {
+          "minimum": 0,
+          "title": "OrderIndex",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "option_id",
+        "name",
+        "order_index"
+      ],
+      "title": "Option",
+      "type": "object"
+    },
+    "unit": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/name_200"
+        },
+        "options": {
+          "items": {
+            "$ref": "#/$defs/option"
+          },
+          "minItems": 1,
+          "title": "Options",
+          "type": "array"
+        },
+        "protected_area": {
+          "title": "ProtectedArea",
+          "type": "boolean"
+        },
+        "unit_id": {
+          "$ref": "#/$defs/id_token"
+        }
+      },
+      "required": [
+        "unit_id",
+        "name",
+        "protected_area",
+        "options"
+      ],
+      "title": "Unit",
+      "type": "object"
+    }
+  },
+  "$id": "https://example.com/schemas/division_registry.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "DivisionRegistry schema (normative). Mirrors Doc 1 shape exactly; ordering/uniqueness are enforced by validation/tests, not by JSON Schema.",
+  "examples": [
+    {
+      "schema_version": "1.x",
+      "units": [
+        {
+          "unit_id": "U-001",
+          "name": "District 1",
+          "protected_area": false,
+          "options": [
+            {
+              "option_id": "O-A1",
+              "name": "Option A",
+              "order_index": 1
+            },
+            {
+              "option_id": "O-B1",
+              "name": "Option B",
+              "order_index": 2
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "properties": {
+    "schema_version": {
+      "title": "SchemaVersion",
+      "type": "string"
+    },
+    "units": {
+      "items": {
+        "$ref": "#/$defs/unit"
+      },
+      "minItems": 1,
+      "title": "Units",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "units"
+  ],
+  "title": "DivisionRegistry",
+  "type": "object",
+  "$comment": "Canonical JSON (UTF-8, LF, sorted keys). Ordering contracts (units by unit_id; options by order_index) and property-uniqueness (unit_id across units; option_id/order_index within a unit) are normative but enforced outside the schema."
+}
+
+
+--------------------------------------------------------------------------------
+FILE: schemas/ballots.schema.json
+--------------------------------------------------------------------------------
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/non-normative/ballots.schema.json",
+  "title": "Raw Ballots (Non-Normative Ingestion)",
+  "$comment": "STATUS: Non-normative (ingestion only). This schema is for upstream ballot ingestion/normalization; the engine and Canonical Test Pack consume DivisionRegistry, BallotTally, and ParameterSet only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "ballot_type", "payload"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "bal_id": { "$ref": "#/$defs/bal_id" },
+    "ballot_type": {
+      "type": "string",
+      "enum": ["plurality", "approval", "score", "ranked_irv", "ranked_condorcet"]
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": ["plurality"],
+          "properties": {
+            "plurality": {
+              "type": "object",
+              "required": ["ballots"],
+              "properties": {
+                "ballots": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/plurality_item" }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "required": ["approval"],
+          "properties": {
+            "approval": {
+              "type": "object",
+              "required": ["ballots"],
+              "properties": {
+                "ballots": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/approval_item" }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "required": ["score"],
+          "properties": {
+            "score": {
+              "type": "object",
+              "required": ["scale_min", "scale_max", "ballots"],
+              "properties": {
+                "scale_min": { "type": "integer" },
+                "scale_max": { "type": "integer" },
+                "ballots": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/score_item" }
+                }
+              },
+              "allOf": [
+                {
+                  "$comment": "Require scale_max > scale_min (uses $data extension).",
+                  "properties": {
+                    "scale_max": {
+                      "type": "integer",
+                      "exclusiveMinimum": { "$data": "1/scale_min" }
+                    }
+                  }
+                }
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "required": ["ranked_irv"],
+          "properties": {
+            "ranked_irv": {
+              "type": "object",
+              "required": ["ballots"],
+              "properties": {
+                "ballots": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/ranked" }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "required": ["ranked_condorcet"],
+          "properties": {
+            "ranked_condorcet": {
+              "type": "object",
+              "required": ["ballots"],
+              "properties": {
+                "ballots": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/ranked" }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    },
+    "notes": { "type": "string" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "ballot_type": { "const": "plurality" } }, "required": ["ballot_type"] },
+      "then": { "properties": { "payload": { "required": ["plurality"] } } }
+    },
+    {
+      "if": { "properties": { "ballot_type": { "const": "approval" } }, "required": ["ballot_type"] },
+      "then": { "properties": { "payload": { "required": ["approval"] } } }
+    },
+    {
+      "if": { "properties": { "ballot_type": { "const": "score" } }, "required": ["ballot_type"] },
+      "then": { "properties": { "payload": { "required": ["score"] } } }
+    },
+    {
+      "if": { "properties": { "ballot_type": { "const": "ranked_irv" } }, "required": ["ballot_type"] },
+      "then": { "properties": { "payload": { "required": ["ranked_irv"] } } }
+    },
+    {
+      "if": { "properties": { "ballot_type": { "const": "ranked_condorcet" } }, "required": ["ballot_type"] },
+      "then": { "properties": { "payload": { "required": ["ranked_condorcet"] } } }
+    }
+  ],
+  "$defs": {
+    "id_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+      "title": "IdToken"
+    },
+    "unit_id": { "$ref": "#/$defs/id_token" },
+    "option_id": { "$ref": "#/$defs/id_token" },
+    "bal_id": {
+      "type": "string",
+      "pattern": "^BAL:[A-Za-z0-9_.:-]{1,64}$",
+      "title": "BallotId"
+    },
+    "ranked": {
+      "type": "object",
+      "required": ["unit_id", "ranking"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/unit_id" },
+        "ranking": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/option_id" },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "approval_item": {
+      "type": "object",
+      "required": ["unit_id", "approvals"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/unit_id" },
+        "approvals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/option_id" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "plurality_item": {
+      "type": "object",
+      "required": ["unit_id", "vote"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/unit_id" },
+        "vote": {
+          "oneOf": [
+            { "$ref": "#/$defs/option_id" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "score_item": {
+      "type": "object",
+      "required": ["unit_id", "scores"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/unit_id" },
+        "scores": {
+          "type": "object",
+          "$comment": "Each property name is an option_id; each value is an integer score. Bounds reference the surrounding score payload's scale_min/scale_max via $data (validator extension).",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": { "$data": "2/scale_min" },
+            "maximum": { "$data": "2/scale_max" }
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
+
+--------------------------------------------------------------------------------
+FILE: schemas/ballot_tally.schema.json
+--------------------------------------------------------------------------------
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/ballot_tally.schema.json",
+  "title": "BallotTally (Canonical Input)",
+  "description": "Canonical per-unit tallies aligned to the DivisionRegistry. Arrays are ordered deterministically; referential integrity and sums are enforced by validation/tests outside of JSON Schema.",
+  "$defs": {
+    "id_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+      "title": "IdToken",
+      "$comment": "Allowed: A–Z a–z 0–9 underscore _ hyphen - colon : dot ."
+    },
+    "unit_id": { "$ref": "#/$defs/id_token" },
+    "option_id": { "$ref": "#/$defs/id_token" },
+
+    "option_tally": {
+      "type": "object",
+      "title": "OptionTally",
+      "required": ["option_id", "votes"],
+      "properties": {
+        "option_id": { "$ref": "#/$defs/option_id" },
+        "votes": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+
+    "unit_tally": {
+      "type": "object",
+      "title": "UnitTally",
+      "required": ["unit_id", "totals", "options"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/unit_id" },
+        "totals": {
+          "type": "object",
+          "title": "UnitTotals",
+          "required": ["valid_ballots", "invalid_ballots"],
+          "properties": {
+            "valid_ballots": { "type": "integer", "minimum": 0 },
+            "invalid_ballots": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "options": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/option_tally" },
+          "$comment": "Order mirrors the Registry option order (by order_index; ties by option_id)."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+
+  "type": "object",
+  "required": ["schema_version", "units"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "units": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/unit_tally" },
+      "$comment": "Ordering contract (informative): units sorted by ascending unit_id. Enforced by conformance checks/tests, not by JSON Schema."
+    }
+  },
+  "additionalProperties": false,
+
+  "$comment": "Canonical JSON (UTF-8, LF, sorted keys) governs hashing/IDs. Referential integrity to the Registry and sum(options[].votes) ≤ totals.valid_ballots are validated by the engine/tests.",
+
+  "examples": [
+    {
+      "schema_version": "1.x",
+      "units": [
+        {
+          "unit_id": "U-001",
+          "totals": { "valid_ballots": 12345, "invalid_ballots": 67 },
+          "options": [
+            { "option_id": "O-A1", "votes": 6000 },
+            { "option_id": "O-B1", "votes": 5000 }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+--------------------------------------------------------------------------------
+FILE: schemas/parameter_set.schema.json
+--------------------------------------------------------------------------------
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/parameter_set.schema.json",
+  "title": "ParameterSet (Canonical VM-VAR Map)",
+  "description": "Canonical ParameterSet capturing effective VM-VAR values for a run. All Included (FID) variables are required; Excluded variables are optional. Unknown variables are rejected.",
+  "$defs": {
+    "bool": { "type": "boolean", "title": "Boolean" },
+    "nonneg_int": { "type": "integer", "minimum": 0, "title": "NonNegativeInteger" },
+    "pct_int": { "type": "integer", "minimum": 0, "maximum": 100, "title": "PercentInteger0..100" },
+    "share_precision_int": { "type": "integer", "minimum": 0, "maximum": 6, "title": "SharePrecision0..6" },
+    "id_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+      "title": "IdToken"
+    },
+    "tie_policy_enum": { "type": "string", "enum": ["status_quo", "deterministic_order", "random"] },
+    "frontier_mode_enum": { "type": "string", "enum": ["none", "banded", "ladder"] },
+    "frontier_strategy_enum": { "type": "string", "enum": ["apply_on_entry", "apply_on_exit", "sticky"] },
+    "label_policy_enum": { "type": "string", "enum": ["fixed", "dynamic_margin"] },
+    "run_scope": {
+      "oneOf": [
+        { "const": "all_units" },
+        { "type": "object" }
+      ],
+      "title": "RunScope"
+    },
+    "sym_ex_selector": { "$ref": "#/$defs/id_token" }
+  },
+  "type": "object",
+  "required": ["schema_version", "vars"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "vars": {
+      "type": "object",
+      "description": "Map of VM-VAR-### → value. All Included (FID) variables must be present. Excluded (non-FID) variables are optional.",
+      "required": [
+        "VM-VAR-001",
+        "VM-VAR-002",
+        "VM-VAR-003",
+        "VM-VAR-004",
+        "VM-VAR-005",
+        "VM-VAR-006",
+        "VM-VAR-007",
+
+        "VM-VAR-010",
+        "VM-VAR-011",
+        "VM-VAR-012",
+        "VM-VAR-013",
+        "VM-VAR-014",
+        "VM-VAR-015",
+        "VM-VAR-016",
+        "VM-VAR-017",
+
+        "VM-VAR-020",
+        "VM-VAR-021",
+        "VM-VAR-022",
+        "VM-VAR-023",
+        "VM-VAR-024",
+        "VM-VAR-025",
+        "VM-VAR-026",
+        "VM-VAR-027",
+        "VM-VAR-028",
+        "VM-VAR-029",
+        "VM-VAR-030",
+        "VM-VAR-031",
+
+        "VM-VAR-040",
+        "VM-VAR-041",
+        "VM-VAR-042",
+        "VM-VAR-045",
+        "VM-VAR-046",
+        "VM-VAR-047",
+        "VM-VAR-048",
+        "VM-VAR-049",
+
+        "VM-VAR-050",
+        "VM-VAR-073"
+      ],
+      "properties": {
+        /* -------- A. Global & family (Included/FID) -------- */
+        "VM-VAR-001": { "type": "string", "$comment": "algorithm_family — enum per release" },
+        "VM-VAR-002": { "type": "string", "$comment": "rounding_policy — enum per release" },
+        "VM-VAR-003": { "$ref": "#/$defs/share_precision_int", "$comment": "share_precision — integer 0..6" },
+        "VM-VAR-004": { "type": "string", "$comment": "denom_rule — enum per family" },
+        "VM-VAR-005": { "type": "string", "$comment": "aggregation_mode — enum per family" },
+        "VM-VAR-006": { "type": "string", "$comment": "seat_allocation_rule — enum per family" },
+        "VM-VAR-007": { "type": "string", "$comment": "tie_scope_model — enum per spec" },
+
+        /* -------- B. Thresholds & gates (Included/FID) -------- */
+        "VM-VAR-010": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-011": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-012": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-013": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-014": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-015": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-016": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-017": { "$ref": "#/$defs/pct_int" },
+
+        "VM-VAR-020": { "$ref": "#/$defs/pct_int", "$comment": "domain per variable definition" },
+        "VM-VAR-021": { "$ref": "#/$defs/run_scope" },
+        "VM-VAR-022": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-023": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-024": { "$ref": "#/$defs/bool", "$comment": "per release; boolean if applicable" },
+        "VM-VAR-025": { "$ref": "#/$defs/bool", "$comment": "per release; boolean if applicable" },
+        "VM-VAR-026": { "type": ["integer", "number"], "$comment": "per release" },
+        "VM-VAR-027": { "type": ["integer", "number"], "$comment": "per release" },
+        "VM-VAR-028": { "type": ["integer", "number"], "$comment": "per release" },
+        "VM-VAR-029": { "type": "array", "items": { "$ref": "#/$defs/sym_ex_selector" } },
+        "VM-VAR-030": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["unit_id", "mode"],
+            "properties": {
+              "unit_id": { "$ref": "#/$defs/id_token" },
+              "mode": { "type": "string", "enum": ["include", "exclude"] }
+            },
+            "additionalProperties": false
+          }
+        },
+        "VM-VAR-031": { "$ref": "#/$defs/pct_int" },
+
+        /* -------- C. Frontier & refinements (+ Protected/Autonomy) (Included/FID) -------- */
+        "VM-VAR-040": { "$ref": "#/$defs/frontier_mode_enum" },
+        "VM-VAR-041": { "type": ["number", "string"], "$comment": "frontier_cut — number/enum per mode" },
+        "VM-VAR-042": { "$ref": "#/$defs/frontier_strategy_enum" },
+        "VM-VAR-045": { "type": "string", "enum": ["deny", "allow"] },
+        "VM-VAR-046": { "type": "object", "$comment": "autonomy_package_map — deterministic keys; documented per release" },
+        "VM-VAR-047": { "type": "number", "minimum": 0, "maximum": 1 },
+        "VM-VAR-048": { "type": "string", "enum": ["none", "soften", "harden"] },
+        "VM-VAR-049": { "type": "string", "enum": ["strict", "lenient"] },
+
+        /* -------- D. Ties (Included vs Excluded) -------- */
+        "VM-VAR-050": { "$ref": "#/$defs/tie_policy_enum", "$comment": "Included (FID)" },
+        "VM-VAR-052": { "$ref": "#/$defs/nonneg_int", "$comment": "tie_seed — Excluded (non-FID), optional" },
+
+        /* -------- E. Presentation toggles (Excluded; optional) -------- */
+        "VM-VAR-032": { "type": "string", "enum": ["unit_id", "label_priority", "turnout"] },
+        "VM-VAR-033": { "type": "string", "enum": ["auto", "always", "never"] },
+        "VM-VAR-034": { "$ref": "#/$defs/bool" },
+        "VM-VAR-035": { "$ref": "#/$defs/bool" },
+        "VM-VAR-060": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-061": { "$ref": "#/$defs/label_policy_enum" },
+        "VM-VAR-062": { "type": "string", "$comment": "\"auto\" or IETF language tag" },
+
+        /* -------- F. Variant (Included/FID) -------- */
+        "VM-VAR-073": { "type": "string", "$comment": "algorithm_variant — enum per release" }
+      },
+      "additionalProperties": false,
+      "$comment": "Every Included (FID) variable is required. Excluded variables (032–035, 052, 060–062) are optional. Booleans are real JSON booleans."
+    }
+  },
+  "additionalProperties": false,
+  "$comment": "Canonical JSON (UTF-8, LF, sorted keys). FID is computed from Included variables only; VM-VAR-052 (tie_seed) is Excluded and only echoed in RunRecord if a random tie actually occurred.",
+  "examples": [
+    {
+      "schema_version": "1.x",
+      "vars": {
+        "VM-VAR-001": "family_v1",
+        "VM-VAR-002": "half_up",
+        "VM-VAR-003": 3,
+        "VM-VAR-004": "standard",
+        "VM-VAR-005": "sum",
+        "VM-VAR-006": "none",
+        "VM-VAR-007": "winner_only",
+
+        "VM-VAR-010": 0,
+        "VM-VAR-011": 0,
+        "VM-VAR-012": 0,
+        "VM-VAR-013": 0,
+        "VM-VAR-014": 0,
+        "VM-VAR-015": 0,
+        "VM-VAR-016": 0,
+        "VM-VAR-017": 0,
+
+        "VM-VAR-020": 0,
+        "VM-VAR-021": "all_units",
+        "VM-VAR-022": 55,
+        "VM-VAR-023": 55,
+        "VM-VAR-024": true,
+        "VM-VAR-025": true,
+        "VM-VAR-026": 0,
+        "VM-VAR-027": 0,
+        "VM-VAR-028": 0,
+        "VM-VAR-029": [],
+        "VM-VAR-030": [{ "unit_id": "U-001", "mode": "include" }],
+        "VM-VAR-031": 0,
+
+        "VM-VAR-040": "none",
+        "VM-VAR-041": 0.0,
+        "VM-VAR-042": "apply_on_entry",
+        "VM-VAR-045": "deny",
+        "VM-VAR-046": {},
+        "VM-VAR-047": 0.0,
+        "VM-VAR-048": "none",
+        "VM-VAR-049": "strict",
+
+        "VM-VAR-050": "status_quo",
+        "VM-VAR-073": "v1",
+
+        "VM-VAR-052": 0,
+        "VM-VAR-032": "unit_id",
+        "VM-VAR-033": "auto",
+        "VM-VAR-034": true,
+        "VM-VAR-035": false,
+        "VM-VAR-060": 55,
+        "VM-VAR-061": "dynamic_margin",
+        "VM-VAR-062": "auto"
+      }
+    }
+  ]
+}
+
+--------------------------------------------------------------------------------
+FILE: schemas/manifest.schema.json
+--------------------------------------------------------------------------------
+
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/manifest.schema.json",
+  "title": "Run Manifest (Canonical Inputs)",
+  "description": "Names the three canonical inputs for a deterministic, offline run and optional expectations/digests.",
+  "$defs": {
+    "local_path": {
+      "type": "string",
+      "pattern": "^(?!https?://).+",
+      "title": "LocalPath",
+      "$comment": "Local filesystem only; forbid http(s) URLs to enforce offline runs."
+    },
+    "sha256_64hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Sha256LowerHex64"
+    },
+    "digest_obj": {
+      "type": "object",
+      "required": ["sha256"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/sha256_64hex" }
+      },
+      "additionalProperties": false,
+      "title": "DigestObject"
+    },
+    "expect_obj": {
+      "type": "object",
+      "properties": {
+        "formula_id": { "type": "string", "title": "ExpectedFormulaId" },
+        "engine_version": { "type": "string", "title": "ExpectedEngineVersion" }
+      },
+      "additionalProperties": false,
+      "title": "ExpectObject",
+      "$comment": "FID is typically a 64-hex string; comparison is performed by the loader/CI outside this schema."
+    }
+  },
+  "type": "object",
+  "required": ["schema_version", "reg_path", "ballot_tally_path", "params_path"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "reg_path": { "$ref": "#/$defs/local_path" },
+    "ballot_tally_path": { "$ref": "#/$defs/local_path" },
+    "params_path": { "$ref": "#/$defs/local_path" },
+    "expect": { "$ref": "#/$defs/expect_obj" },
+    "digests": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/digest_obj" },
+      "title": "DigestsMap",
+      "$comment": "Keys are relative paths as they appear in the manifest; values carry sha256 in lowercase 64-hex."
+    },
+    "notes": { "type": "string" }
+  },
+  "additionalProperties": false,
+  "$comment": "Canonical inputs for tests/runs are exactly registry.json (DivisionRegistry), tally.json (BallotTally), and params.json (ParameterSet). No raw ballots path. Canonical JSON rules (UTF-8, LF, sorted keys; arrays in spec order) apply to hashing/verification.",
+  "examples": [
+    {
+      "schema_version": "1.x",
+      "reg_path": "cases/VM-TST-101/registry.json",
+      "ballot_tally_path": "cases/VM-TST-101/tally.json",
+      "params_path": "cases/VM-TST-101/params.json",
+      "expect": {
+        "formula_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "engine_version": "v0.1.0"
+      },
+      "digests": {
+        "cases/VM-TST-101/registry.json": { "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+        "cases/VM-TST-101/tally.json":    { "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+        "cases/VM-TST-101/params.json":   { "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+      }
+    }
+  ]
+}
+
+
+--------------------------------------------------------------------------------
+FILE: schemas/result.schema.json
+--------------------------------------------------------------------------------
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/result.schema.json",
+  "title": "Result (Canonical Engine Output)",
+  "description": "Canonical Result produced by the engine. Minimal, normalized shape: summary + per-unit results. No input references or tie logs appear here (those live in RunRecord).",
+  "$defs": {
+    "id64hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "LowerHex64"
+    },
+    "res_id": {
+      "type": "string",
+      "pattern": "^RES:[0-9a-f]{64}$",
+      "title": "ResultIdRES64"
+    },
+    "id_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+      "title": "IdToken",
+      "$comment": "Allowed: A–Z a–z 0–9 underscore _ hyphen - colon : dot ."
+    },
+    "unit_allocation": {
+      "type": "object",
+      "title": "UnitAllocation",
+      "required": ["option_id", "votes", "share"],
+      "properties": {
+        "option_id": { "$ref": "#/$defs/id_token" },
+        "votes": { "type": "integer", "minimum": 0 },
+        "share": { "type": "number", "minimum": 0, "maximum": 1 },
+        "seats": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "unit_result": {
+      "type": "object",
+      "title": "UnitResult",
+      "required": ["unit_id", "allocations", "label"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/id_token" },
+        "allocations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/unit_allocation" },
+          "$comment": "Order mirrors Registry option order (order_index; ties by option_id)."
+        },
+        "label": { "type": "string", "enum": ["Decisive", "Marginal", "Invalid"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "required": [
+    "schema_version",
+    "result_id",
+    "formula_id",
+    "engine_version",
+    "created_at",
+    "summary",
+    "units"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "result_id": { "$ref": "#/$defs/res_id" },
+    "formula_id": { "$ref": "#/$defs/id64hex" },
+    "engine_version": { "type": "string" },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "$comment": "RFC3339 timestamp. Engine emits UTC (Z)."
+    },
+    "summary": {
+      "type": "object",
+      "title": "ResultSummary",
+      "required": ["valid_ballots_total", "invalid_ballots_total", "turnout_rate"],
+      "properties": {
+        "valid_ballots_total": { "type": "integer", "minimum": 0 },
+        "invalid_ballots_total": { "type": "integer", "minimum": 0 },
+        "turnout_rate": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "units": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/unit_result" },
+      "$comment": "Ordering (informative): units sorted by ascending unit_id. Enforced by conformance checks/tests outside JSON Schema."
+    }
+  },
+  "additionalProperties": false,
+  "$comment": "Arrays follow Doc 1A ordering rules: units ↑ unit_id; allocations ↑ order_index (tie by option_id). Input references and tie logs are not present here—they live in RunRecord.",
+  "examples": [
+    {
+      "schema_version": "1.x",
+      "result_id": "RES:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "formula_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "engine_version": "v1.0.0",
+      "created_at": "2025-08-12T14:00:00Z",
+      "summary": {
+        "valid_ballots_total": 12345,
+        "invalid_ballots_total": 67,
+        "turnout_rate": 0.95
+      },
+      "units": [
+        {
+          "unit_id": "U-001",
+          "allocations": [
+            { "option_id": "O-A1", "votes": 6000, "share": 0.486 },
+            { "option_id": "O-B1", "votes": 5000, "share": 0.405 }
+          ],
+          "label": "Decisive"
+        }
+      ]
+    }
+  ]
+}
+
+--------------------------------------------------------------------------------
+FILE: schemas/run_record.schema.json
+--------------------------------------------------------------------------------
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/run_record.schema.json",
+  "title": "RunRecord (Provenance Envelope)",
+  "description": "Signed/attested provenance of one execution: inputs, policy, platform, and output references. Strict; no unknown fields.",
+  "$defs": {
+    "hex64": { "type": "string", "pattern": "^[0-9a-f]{64}$", "title": "Hex64Lower" },
+
+    "run_id": {
+      "type": "string",
+      "pattern": "^RUN:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z-[0-9a-f]{8,64}$",
+      "title": "RunId",
+      "$comment": "RUN:<UTC-timestamp>-<hash>; UTC Z enforced here."
+    },
+
+    "res_id":  { "type": "string", "pattern": "^RES:[0-9a-f]{64}$", "title": "ResultId" },
+    "fr_id":   { "type": "string", "pattern": "^FR:[0-9a-f]{64}$",  "title": "FrontierMapId" },
+    "man_id":  { "type": "string", "pattern": "^MAN:[0-9a-f]{64}$", "title": "ManifestId" },
+    "reg_id":  { "type": "string", "pattern": "^REG:[0-9a-f]{64}$", "title": "RegistryId" },
+    "ps_id":   { "type": "string", "pattern": "^PS:[0-9a-f]{64}$",  "title": "ParameterSetId" },
+    "tly_id":  { "type": "string", "pattern": "^TLY:[0-9a-f]{64}$", "title": "BallotTallyId" },
+    "bal_id":  { "type": "string", "pattern": "^BAL:[A-Za-z0-9_.:-]{1,64}$", "title": "RawBallotsId" },
+
+    "digest_entry": {
+      "type": "object",
+      "required": ["sha256"],
+      "properties": { "sha256": { "$ref": "#/$defs/hex64" } },
+      "additionalProperties": false,
+      "title": "DigestEntry"
+    }
+  },
+
+  "type": "object",
+  "required": ["id", "timestamp_utc", "engine", "inputs", "policy", "platform", "outputs"],
+  "additionalProperties": false,
+
+  "properties": {
+    "id": { "$ref": "#/$defs/run_id" },
+
+    "timestamp_utc": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$",
+      "title": "TimestampUTC",
+      "$comment": "RFC3339 UTC (must end with 'Z')."
+    },
+
+    "engine": {
+      "type": "object",
+      "required": ["engine_version", "formula_id", "formula_manifest_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "engine_version": { "type": "string" },
+        "formula_id": { "$ref": "#/$defs/hex64" },
+        "formula_manifest_sha256": { "$ref": "#/$defs/hex64" }
+      }
+    },
+
+    "inputs": {
+      "type": "object",
+      "required": ["reg_id", "parameter_set_id", "adjacency_present", "digests"],
+      "additionalProperties": false,
+      "properties": {
+        "manifest_id": { "$ref": "#/$defs/man_id" },
+        "reg_id": { "$ref": "#/$defs/reg_id" },
+        "parameter_set_id": { "$ref": "#/$defs/ps_id" },
+
+        "ballots_id": { "$ref": "#/$defs/bal_id" },
+        "ballot_tally_id": { "$ref": "#/$defs/tly_id" },
+
+        "adjacency_present": { "type": "boolean" },
+
+        "digests": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/digest_entry" },
+          "title": "InputDigests",
+          "$comment": "Map: relative path → { sha256: <64-hex> } for every input file loaded."
+        }
+      },
+
+      "oneOf": [
+        { "required": ["ballots_id"], "not": { "required": ["ballot_tally_id"] } },
+        { "required": ["ballot_tally_id"], "not": { "required": ["ballots_id"] } }
+      ]
+    },
+
+    "policy": {
+      "type": "object",
+      "required": ["tie_policy"],
+      "additionalProperties": false,
+      "properties": {
+        "tie_policy": {
+          "type": "string",
+          "enum": ["status_quo", "deterministic_order", "random"]
+        },
+        "deterministic_order_key": {
+          "type": "string",
+          "enum": ["option_order_index"]
+        },
+        "rng_seed": { "$ref": "#/$defs/hex64" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "tie_policy": { "const": "random" } }, "required": ["tie_policy"] },
+          "then": { "required": ["rng_seed"] }
+        },
+        {
+          "if": { "properties": { "tie_policy": { "const": "deterministic_order" } }, "required": ["tie_policy"] },
+          "then": { "required": ["deterministic_order_key"] }
+        }
+      ]
+    },
+
+    "platform": {
+      "type": "object",
+      "required": ["os", "arch", "rustc_version", "build_profile"],
+      "additionalProperties": false,
+      "properties": {
+        "os": { "type": "string", "enum": ["windows", "macos", "linux"] },
+        "arch": { "type": "string", "pattern": "^[A-Za-z0-9_\\-]+$" },
+        "rustc_version": { "type": "string" },
+        "build_profile": { "type": "string", "enum": ["debug", "release"] }
+      }
+    },
+
+    "outputs": {
+      "type": "object",
+      "required": ["result_id", "result_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "result_id": { "$ref": "#/$defs/res_id" },
+        "result_sha256": { "$ref": "#/$defs/hex64" },
+
+        "frontier_map_id": { "$ref": "#/$defs/fr_id" },
+        "frontier_map_sha256": { "$ref": "#/$defs/hex64" },
+
+        "tie_log_summary": {
+          "type": "object",
+          "required": ["deterministic_ties", "randomized_ties"],
+          "additionalProperties": false,
+          "properties": {
+            "deterministic_ties": { "type": "integer", "minimum": 0 },
+            "randomized_ties": { "type": "integer", "minimum": 0 }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["frontier_map_id"] },
+          "then": { "required": ["frontier_map_sha256"] }
+        }
+      ]
+    },
+
+    "notes": { "type": "string" }
+  },
+
+  "$comment": "Digests are SHA-256 over canonical bytes (UTF-8, LF, sorted keys). Result/Frontier IDs use RES:/FR: prefixes with 64-hex. The RUN: id embeds UTC time and a hash suffix."
+}
+
+--------------------------------------------------------------------------------
+FILE: schemas/frontier_map.schema.json
+--------------------------------------------------------------------------------
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/frontier_map.schema.json",
+  "title": "FrontierMap (Canonical Output)",
+  "description": "Per-unit frontier status & contiguity outcomes derived from a run. Inputs/manifest IDs live in RunRecord, not here.",
+  "$defs": {
+    "hex64": { "type": "string", "pattern": "^[0-9a-f]{64}$", "title": "Hex64Lower" },
+    "fr_id": { "type": "string", "pattern": "^FR:[0-9a-f]{64}$", "title": "FrontierMapId" },
+    "id_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+      "title": "IdToken",
+      "$comment": "Allowed: A–Z a–z 0–9 underscore _ hyphen - colon : dot ."
+    },
+    "edge": { "type": "string", "enum": ["land", "bridge", "water"] },
+    "band": {
+      "type": "object",
+      "title": "FrontierBand",
+      "required": ["status", "min_pct", "max_pct"],
+      "properties": {
+        "status": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "min_pct": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "max_pct": { "type": "integer", "minimum": 0, "maximum": 100 }
+      },
+      "allOf": [
+        {
+          "$comment": "Enforce min_pct ≤ max_pct using $data (validator extension).",
+          "properties": {
+            "max_pct": {
+              "type": "integer",
+              "minimum": { "$data": "1/min_pct" }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "flags": {
+      "type": "object",
+      "title": "UnitFlags",
+      "required": ["contiguity_ok", "mediation_flagged", "protected_override_used", "enclave"],
+      "properties": {
+        "contiguity_ok": { "type": "boolean" },
+        "mediation_flagged": { "type": "boolean" },
+        "protected_override_used": { "type": "boolean" },
+        "enclave": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "adjacency_summary": {
+      "type": "object",
+      "title": "AdjacencySummary",
+      "required": ["used_edges"],
+      "properties": {
+        "used_edges": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/edge" }
+        },
+        "corridor_used": { "type": "boolean" },
+        "reasons": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/id_token" },
+          "title": "ReasonCodes"
+        }
+      },
+      "additionalProperties": false
+    },
+    "unit_frontier": {
+      "type": "object",
+      "title": "UnitFrontier",
+      "required": ["unit_id", "support_share", "status", "flags"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/id_token" },
+        "support_share": { "type": "number", "minimum": 0, "maximum": 1 },
+        "status": { "type": "string" },
+        "flags": { "$ref": "#/$defs/flags" },
+        "adjacency_summary": { "$ref": "#/$defs/adjacency_summary" }
+      },
+      "additionalProperties": false
+    },
+    "frontier_config": {
+      "type": "object",
+      "title": "FrontierConfigApplied",
+      "required": ["mode", "contiguity_edge_types", "frontier_strategy"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["none", "banded", "ladder"] },
+        "contiguity_edge_types": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/edge" },
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "frontier_strategy": {
+          "type": "string",
+          "enum": ["apply_on_entry", "apply_on_exit", "sticky"]
+        },
+        "bands": { "type": "array", "items": { "$ref": "#/$defs/band" } }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "none" } }, "required": ["mode"] },
+          "then": { "not": { "required": ["bands"] } }
+        },
+        {
+          "if": { "properties": { "mode": { "enum": ["banded", "ladder"] } }, "required": ["mode"] },
+          "then": { "required": ["bands"] }
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "required": ["schema_version", "frontier_map_id", "frontier_config", "units"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "frontier_map_id": { "$ref": "#/$defs/fr_id" },
+    "frontier_config": { "$ref": "#/$defs/frontier_config" },
+    "units": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/unit_frontier" },
+      "$comment": "Ordering (informative): units sorted by ascending unit_id. Enforced by validation/tests."
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "$comment": "If mode = none, every unit.status must be \"none\".",
+      "if": {
+        "properties": {
+          "frontier_config": {
+            "properties": { "mode": { "const": "none" } },
+            "required": ["mode"]
+          }
+        },
+        "required": ["frontier_config"]
+      },
+      "then": {
+        "properties": {
+          "units": {
+            "items": {
+              "properties": { "status": { "const": "none" } },
+              "required": ["status"]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$comment": "Arrays are canonicalized by the engine; JSON is UTF-8, LF, with sorted object keys. Status membership in bands when mode≠none is validated by the pipeline.",
+  "examples": [
+    {
+      "schema_version": "1.x",
+      "frontier_map_id": "FR:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "frontier_config": {
+        "mode": "banded",
+        "contiguity_edge_types": ["land", "bridge"],
+        "frontier_strategy": "apply_on_entry",
+        "bands": [
+          { "status": "frontier", "min_pct": 45, "max_pct": 55 },
+          { "status": "stable", "min_pct": 56, "max_pct": 100 }
+        ]
+      },
+      "units": [
+        {
+          "unit_id": "U-001",
+          "support_share": 0.532,
+          "status": "frontier",
+          "flags": {
+            "contiguity_ok": true,
+            "mediation_flagged": false,
+            "protected_override_used": false,
+            "enclave": false
+          },
+          "adjacency_summary": { "used_edges": ["land"] }
+        }
+      ]
+    }
+  ]
+}

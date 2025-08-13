@@ -1,0 +1,2016 @@
+# bundle: vm_core
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_core/Cargo.toml
+--------------------------------------------------------------------------------
+# crates/vm_core/Cargo.toml
+
+[package]
+name = "vm_core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.0"            # align with workspace rust-toolchain pin
+license = "Apache-2.0 OR MIT"
+description = "Core types, VM-VAR domains, rounding, and deterministic RNG for the VM engine."
+
+[lib]
+name = "vm_core"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+default = ["std"]
+std = []
+serde = ["dep:serde"]              # opt-in serde derives on core types
+
+[dependencies]
+serde       = { version = "1", features = ["derive"], optional = true, default-features = false }
+rand_core   = { version = "0.6", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+# (intentionally minimal; add only if unit tests require)
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_core/src/lib.rs
+--------------------------------------------------------------------------------
+//! vm_core — Core types, domains, ordering helpers, and deterministic RNG.
+//!
+//! This crate is **I/O-free**. It defines stable types/APIs used across the
+//! engine (`vm_io`, `vm_algo`, `vm_pipeline`, `vm_report`, `vm_cli`).
+//!
+//! - Output IDs: `RES:`, `RUN:`, `FR:`
+//! - Registry tokens: `UnitId`, `OptionId`
+//! - VM-VAR domains: `TiePolicy` (050), `AlgorithmVariant` (073), `Params`
+//! - Deterministic ordering helpers
+//! - Integer-first numerics & ratio helpers
+//! - Seedable RNG (ChaCha20) for **ties only**
+//!
+//! Serialization derives are gated behind `serde` feature.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+pub mod errors {
+    use core::fmt;
+
+    /// Minimal error set for core-domain validation & parsing.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum CoreError {
+        InvalidId,
+        InvalidToken,
+        InvalidHex,
+        InvalidTimestamp,
+        InvalidRatio,
+        DomainOutOfRange(&'static str),
+        EmptyChoiceSet,
+    }
+
+    impl fmt::Display for CoreError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                CoreError::InvalidId => write!(f, "invalid id"),
+                CoreError::InvalidToken => write!(f, "invalid token"),
+                CoreError::InvalidHex => write!(f, "invalid hex"),
+                CoreError::InvalidTimestamp => write!(f, "invalid timestamp"),
+                CoreError::InvalidRatio => write!(f, "invalid ratio"),
+                CoreError::DomainOutOfRange(k) => write!(f, "domain out of range: {k}"),
+                CoreError::EmptyChoiceSet => write!(f, "empty choice set"),
+            }
+        }
+    }
+}
+
+pub mod ids {
+    //! Newtypes and parsers for output/digest identifiers.
+
+    use crate::errors::CoreError;
+    use alloc::string::{String, ToString};
+    use core::fmt;
+    use core::str::FromStr;
+
+    #[cfg(feature = "serde")]
+    use serde::{Deserialize, Serialize};
+
+    fn is_lower_hex(s: &str) -> bool {
+        s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    fn is_lower_hex_len(s: &str, n: usize) -> bool {
+        s.len() == n && is_lower_hex(s)
+    }
+
+    fn is_ts_utc_z(s: &str) -> bool {
+        // Very strict RFC3339-like check: "YYYY-MM-DDTHH:MM:SSZ" (length 20)
+        let b = s.as_bytes();
+        if b.len() != 20 { return false; }
+        matches!(b[4], b'-')
+            && matches!(b[7], b'-')
+            && matches!(b[10], b'T')
+            && matches!(b[13], b':')
+            && matches!(b[16], b':')
+            && matches!(b[19], b'Z')
+            && b.iter().enumerate().all(|(i, c)| match i {
+                0..=3 | 5..=6 | 8..=9 | 11..=12 | 14..=15 | 17..=18 => matches!(c, b'0'..=b'9'),
+                4 | 7 | 10 | 13 | 16 | 19 => true,
+                _ => false,
+            })
+    }
+
+    /// 64-hex lowercase (digest/fingerprint).
+    #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct Sha256(String);
+
+    impl Sha256 {
+        pub fn as_str(&self) -> &str { &self.0 }
+    }
+
+    impl fmt::Display for Sha256 {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    impl FromStr for Sha256 {
+        type Err = CoreError;
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            if is_lower_hex_len(s, 64) { Ok(Self(s.to_string())) } else { Err(CoreError::InvalidHex) }
+        }
+    }
+
+    /// FormulaId = 64-hex fingerprint of normative manifest/rules.
+    pub type FormulaId = Sha256;
+
+    /// "RES:" + 64-hex (lowercase)
+    #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct ResultId(String);
+
+    impl ResultId {
+        pub fn as_str(&self) -> &str { &self.0 }
+    }
+
+    impl fmt::Display for ResultId {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    impl FromStr for ResultId {
+        type Err = CoreError;
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            let rest = s.strip_prefix("RES:").ok_or(CoreError::InvalidId)?;
+            if is_lower_hex_len(rest, 64) { Ok(Self(s.to_string())) } else { Err(CoreError::InvalidId) }
+        }
+    }
+
+    /// "FR:" + 64-hex (lowercase)
+    #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct FrontierMapId(String);
+
+    impl FrontierMapId {
+        pub fn as_str(&self) -> &str { &self.0 }
+    }
+
+    impl fmt::Display for FrontierMapId {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    impl FromStr for FrontierMapId {
+        type Err = CoreError;
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            let rest = s.strip_prefix("FR:").ok_or(CoreError::InvalidId)?;
+            if is_lower_hex_len(rest, 64) { Ok(Self(s.to_string())) } else { Err(CoreError::InvalidId) }
+        }
+    }
+
+    /// "RUN:" + "<YYYY-MM-DDTHH:MM:SSZ>" + "-" + "<8..64-hex lowercase>"
+    #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct RunId(String);
+
+    impl RunId {
+        pub fn as_str(&self) -> &str { &self.0 }
+    }
+
+    impl fmt::Display for RunId {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    impl FromStr for RunId {
+        type Err = CoreError;
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            let rest = s.strip_prefix("RUN:").ok_or(CoreError::InvalidId)?;
+            // Split at the dash between timestamp and hash
+            let (ts, hash) = rest.split_once('-').ok_or(CoreError::InvalidId)?;
+            if !is_ts_utc_z(ts) { return Err(CoreError::InvalidTimestamp); }
+            if !(8..=64).contains(&hash.len()) || !is_lower_hex(hash) {
+                return Err(CoreError::InvalidId);
+            }
+            Ok(Self(s.to_string()))
+        }
+    }
+}
+
+pub mod tokens {
+    //! Registry token types (`UnitId`, `OptionId`) with strict charset.
+
+    use crate::errors::CoreError;
+    use alloc::string::{String, ToString};
+    use core::fmt;
+    use core::str::FromStr;
+
+    #[cfg(feature = "serde")]
+    use serde::{Deserialize, Serialize};
+
+    fn is_token(s: &str) -> bool {
+        let len = s.len();
+        if !(1..=64).contains(&len) { return false; }
+        s.bytes().all(|b| matches!(b,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' |
+            b'_' | b'-' | b':' | b'.'
+        ))
+    }
+
+    macro_rules! def_token {
+        ($name:ident) => {
+            #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+            #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+            pub struct $name(String);
+
+            impl $name {
+                pub fn as_str(&self) -> &str { &self.0 }
+            }
+
+            impl fmt::Display for $name {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
+            }
+
+            impl FromStr for $name {
+                type Err = CoreError;
+                fn from_str(s: &str) -> Result<Self, Self::Err> {
+                    if is_token(s) { Ok(Self(s.to_string())) } else { Err(CoreError::InvalidToken) }
+                }
+            }
+        }
+    }
+
+    def_token!(UnitId);
+    def_token!(OptionId);
+}
+
+pub mod determinism {
+    //! Stable ordering helpers.
+
+    use core::cmp::Ordering;
+    use crate::tokens::OptionId;
+
+    /// Types participating in stable selections can expose a total order key.
+    pub trait StableOrd {
+        type Key: Ord;
+        fn stable_key(&self) -> Self::Key;
+    }
+
+    /// Minimal registry option metadata used for deterministic ordering.
+    #[derive(Clone, Debug)]
+    pub struct RegOptionMeta<'a> {
+        pub order_index: u32,
+        pub option_id: &'a OptionId,
+    }
+
+    /// Compare by `order_index`, then by `option_id` lexicographically.
+    pub fn cmp_options_by_order(a: &RegOptionMeta<'_>, b: &RegOptionMeta<'_>) -> Ordering {
+        match a.order_index.cmp(&b.order_index) {
+            Ordering::Equal => a.option_id.as_str().cmp(b.option_id.as_str()),
+            o => o,
+        }
+    }
+
+    /// Sort unit ids ascending (lexicographic).
+    pub fn sort_units_by_id(ids: &mut [crate::tokens::UnitId]) {
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    }
+}
+
+pub mod rounding {
+    //! Integer-first ratio type and helpers.
+
+    use crate::errors::CoreError;
+    use core::cmp::Ordering;
+
+    /// Exact ratio with normalized sign and positive denominator.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+    pub struct Ratio {
+        pub num: i128,
+        pub den: i128,
+    }
+
+    #[inline]
+    fn abs_i128(x: i128) -> i128 { if x < 0 { -x } else { x } }
+
+    fn gcd_i128(mut a: i128, mut b: i128) -> i128 {
+        a = abs_i128(a);
+        b = abs_i128(b);
+        while b != 0 {
+            let r = a % b;
+            a = b;
+            b = r;
+        }
+        if a == 0 { 1 } else { a }
+    }
+
+    /// Construct a ratio, ensuring `den > 0` and reducing by GCD.
+    pub fn new_ratio_checked(num: i128, den: i128) -> Result<Ratio, CoreError> {
+        if den == 0 { return Err(CoreError::InvalidRatio); }
+        let (mut n, mut d) = (num, den);
+        if d < 0 {
+            n = -n;
+            d = -d;
+        }
+        let g = gcd_i128(n, d);
+        Ok(Ratio { num: n / g, den: d / g })
+    }
+
+    /// Compare two ratios exactly (cross-multiply) with a tie returning `Equal`.
+    ///
+    /// NOTE: Uses checked multiplication; in the unlikely event of overflow,
+    /// falls back to `f64` comparison (deterministic but lossy).
+    pub fn compare_ratio_half_even(a: &Ratio, b: &Ratio) -> Ordering {
+        // Reduce before cross-multiply to reduce overflow chance.
+        let g1 = gcd_i128(a.num, b.num);
+        let g2 = gcd_i128(a.den, b.den);
+        let an = a.num / g1;
+        let bn = b.num / g1;
+        let ad = a.den / g2;
+        let bd = b.den / g2;
+
+        if let (Some(l), Some(r)) = (an.checked_mul(bd), bn.checked_mul(ad)) {
+            l.cmp(&r)
+        } else {
+            // Fallback: compare as f64 (deterministic IEEE-754). Only for extreme values.
+            let af = (a.num as f64) / (a.den as f64);
+            let bf = (b.num as f64) / (b.den as f64);
+            af.partial_cmp(&bf).unwrap_or(Ordering::Equal)
+        }
+    }
+}
+
+pub mod rng {
+    //! Seeded RNG for **ties only** (no OS entropy).
+
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::{RngCore, SeedableRng};
+
+    use crate::determinism::StableOrd;
+    use crate::errors::CoreError;
+
+    /// Newtype over ChaCha20Rng for tie-breaking.
+    pub struct TieRng(ChaCha20Rng);
+
+    /// Create a tie RNG from an integer seed (VM-VAR-052).
+    pub fn tie_rng_from_seed(seed: u64) -> TieRng {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        TieRng(ChaCha20Rng::from_seed(bytes))
+    }
+
+    impl TieRng {
+        /// Choose an index from a non-empty slice uniformly using rejection sampling.
+        /// Returns `None` on empty slice.
+        pub fn choose<T: StableOrd>(&mut self, slice: &[T]) -> Option<usize> {
+            let n = slice.len();
+            if n == 0 { return None; }
+            let n_u64 = n as u64;
+            // Rejection sampling to avoid modulo bias.
+            let zone = u64::MAX - (u64::MAX % n_u64);
+            loop {
+                let x = self.0.next_u64();
+                if x < zone {
+                    return Some((x % n_u64) as usize);
+                }
+            }
+        }
+
+        /// Expose underlying RNG for controlled uses (e.g., shuffle within tie set).
+        pub fn rng_mut(&mut self) -> &mut ChaCha20Rng { &mut self.0 }
+    }
+
+    impl Default for TieRng {
+        fn default() -> Self { tie_rng_from_seed(0) }
+    }
+}
+
+pub mod variables {
+    //! VM-VAR domains and a minimal `Params` struct (non-exhaustive).
+    //!
+    //! Notes:
+    //! - `tie_policy` (050) is **Included** in FID.
+    //! - `tie_seed`   (052) is **Excluded** from FID and only relevant if
+    //!   `tie_policy == Random`. Recording of the seed happens in RunRecord
+    //!   **only if** a random tie actually occurred.
+    //! - `
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_core/src/ids.rs
+--------------------------------------------------------------------------------
+//! crates/vm_core/src/ids.rs
+//! Canonical engine/output IDs and token IDs (no input IDs here).
+//! Deterministic, ASCII-only, strict shapes; no I/O.
+
+#![allow(clippy::result_large_err)]
+
+use core::fmt;
+use core::str::FromStr;
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+/// Errors returned when validating or parsing IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdError {
+    NonAscii,
+    TooLong,
+    BadShape,
+}
+
+const MAX_ID_LEN: usize = 256;
+const HEX64_LEN: usize = 64;
+const TOKEN_MAX_LEN: usize = 64;
+
+/// Quickly verify ASCII (no NUL).
+#[inline]
+fn is_ascii_no_nul(s: &str) -> bool {
+    !s.as_bytes().iter().any(|&b| b == 0 || b > 0x7F)
+}
+
+/// Lowercase hex (length must be exactly 64).
+#[inline]
+pub fn is_valid_sha256(s: &str) -> bool {
+    if s.len() != HEX64_LEN || !is_ascii_no_nul(s) {
+        return false;
+    }
+    s.as_bytes()
+        .iter()
+        .all(|&b| (b'0'..=b'9').contains(&b) || (b'a'..=b'f').contains(&b))
+}
+
+/// Token for UnitId/OptionId: ^[A-Za-z0-9_.:-]{1,64}$ (ASCII only)
+#[inline]
+pub fn is_valid_token(s: &str) -> bool {
+    let bs = s.as_bytes();
+    let len = bs.len();
+    if len == 0 || len > TOKEN_MAX_LEN || !is_ascii_no_nul(s) {
+        return false;
+    }
+    bs.iter().all(|&b| {
+        (b'A'..=b'Z').contains(&b)
+            || (b'a'..=b'z').contains(&b)
+            || (b'0'..=b'9').contains(&b)
+            || b == b'_'
+            || b == b'.'
+            || b == b':'
+            || b == b'-'
+    })
+}
+
+macro_rules! simple_string_newtype {
+    ($(#[$m:meta])* $name:ident) => {
+        $(#[$m])*
+        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[cfg_attr(feature = "serde", serde(transparent))]
+        pub struct $name(String);
+
+        impl $name {
+            #[inline] pub fn as_str(&self) -> &str { &self.0 }
+        }
+
+        impl fmt::Display for $name {
+            #[inline]
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = IdError;
+            #[inline]
+            fn try_from(value: &str) -> Result<Self, Self::Error> { value.parse() }
+        }
+    }
+}
+
+// === Hex-only newtypes: FormulaId, Sha256 ===
+
+simple_string_newtype!(
+    /// 64-hex lowercase formula identifier (FID component).
+    FormulaId
+);
+simple_string_newtype!(
+    /// Generic 64-hex lowercase SHA-256 digest newtype.
+    Sha256
+);
+
+impl FromStr for FormulaId {
+    type Err = IdError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !is_ascii_no_nul(s) { return Err(IdError::NonAscii); }
+        if s.len() > MAX_ID_LEN { return Err(IdError::TooLong); }
+        if !is_valid_sha256(s) { return Err(IdError::BadShape); }
+        Ok(FormulaId(s.to_owned()))
+    }
+}
+impl FormulaId {
+    #[inline] pub fn as_hex(&self) -> &str { &self.0 }
+}
+
+impl FromStr for Sha256 {
+    type Err = IdError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !is_ascii_no_nul(s) { return Err(IdError::NonAscii); }
+        if s.len() > MAX_ID_LEN { return Err(IdError::TooLong); }
+        if !is_valid_sha256(s) { return Err(IdError::BadShape); }
+        Ok(Sha256(s.to_owned()))
+    }
+}
+impl Sha256 {
+    #[inline] pub fn as_hex(&self) -> &str { &self.0 }
+}
+
+// === Token IDs: UnitId, OptionId (no prefixes) ===
+
+simple_string_newtype!(
+    /// Registry Unit token: ^[A-Za-z0-9_.:-]{1,64}$
+    UnitId
+);
+simple_string_newtype!(
+    /// Registry Option token: ^[A-Za-z0-9_.:-]{1,64}$
+    OptionId
+);
+
+impl FromStr for UnitId {
+    type Err = IdError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !is_ascii_no_nul(s) { return Err(IdError::NonAscii); }
+        if s.len() > MAX_ID_LEN { return Err(IdError::TooLong); }
+        if !is_valid_token(s) { return Err(IdError::BadShape); }
+        Ok(UnitId(s.to_owned()))
+    }
+}
+
+impl FromStr for OptionId {
+    type Err = IdError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !is_ascii_no_nul(s) { return Err(IdError::NonAscii); }
+        if s.len() > MAX_ID_LEN { return Err(IdError::TooLong); }
+        if !is_valid_token(s) { return Err(IdError::BadShape); }
+        Ok(OptionId(s.to_owned()))
+    }
+}
+
+// === Prefixed output IDs: RES, RUN, FR ===
+
+simple_string_newtype!(
+    /// "RES:" + 64-hex lowercase
+    ResultId
+);
+simple_string_newtype!(
+    /// "RUN:" + <RFC3339 UTC 'YYYY-MM-DDTHH:MM:SSZ'> + "-" + 64-hex lowercase
+    RunId
+);
+simple_string_newtype!(
+    /// "FR:" + 64-hex lowercase
+    FrontierMapId
+);
+
+#[inline]
+fn is_res_shape(s: &str) -> bool {
+    s.len() == 4 + HEX64_LEN
+        && s.as_bytes().get(0..4) == Some(b"RES:")
+        && is_valid_sha256(&s[4..])
+}
+
+#[inline]
+fn is_fr_shape(s: &str) -> bool {
+    s.len() == 3 + HEX64_LEN
+        && s.as_bytes().get(0..3) == Some(b"FR:")
+        && is_valid_sha256(&s[3..])
+}
+
+/// Strict RFC3339 "YYYY-MM-DDTHH:MM:SSZ"
+#[inline]
+fn is_rfc3339_utc_20(ts: &str) -> bool {
+    let b = ts.as_bytes();
+    if b.len() != 20 { return false; }
+    // YYYY-MM-DDTHH:MM:SSZ
+    let digits = |r: core::ops::Range<usize>| b[r].iter().all(|&c| (b'0'..=b'9').contains(&c));
+    digits(0..4)
+        && b[4] == b'-'
+        && digits(5..7)
+        && b[7] == b'-'
+        && digits(8..10)
+        && b[10] == b'T'
+        && digits(11..13)
+        && b[13] == b':'
+        && digits(14..16)
+        && b[16] == b':'
+        && digits(17..19)
+        && b[19] == b'Z'
+}
+
+#[inline]
+fn is_run_shape(s: &str) -> bool {
+    // "RUN:" + ts(20) + "-" + hex64
+    if s.len() != 4 + 20 + 1 + HEX64_LEN { return false; }
+    let b = s.as_bytes();
+    if b.get(0..4) != Some(b"RUN:") { return false; }
+    let ts = &s[4..24];
+    if !is_rfc3339_utc_20(ts) { return false; }
+    if b[24] != b'-' { return false; }
+    is_valid_sha256(&s[25..])
+}
+
+impl FromStr for ResultId {
+    type Err = IdError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !is_ascii_no_nul(s) { return Err(IdError::NonAscii); }
+        if s.len() > MAX_ID_LEN { return Err(IdError::TooLong); }
+        if !is_res_shape(s) { return Err(IdError::BadShape); }
+        Ok(ResultId(s.to_owned()))
+    }
+}
+impl ResultId {
+    #[inline] pub fn as_hex(&self) -> &str { &self.0[4..] }
+}
+
+impl FromStr for FrontierMapId {
+    type Err = IdError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !is_ascii_no_nul(s) { return Err(IdError::NonAscii); }
+        if s.len() > MAX_ID_LEN { return Err(IdError::TooLong); }
+        if !is_fr_shape(s) { return Err(IdError::BadShape); }
+        Ok(FrontierMapId(s.to_owned()))
+    }
+}
+impl FrontierMapId {
+    #[inline] pub fn as_hex(&self) -> &str { &self.0[3..] }
+}
+
+impl FromStr for RunId {
+    type Err = IdError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !is_ascii_no_nul(s) { return Err(IdError::NonAscii); }
+        if s.len() > MAX_ID_LEN { return Err(IdError::TooLong); }
+        if !is_run_shape(s) { return Err(IdError::BadShape); }
+        Ok(RunId(s.to_owned()))
+    }
+}
+
+impl RunId {
+    /// Fast accessor to the embedded timestamp (RFC3339 UTC).
+    #[inline]
+    pub fn timestamp_utc(&self) -> &str {
+        // "RUN:" + <ts 20> + "-" + hex64
+        &self.0[4..24]
+    }
+}
+
+// === Tests ===
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha_and_formula() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
+        assert!(is_valid_sha256(hex));
+        let fid: FormulaId = hex.parse().unwrap();
+        assert_eq!(fid.as_hex(), hex);
+        let dig: Sha256 = hex.parse().unwrap();
+        assert_eq!(format!("{dig}"), hex);
+        assert!("0123XYZ".parse::<Sha256>().is_err());
+    }
+
+    #[test]
+    fn tokens() {
+        for ok in ["A", "a", "9", "_", ".", ":", "-", "A_b:9.Z"] {
+            assert!(is_valid_token(ok));
+            let _u: UnitId = ok.parse().unwrap();
+            let _o: OptionId = ok.parse().unwrap();
+        }
+        for bad in ["", " ", "é", "toolong_________________________________________________________________"] {
+            assert!(!is_valid_token(bad));
+            assert!(bad.parse::<UnitId>().is_err());
+        }
+    }
+
+    #[test]
+    fn res_fr_run() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
+        let res_s = format!("RES:{hex}");
+        let fr_s  = format!("FR:{hex}");
+        let run_s = format!("RUN:2025-08-12T14:00:00Z-{hex}");
+
+        let res: ResultId = res_s.parse().unwrap();
+        let fr:  FrontierMapId = fr_s.parse().unwrap();
+        let run: RunId = run_s.parse().unwrap();
+
+        assert_eq!(res.as_hex(), hex);
+        assert_eq!(fr.as_hex(), hex);
+        assert_eq!(run.timestamp_utc(), "2025-08-12T14:00:00Z");
+
+        // Round-trip
+        assert_eq!(format!("{res}"), res_s);
+        assert_eq!(format!("{fr}"), fr_s);
+        assert_eq!(format!("{run}"), run_s);
+
+        // Bad shapes
+        assert!("RES:DEADBEAF".parse::<ResultId>().is_err());
+        assert!("FR:0123XYZ...".parse::<FrontierMapId>().is_err());
+        assert!("RUN:2025-08-12T14:00:00-0123".parse::<RunId>().is_err()); // missing Z and '-'
+        assert!("RUN:2025-08-12 14:00:00Z-".to_string() + hex
+            .as_str()).parse::<RunId>().is_err(); // space instead of 'T'
+    }
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_core/src/entities.rs
+--------------------------------------------------------------------------------
+//! crates/vm_core/src/entities.rs
+//! Domain entities shared across the engine (registry, units, options, tallies).
+//! Pure types + invariants + deterministic ordering helpers. No I/O.
+
+#![allow(clippy::result_large_err)]
+
+use core::cmp::Ordering;
+use core::fmt;
+
+use crate::ids::{OptionId, UnitId};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+/// Construction/validation errors for domain entities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityError {
+    EmptyCollection,
+    InvalidName,
+}
+
+impl fmt::Display for EntityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EntityError::EmptyCollection => f.write_str("empty collection"),
+            EntityError::InvalidName => f.write_str("invalid name"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for EntityError {}
+
+const NAME_MIN_LEN: usize = 1;
+const NAME_MAX_LEN: usize = 200;
+
+#[inline]
+fn is_valid_name(s: &str) -> bool {
+    let len = s.chars().count();
+    (NAME_MIN_LEN..=NAME_MAX_LEN).contains(&len)
+}
+
+/// Canonical registry of divisions/units/options.
+/// Invariant: `units.len() >= 1`, units kept (or sortable) in ↑ UnitId order.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct DivisionRegistry {
+    pub schema_version: String,
+    pub units: Vec<Unit>,
+}
+
+impl DivisionRegistry {
+    /// Construct a registry, enforcing non-empty & per-unit invariants.
+    pub fn new(schema_version: String, mut units: Vec<Unit>) -> Result<Self, EntityError> {
+        if units.is_empty() {
+            return Err(EntityError::EmptyCollection);
+        }
+        // Validate units & their options
+        for u in &units {
+            u.assert_invariants()?;
+        }
+        // Canonicalize order
+        sort_units_by_id(&mut units);
+        Ok(Self { schema_version, units })
+    }
+
+    /// Read-only view of all units.
+    #[inline]
+    pub fn units(&self) -> &[Unit] {
+        &self.units
+    }
+
+    /// Find a unit by id (linear scan; call after canonical sort if you prefer binary_search).
+    #[inline]
+    pub fn unit(&self, id: &UnitId) -> Option<&Unit> {
+        self.units.iter().find(|u| &u.unit_id == id)
+    }
+}
+
+/// A voting/geographic unit (e.g., district, ward).
+/// Invariant: name: 1..=200 chars; `options.len() >= 1`; options kept in ↑(order_index, option_id).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Unit {
+    pub unit_id: UnitId,
+    pub name: String,
+    pub protected_area: bool,
+    pub options: Vec<OptionItem>,
+}
+
+impl Unit {
+    pub fn new(
+        unit_id: UnitId,
+        name: String,
+        protected_area: bool,
+        mut options: Vec<OptionItem>,
+    ) -> Result<Self, EntityError> {
+        if !is_valid_name(&name) {
+            return Err(EntityError::InvalidName);
+        }
+        if options.is_empty() {
+            return Err(EntityError::EmptyCollection);
+        }
+        for o in &options {
+            o.assert_invariants()?;
+        }
+        sort_options_canonical(&mut options);
+        Ok(Self {
+            unit_id,
+            name,
+            protected_area,
+            options,
+        })
+    }
+
+    /// Root-ness is a pipeline concern; keep API but return false to avoid leaking policy here.
+    #[inline]
+    pub fn is_root(&self) -> bool {
+        false
+    }
+
+    #[inline]
+    fn assert_invariants(&self) -> Result<(), EntityError> {
+        if !is_valid_name(&self.name) {
+            return Err(EntityError::InvalidName);
+        }
+        if self.options.is_empty() {
+            return Err(EntityError::EmptyCollection);
+        }
+        for o in &self.options {
+            o.assert_invariants()?;
+        }
+        Ok(())
+    }
+}
+
+/// An option/party/candidate entry within a unit.
+/// Invariant: name 1..=200 chars; order_index is a u16; canonical cmp is (order_index, option_id).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct OptionItem {
+    pub option_id: OptionId,
+    pub name: String,
+    pub order_index: u16,
+}
+
+impl OptionItem {
+    pub fn new(option_id: OptionId, name: String, order_index: u16) -> Result<Self, EntityError> {
+        if !is_valid_name(&name) {
+            return Err(EntityError::InvalidName);
+        }
+        Ok(Self {
+            option_id,
+            name,
+            order_index,
+        })
+    }
+
+    #[inline]
+    fn assert_invariants(&self) -> Result<(), EntityError> {
+        if !is_valid_name(&self.name) {
+            return Err(EntityError::InvalidName);
+        }
+        Ok(())
+    }
+}
+
+/// Per-unit totals, mirroring the BallotTally aggregation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct TallyTotals {
+    pub valid_ballots: u64,
+    pub invalid_ballots: u64,
+}
+
+impl TallyTotals {
+    #[inline]
+    pub fn new(valid_ballots: u64, invalid_ballots: u64) -> Self {
+        Self {
+            valid_ballots,
+            invalid_ballots,
+        }
+    }
+
+    /// Total ballots cast (saturating to guard against theoretical overflow).
+    #[inline]
+    pub fn ballots_cast(&self) -> u64 {
+        self.valid_ballots.saturating_add(self.invalid_ballots)
+    }
+}
+
+/// Deterministic canonical comparison for options: ↑ (order_index, option_id).
+#[inline]
+pub fn cmp_options(a: &OptionItem, b: &OptionItem) -> Ordering {
+    match a.order_index.cmp(&b.order_index) {
+        Ordering::Equal => a.option_id.cmp(&b.option_id),
+        ord => ord,
+    }
+}
+
+/// Sort units by UnitId ascending (stable).
+#[inline]
+pub fn sort_units_by_id(units: &mut [Unit]) {
+    units.sort_by(|a, b| a.unit_id.cmp(&b.unit_id));
+}
+
+/// Sort options canonically by (order_index, option_id) (stable).
+#[inline]
+pub fn sort_options_canonical(opts: &mut [OptionItem]) {
+    opts.sort_by(cmp_options);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uid(s: &str) -> UnitId {
+        s.parse().unwrap()
+    }
+    fn oid(s: &str) -> OptionId {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn name_bounds() {
+        assert!(is_valid_name("A"));
+        assert!(is_valid_name(&"x".repeat(200)));
+        assert!(!is_valid_name(""));
+        assert!(!is_valid_name(&"x".repeat(201)));
+    }
+
+    #[test]
+    fn option_new_and_invariants() {
+        let ok = OptionItem::new(oid("A"), "Alpha".into(), 0).unwrap();
+        assert_eq!(ok.order_index, 0);
+        assert!(OptionItem::new(oid("B"), "".into(), 1).is_err());
+    }
+
+    #[test]
+    fn unit_new_and_sorting() {
+        let o3 = OptionItem::new(oid("Z"), "Zed".into(), 2).unwrap();
+        let o1 = OptionItem::new(oid("A"), "Alpha".into(), 0).unwrap();
+        let o2 = OptionItem::new(oid("B"), "Bravo".into(), 1).unwrap();
+        let mut u = Unit::new(uid("U1"), "Unit".into(), false, vec![o3.clone(), o2.clone(), o1.clone()]).unwrap();
+        // Canonical order check: (order_index, option_id)
+        assert_eq!(u.options[0].option_id, oid("A"));
+        assert_eq!(u.options[1].option_id, oid("B"));
+        assert_eq!(u.options[2].option_id, oid("Z"));
+
+        // Bad name
+        assert!(Unit::new(uid("U2"), "".into(), false, vec![o1.clone()]).is_err());
+        // Empty options
+        assert!(Unit::new(uid("U3"), "Ok".into(), false, vec![]).is_err());
+    }
+
+    #[test]
+    fn registry_new_and_lookup() {
+        let u1 = Unit::new(uid("A"), "A".into(), false, vec![OptionItem::new(oid("X"), "X".into(), 1).unwrap()]).unwrap();
+        let u2 = Unit::new(uid("B"), "B".into(), true,  vec![OptionItem::new(oid("Y"), "Y".into(), 0).unwrap()]).unwrap();
+        let reg = DivisionRegistry::new("1.0".into(), vec![u2.clone(), u1.clone()]).unwrap();
+
+        // Sorted by unit_id
+        assert_eq!(reg.units[0].unit_id, uid("A"));
+        assert_eq!(reg.units[1].unit_id, uid("B"));
+
+        // Lookup
+        assert!(reg.unit(&uid("A")).is_some());
+        assert!(reg.unit(&uid("Z")).is_none());
+    }
+
+    #[test]
+    fn totals_sum_is_saturating() {
+        let t = TallyTotals::new(u64::MAX, 10);
+        assert_eq!(t.ballots_cast(), u64::MAX); // saturates, never panics
+    }
+
+    #[test]
+    fn cmp_and_sort_options() {
+        let mut v = vec![
+            OptionItem::new(oid("B"), "B".into(), 0).unwrap(),
+            OptionItem::new(oid("A"), "A".into(), 0).unwrap(),
+            OptionItem::new(oid("C"), "C".into(), 1).unwrap(),
+        ];
+        sort_options_canonical(&mut v);
+        assert_eq!(v.iter().map(|o| o.option_id.as_str()).collect::<Vec<_>>(), ["A", "B", "C"]);
+    }
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_core/src/variables.rs
+--------------------------------------------------------------------------------
+//! VM variables (VM-VAR-###) as typed domains + `Params` snapshot.
+//!
+//! - Strong enums for frontier/ties/etc.
+//! - `Params::default()` provides per-release defaults (placeholder here).
+//! - `validate_domains(&Params)` enforces **domain-only** rules (no I/O).
+//! - Optional `serde` derives (no `serde_json` here).
+//!
+//! This module is I/O-free and hashing/canonicalization are handled elsewhere.
+
+#![allow(clippy::upper_case_acronyms)]
+
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+use crate::tokens::UnitId;
+
+/* ------------------------------- Error types ------------------------------ */
+
+/// Validation errors for VM variables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VarError {
+    OutOfRange { var: &'static str },
+    BadToken { var: &'static str },
+    Unsupported { var: &'static str },
+}
+
+/* ---------------------------------- Enums --------------------------------- */
+
+#[cfg(feature = "serde")]
+macro_rules! serde_enum {
+    ($name:ident $(,$attr:meta)*) => {
+        #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+        #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+        $(#[$attr])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum $name
+    };
+}
+
+#[cfg(not(feature = "serde"))]
+macro_rules! serde_enum {
+    ($name:ident $(,$attr:meta)*) => {
+        $(#[$attr])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum $name
+    };
+}
+
+/// VM-VAR-050 — tie policy (Included in FID).
+serde_enum!(TiePolicy) {
+    StatusQuo,
+    DeterministicOrder,
+    Random,
+}
+
+/// VM-VAR-073 — algorithm variant (Included in FID).
+/// NOTE: Variants are per-release. Keep this list synchronized with Docs.
+serde_enum!(AlgorithmVariant, non_exhaustive) {
+    V1,
+    // Add release-specific variants here.
+}
+
+/// VM-VAR-040 — frontier mode (Included).
+serde_enum!(FrontierMode) {
+    None,
+    Banded,
+    Ladder,
+}
+
+/// VM-VAR-042 — frontier strategy (Included).
+serde_enum!(FrontierStrategy) {
+    ApplyOnEntry,
+    ApplyOnExit,
+    Sticky,
+}
+
+/// VM-VAR-045 — protected area override (Included).
+serde_enum!(ProtectedAreaOverride) {
+    Deny,
+    Allow,
+}
+
+/// VM-VAR-048 — frontier backoff policy (Included).
+serde_enum!(FrontierBackoffPolicy) {
+    None,
+    Soften,
+    Harden,
+}
+
+/// VM-VAR-049 — frontier strictness (Included).
+serde_enum!(FrontierStrictness) {
+    Strict,
+    Lenient,
+}
+
+/// VM-VAR-032 — (Excluded) presentation.
+serde_enum!(UnitSortOrder) {
+    UnitId,
+    LabelPriority,
+    Turnout,
+}
+
+/// VM-VAR-033 — (Excluded) presentation.
+serde_enum!(TiesSectionVisibility) {
+    Auto,
+    Always,
+    Never,
+}
+
+/// VM-VAR-061 — (Excluded) presentation.
+serde_enum!(DecisivenessLabelPolicy) {
+    Fixed,
+    DynamicMargin,
+}
+
+/* -------------------------------- Newtypes -------------------------------- */
+
+/// Token used by selectors/symmetry lists — `[A-Za-z0-9_.:-]{1,64}`
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StringToken(String);
+
+impl StringToken {
+    pub fn new(s: &str) -> Result<Self, VarError> {
+        if is_token(s) {
+            Ok(Self(s.to_string()))
+        } else {
+            Err(VarError::BadToken { var: "StringToken" })
+        }
+    }
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+/// Percent in 0..=100 (VM many vars).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Pct(u8);
+
+impl Pct {
+    pub const fn new(v: u8) -> Result<Self, VarError> {
+        if v <= 100 { Ok(Self(v)) } else { Err(VarError::OutOfRange { var: "Pct" }) }
+    }
+    pub const fn get(self) -> u8 { self.0 }
+}
+
+/* --------------------------------- Minor ---------------------------------- */
+
+/// VM-VAR-021 — run scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "type", content = "value", rename_all = "snake_case"))]
+pub enum RunScope {
+    AllUnits,
+    Selector(StringToken),
+}
+
+/// VM-VAR-030 — eligibility override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct EligibilityOverride {
+    pub unit_id: UnitId,
+    pub mode: EligibilityMode,
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum EligibilityMode { Include, Exclude }
+
+/// VM-VAR-046 — deterministic-key map (domain defined per release).
+pub type AutonomyPackageMap = BTreeMap<StringToken, StringToken>;
+
+/* --------------------------------- Params --------------------------------- */
+
+/// Typed snapshot of VM variables. Included (FID) vars are required; Excluded are optional.
+///
+/// NOTE: String-typed enums (001/002/004/005/006/007) are modeled as `String` to allow
+/// per-release set evolution without changing the core crate.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Params {
+    /* Included (FID) — required */
+    /// VM-VAR-001: algorithm family (enum per release)
+    pub v001_algorithm_family: String,
+    /// VM-VAR-002: rounding policy (enum per release)
+    pub v002_rounding_policy: String,
+    /// VM-VAR-003: share precision 0..=6
+    pub v003_share_precision: u8,
+    /// VM-VAR-004..006: strings per family
+    pub v004_denom_rule: String,
+    pub v005_aggregation_mode: String,
+    pub v006_seat_allocation_rule: String,
+    /// VM-VAR-007: tie scope model (e.g., "winner_only" | "rank_all")
+    pub v007_tie_scope_model: String,
+
+    // Thresholds/gates
+    pub v010: Pct, pub v011: Pct, pub v012: Pct, pub v013: Pct,
+    pub v014: Pct, pub v015: Pct, pub v016: Pct, pub v017: Pct,
+    pub v020: Pct,
+
+    /// VM-VAR-021
+    pub v021_run_scope: RunScope,
+
+    pub v022: Pct, pub v023: Pct,
+    /// VM-VAR-024..025 — booleans (if defined in release)
+    pub v024_flag_a: bool,
+    pub v025_flag_b: bool,
+    /// VM-VAR-026..028 — numeric knobs (domain per release)
+    pub v026: i32,
+    pub v027: i32,
+    pub v028: i32,
+
+    /// VM-VAR-029 — deterministic selectors
+    pub v029_symmetry_exceptions: Vec<StringToken>,
+    /// VM-VAR-030
+    pub v030_eligibility_override_list: Vec<EligibilityOverride>,
+    /// VM-VAR-031
+    pub v031_ballot_integrity_floor: Pct,
+
+    /// Frontier (040..049)
+    pub v040_frontier_mode: FrontierMode,
+    pub v041_frontier_cut: f32,          // domain per mode
+    pub v042_frontier_strategy: FrontierStrategy,
+    pub v045_protected_area_override: ProtectedAreaOverride,
+    pub v046_autonomy_package_map: AutonomyPackageMap,
+    pub v047_frontier_band_window: f32,  // 0.0..=1.0
+    pub v048_frontier_backoff_policy: FrontierBackoffPolicy,
+    pub v049_frontier_strictness: FrontierStrictness,
+
+    /// Ties (050 in FID)
+    pub v050_tie_policy: TiePolicy,
+
+    /// Variant (073 in FID)
+    pub v073_algorithm_variant: AlgorithmVariant,
+
+    /* Excluded (non-FID) — optional */
+    pub v032_unit_sort_order: Option<UnitSortOrder>,
+    pub v033_ties_section_visibility: Option<TiesSectionVisibility>,
+    pub v034_frontier_map_enabled: Option<bool>,
+    pub v035_sensitivity_analysis_enabled: Option<bool>,
+    /// VM-VAR-052 — integer seed ≥ 0 (recorded in RunRecord iff a random tie occurred)
+    pub v052_tie_seed: Option<u64>,
+    pub v060_majority_label_threshold: Option<Pct>,
+    pub v061_decisiveness_label_policy: Option<DecisivenessLabelPolicy>,
+    /// "auto" or IETF tag (opaque)
+    pub v062_unit_display_language: Option<String>,
+}
+
+/* -------------------------------- Defaults -------------------------------- */
+
+impl Default for Params {
+    fn default() -> Self {
+        // NOTE: These are sane placeholders; set to your per-release defaults.
+        Self {
+            v001_algorithm_family: "family_v1".to_string(),
+            v002_rounding_policy: "half_up".to_string(),
+            v003_share_precision: 3,
+            v004_denom_rule: "standard".to_string(),
+            v005_aggregation_mode: "sum".to_string(),
+            v006_seat_allocation_rule: "none".to_string(),
+            v007_tie_scope_model: "winner_only".to_string(),
+
+            v010: Pct::new(0).unwrap(), v011: Pct::new(0).unwrap(),
+            v012: Pct::new(0).unwrap(), v013: Pct::new(0).unwrap(),
+            v014: Pct::new(0).unwrap(), v015: Pct::new(0).unwrap(),
+            v016: Pct::new(0).unwrap(), v017: Pct::new(0).unwrap(),
+            v020: Pct::new(0).unwrap(),
+
+            v021_run_scope: RunScope::AllUnits,
+
+            v022: Pct::new(0).unwrap(),
+            v023: Pct::new(0).unwrap(),
+
+            v024_flag_a: true,
+            v025_flag_b: true,
+
+            v026: 0,
+            v027: 0,
+            v028: 0,
+
+            v029_symmetry_exceptions: Vec::new(),
+            v030_eligibility_override_list: Vec::new(),
+            v031_ballot_integrity_floor: Pct::new(0).unwrap(),
+
+            v040_frontier_mode: FrontierMode::None,
+            v041_frontier_cut: 0.0,
+            v042_frontier_strategy: FrontierStrategy::ApplyOnEntry,
+            v045_protected_area_override: ProtectedAreaOverride::Deny,
+            v046_autonomy_package_map: AutonomyPackageMap::new(),
+            v047_frontier_band_window: 0.0,
+            v048_frontier_backoff_policy: FrontierBackoffPolicy::None,
+            v049_frontier_strictness: FrontierStrictness::Strict,
+
+            v050_tie_policy: TiePolicy::StatusQuo,
+            v073_algorithm_variant: AlgorithmVariant::V1,
+
+            v032_unit_sort_order: None,
+            v033_ties_section_visibility: None,
+            v034_frontier_map_enabled: Some(true),
+            v035_sensitivity_analysis_enabled: Some(false),
+            v052_tie_seed: Some(0),
+            v060_majority_label_threshold: None,
+            v061_decisiveness_label_policy: Some(DecisivenessLabelPolicy::DynamicMargin),
+            v062_unit_display_language: Some("auto".to_string()),
+        }
+    }
+}
+
+/* ------------------------------- Validation -------------------------------- */
+
+/// Domain-only validation (no cross-artifact checks).
+pub fn validate_domains(p: &Params) -> Result<(), VarError> {
+    // v003: 0..=6
+    if p.v003_share_precision > 6 {
+        return Err(VarError::OutOfRange { var: "VM-VAR-003" });
+    }
+
+    // Percentages are enforced by `Pct`, but double-check to be robust.
+    for (name, pct) in [
+        ("VM-VAR-010", p.v010.get()), ("VM-VAR-011", p.v011.get()),
+        ("VM-VAR-012", p.v012.get()), ("VM-VAR-013", p.v013.get()),
+        ("VM-VAR-014", p.v014.get()), ("VM-VAR-015", p.v015.get()),
+        ("VM-VAR-016", p.v016.get()), ("VM-VAR-017", p.v017.get()),
+        ("VM-VAR-020", p.v020.get()), ("VM-VAR-022", p.v022.get()),
+        ("VM-VAR-023", p.v023.get()), ("VM-VAR-031", p.v031_ballot_integrity_floor.get()),
+    ] {
+        if pct > 100 {
+            return Err(VarError::OutOfRange { var: name });
+        }
+    }
+
+    // v047: 0.0..=1.0
+    if !(0.0..=1.0).contains(&p.v047_frontier_band_window) {
+        return Err(VarError::OutOfRange { var: "VM-VAR-047" });
+    }
+
+    // v041: if constrained per mode, put numeric guards here; we keep it finite.
+    if !p.v041_frontier_cut.is_finite() {
+        return Err(VarError::OutOfRange { var: "VM-VAR-041" });
+    }
+
+    // v052: seed is u64 if present — always >= 0 by type.
+
+    // v029: StringToken ensures domain; still reject empty vector is OK (allowed).
+
+    // v030: UnitId domain handled by type; list may be empty (allowed).
+    Ok(())
+}
+
+/* ------------------------------ Convenience -------------------------------- */
+
+impl Params {
+    #[inline]
+    pub fn is_random_ties(&self) -> bool {
+        matches!(self.v050_tie_policy, TiePolicy::Random)
+    }
+
+    #[inline]
+    pub fn frontier_enabled(&self) -> bool {
+        !matches!(self.v040_frontier_mode, FrontierMode::None)
+    }
+
+    /// Example convenience normalization (may be used by algorithms).
+    #[inline]
+    pub fn pr_threshold(&self) -> Option<u8> {
+        Some(self.v022.get())
+    }
+
+    /// Iterate **Included** (FID) variable IDs in canonical order (keys only).
+    pub fn iter_fid_keys(&self) -> impl Iterator<Item = &'static str> {
+        FID_KEYS.iter().copied()
+    }
+}
+
+/* ------------------------------ FID Iteration ------------------------------ */
+
+/// Static list of Included (FID) keys, canonical order.
+const FID_KEYS: &[&str] = &[
+    "VM-VAR-001","VM-VAR-002","VM-VAR-003","VM-VAR-004","VM-VAR-005","VM-VAR-006","VM-VAR-007",
+    "VM-VAR-010","VM-VAR-011","VM-VAR-012","VM-VAR-013","VM-VAR-014","VM-VAR-015","VM-VAR-016","VM-VAR-017",
+    "VM-VAR-020","VM-VAR-021","VM-VAR-022","VM-VAR-023","VM-VAR-024","VM-VAR-025","VM-VAR-026","VM-VAR-027","VM-VAR-028","VM-VAR-029","VM-VAR-030","VM-VAR-031",
+    "VM-VAR-040","VM-VAR-041","VM-VAR-042","VM-VAR-045","VM-VAR-046","VM-VAR-047","VM-VAR-048","VM-VAR-049",
+    "VM-VAR-050","VM-VAR-073",
+];
+
+/* --------------------------------- Helpers -------------------------------- */
+
+#[inline]
+fn is_token(s: &str) -> bool {
+    let len = s.len();
+    if !(1..=64).contains(&len) { return false; }
+    s.bytes().all(|b| matches!(b,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' |
+        b'_' | b'-' | b':' | b'.'
+    ))
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_core/src/determinism.rs
+--------------------------------------------------------------------------------
+//! Determinism utilities: stable ordering & order-independent reduction.
+//!
+//! This module is **I/O-free**. It provides:
+//! - Stable total orders for core tokens/entities
+//! - Canonical in-place sort helpers
+//! - A deterministic reduce helper (independent of chunking order if the
+//!   combiner is associative)
+//! - A small map helper to materialize canonical (key-ordered) maps
+//! - A trait for “canonical bytes” (interface only; implemented elsewhere)
+
+extern crate alloc;
+
+use core::cmp::Ordering;
+
+use crate::entities::OptionItem;
+use crate::tokens::{OptionId, UnitId};
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+
+/* -------------------------------------------------------------------------- */
+/*                               Stable Ordering                              */
+/* -------------------------------------------------------------------------- */
+
+/// Provide a **total**, stable order for values that must sort canonically.
+pub trait StableOrd {
+    fn stable_cmp(&self, other: &Self) -> Ordering;
+}
+
+impl StableOrd for UnitId {
+    #[inline]
+    fn stable_cmp(&self, other: &Self) -> Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl StableOrd for OptionId {
+    #[inline]
+    fn stable_cmp(&self, other: &Self) -> Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl StableOrd for OptionItem {
+    /// Canonical option order is **always** `(order_index, option_id)`.
+    #[inline]
+    fn stable_cmp(&self, other: &Self) -> Ordering {
+        match self.order_index.cmp(&other.order_index) {
+            Ordering::Equal => self.option_id.as_str().cmp(other.option_id.as_str()),
+            o => o,
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Canonical sort helpers                           */
+/* -------------------------------------------------------------------------- */
+
+/// Compare two options by `(order_index, option_id)`.
+#[inline]
+pub fn cmp_options_by_order(a: &OptionItem, b: &OptionItem) -> Ordering {
+    a.stable_cmp(b)
+}
+
+/// Sort options **in place** into canonical order.
+#[inline]
+pub fn sort_options_canonical(xs: &mut [OptionItem]) {
+    xs.sort_by(|a, b| a.stable_cmp(b));
+}
+
+/// Sort units **in place** by ascending `UnitId` (lexicographic).
+#[inline]
+pub fn sort_units_by_id<T: AsRef<UnitId>>(xs: &mut [T]) {
+    xs.sort_by(|a, b| a.as_ref().as_str().cmp(b.as_ref().as_str()));
+}
+
+/* -------------------------------------------------------------------------- */
+/*                         Deterministic (order-free) reduce                   */
+/* -------------------------------------------------------------------------- */
+
+/// Marker trait providing an identity element for reductions.
+///
+/// The identity is not used for the non-empty case (we fold from the first
+/// element). It exists to document the algebra and for potential callers that
+/// wish to validate identities in tests.
+pub trait StableReduce: Sized {
+    fn identity() -> Self;
+}
+
+/// Deterministically reduce a vector by first sorting it canonically and then
+/// folding with the provided associative `combine`.
+///
+/// If `items` is empty, returns `None`.
+#[inline]
+pub fn reduce_deterministic<T, F>(mut items: Vec<T>, combine: F) -> Option<T>
+where
+    T: StableReduce + StableOrd,
+    F: Fn(T, T) -> T,
+{
+    if items.is_empty() {
+        return None;
+    }
+    items.sort_by(|a, b| a.stable_cmp(b));
+    let mut it = items.into_iter();
+    let first = it.next().unwrap();
+    Some(it.fold(first, |acc, x| combine(acc, x)))
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          Canonical map materialization                      */
+/* -------------------------------------------------------------------------- */
+
+/// Build a key-ordered `BTreeMap` from an iterator of `(K, V)`.
+#[inline]
+pub fn btreemap_from_iter_kv<K: Ord, V, I: IntoIterator<Item = (K, V)>>(it: I) -> BTreeMap<K, V> {
+    it.into_iter().collect()
+}
+
+/* -------------------------------------------------------------------------- */
+/*                         Canonical bytes (interface)                         */
+/* -------------------------------------------------------------------------- */
+
+/// Types that can emit **canonical bytes** suitable for hashing.
+/// (Implementation lives in the codec layer; this is the interface.)
+pub trait HashCanon {
+    fn canonical_bytes(&self) -> Vec<u8>;
+}
+
+/* ---------------------------------- Tests --------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tokens::{OptionId, UnitId};
+
+    fn oid(s: &str) -> OptionId { s.parse().unwrap() }
+    fn uid(s: &str) -> UnitId { s.parse().unwrap() }
+
+    #[test]
+    fn unit_sort_is_lex() {
+        let mut v = vec![uid("U-10"), uid("U-2"), uid("A-1")];
+        sort_units_by_id(&mut v);
+        let got: Vec<&str> = v.iter().map(|u| u.as_str()).collect();
+        assert_eq!(got, vec!["A-1", "U-10", "U-2"]);
+    }
+
+    #[test]
+    fn option_sort_by_index_then_id() {
+        let mut xs = vec![
+            OptionItem { option_id: oid("O-B"), name: "b".into(), order_index: 1 },
+            OptionItem { option_id: oid("O-A"), name: "a".into(), order_index: 1 },
+            OptionItem { option_id: oid("O-C"), name: "c".into(), order_index: 0 },
+        ];
+        sort_options_canonical(&mut xs);
+        let got: Vec<(&str, u16)> = xs.iter().map(|o| (o.option_id.as_str(), o.order_index)).collect();
+        assert_eq!(got, vec![("O-C", 0), ("O-A", 1), ("O-B", 1)]);
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Sum(u32);
+    impl StableReduce for Sum {
+        fn identity() -> Self { Sum(0) }
+    }
+    impl StableOrd for Sum {
+        fn stable_cmp(&self, other: &Self) -> Ordering { self.0.cmp(&other.0) }
+    }
+
+    #[test]
+    fn reduce_is_deterministic_sorted_fold() {
+        let v = vec![Sum(5), Sum(1), Sum(3)];
+        let r = reduce_deterministic(v, |a, b| Sum(a.0 + b.0)).unwrap();
+        assert_eq!(r, Sum(9));
+    }
+
+    #[test]
+    fn reduce_empty_none() {
+        let v: Vec<Sum> = vec![];
+        assert!(reduce_deterministic(v, |a, b| Sum(a.0 + b.0)).is_none());
+    }
+
+    #[test]
+    fn btreemap_canonical_keys() {
+        let m = btreemap_from_iter_kv([("b", 2), ("a", 1), ("c", 3)]);
+        let keys: Vec<&str> = m.keys().copied().collect();
+        assert_eq!(keys, vec!["a", "b", "c"]);
+    }
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_core/src/rounding.rs
+--------------------------------------------------------------------------------
+//! Overflow-safe integer/rational helpers with banker’s rounding (half-to-even).
+//!
+//! - Pure integer math; no floats, no I/O.
+//! - Deterministic across OS/arch.
+//! - Rounding only where explicitly allowed (nearest-even).
+//!
+//! Public API (as specified):
+//!   - `simplify`
+//!   - `cmp_ratio`
+//!   - `ge_percent`
+//!   - `round_nearest_even_int`
+//!   - `percent_one_decimal_tenths`
+//!   - `ge_percent_half_even`
+//!
+//! Extra small conveniences (aligned with `lib.rs` outline):
+//!   - `Ratio` newtype + `new_ratio_checked`
+//!   - `compare_ratio_half_even` (delegates to exact compare)
+
+#![allow(clippy::many_single_char_names)]
+
+use core::cmp::Ordering;
+
+/* --------------------------------- Errors --------------------------------- */
+
+/// Errors for numeric helpers (no I/O, deterministic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericError {
+    ZeroDenominator,
+}
+
+/* --------------------------------- Ratio ---------------------------------- */
+
+/// Exact rational with invariant `den > 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ratio {
+    pub num: i128,
+    pub den: i128,
+}
+
+impl Ratio {
+    /// Construct and normalize sign/reduce by gcd; ensures `den > 0` and gcd(|num|, den) == 1.
+    pub fn new_ratio_checked(num: i128, den: i128) -> Result<Self, NumericError> {
+        let (n, d) = simplify(num, den)?;
+        Ok(Self { num: n, den: d })
+    }
+}
+
+/* --------------------------------- GCD ------------------------------------ */
+
+#[inline]
+fn abs_i128_to_u128(x: i128) -> u128 {
+    if x == i128::MIN {
+        (1u128) << 127
+    } else if x < 0 {
+        (-x) as u128
+    } else {
+        x as u128
+    }
+}
+
+#[inline]
+fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+/* --------------------------- Core helper functions ------------------------- */
+
+/// Normalize sign and reduce by gcd; ensures den > 0.
+/// Returns (num, den) with gcd(|num|, den) == 1 and den > 0.
+pub fn simplify(num: i128, den: i128) -> Result<(i128, i128), NumericError> {
+    if den == 0 {
+        return Err(NumericError::ZeroDenominator);
+    }
+    let mut n = num;
+    let mut d = den;
+    if d < 0 {
+        n = -n;
+        d = -d;
+    }
+    let g = gcd_u128(abs_i128_to_u128(n), d as u128) as i128;
+    let n2 = n / g;
+    let d2 = d / g;
+    Ok((n2, d2))
+}
+
+/// Overflow-safe compare of a/b vs c/d (total order).
+/// Uses cross-cancel; if risk of overflow remains, falls back to Euclid/CF.
+pub fn cmp_ratio(a_num: i128, a_den: i128, b_num: i128, b_den: i128) -> Result<Ordering, NumericError> {
+    // Normalize
+    let (mut an, ad) = simplify(a_num, a_den)?;
+    let (mut bn, bd) = simplify(b_num, b_den)?;
+
+    // Fast sign checks
+    let a_neg = an < 0;
+    let b_neg = bn < 0;
+    if a_neg != b_neg {
+        return Ok(if a_neg { Ordering::Less } else { Ordering::Greater });
+    }
+    // Both negative: compare their absolutes reversed
+    if a_neg && b_neg {
+        an = -an;
+        bn = -bn;
+        return cmp_ratio_nonneg(an, ad, bn, bd).map(|o| o.reverse());
+    }
+    // Both non-negative
+    cmp_ratio_nonneg(an, ad, bn, bd)
+}
+
+/// Compare non-negative rationals (an/ad) vs (bn/bd) with overflow safety.
+fn cmp_ratio_nonneg(an: i128, ad: i128, bn: i128, bd: i128) -> Result<Ordering, NumericError> {
+    // Quick equality path
+    if an == bn && ad == bd {
+        return Ok(Ordering::Equal);
+    }
+
+    // Cross-cancel to shrink operands
+    let g1 = gcd_u128(abs_i128_to_u128(an), abs_i128_to_u128(bn)) as i128;
+    let (an, bn) = (an / g1, bn / g1);
+    let g2 = gcd_u128(ad as u128, bd as u128) as i128;
+    let (ad, bd) = (ad / g2, bd / g2);
+
+    // Try cross-multiplication
+    if let (Some(lhs), Some(rhs)) = (an.checked_mul(bd), bn.checked_mul(ad)) {
+        return Ok(lhs.cmp(&rhs));
+    }
+
+    // Fallback: continued-fraction / Euclid-based compare
+    Ok(cmp_by_cf_nonneg(an, ad, bn, bd))
+}
+
+/// Continued-fraction style comparison for non-negative rationals, no overflow.
+fn cmp_by_cf_nonneg(mut a: i128, mut b: i128, mut c: i128, mut d: i128) -> Ordering {
+    debug_assert!(a >= 0 && b > 0 && c >= 0 && d > 0);
+    loop {
+        let qa = a / b;
+        let ra = a % b;
+        let qc = c / d;
+        let rc = c % d;
+
+        if qa != qc {
+            return qa.cmp(&qc);
+        }
+        // Exactness checks
+        if ra == 0 && rc == 0 {
+            return Ordering::Equal;
+        }
+        if ra == 0 {
+            // a/b == qa; c/d > qc since rc>0
+            return Ordering::Less;
+        }
+        if rc == 0 {
+            return Ordering::Greater;
+        }
+        // Compare reciprocals: a/b ? c/d  <=>  b/ra ? d/rc, but note the inversion.
+        // Swap to next CF step.
+        a = b;
+        b = ra;
+        c = d;
+        d = rc;
+    }
+}
+
+/// Compare a/b against integer percent p (0..=100) without floats.
+/// Returns true iff a/b >= p%.
+pub fn ge_percent(a_num: i128, a_den: i128, p: u8) -> Result<bool, NumericError> {
+    let ord = cmp_ratio(a_num, a_den, p as i128, 100)?;
+    Ok(matches!(ord, Ordering::Greater | Ordering::Equal))
+}
+
+/// Banker's rounding of a/b to nearest integer (ties to even).
+pub
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_core/src/rng.rs
+--------------------------------------------------------------------------------
+//! crates/vm_core/src/rng.rs
+//! Deterministic RNG for tie resolution only (VM-VAR-052 seed).
+//! ChaCha20-based, single-threaded, no OS entropy/time, no floats.
+
+#![allow(clippy::result_large_err)]
+
+use rand_chacha::ChaCha20Rng;
+use rand_core::{RngCore, SeedableRng};
+use smol_str::SmolStr;
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+/// Construction/usage errors (kept for API symmetry; most fns return Option on empty domains).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RngError {
+    EmptyDomain,
+}
+
+/// Opaque RNG used strictly for ties. Tracks how many 64-bit words were consumed.
+#[derive(Clone)]
+pub struct TieRng {
+    rng: ChaCha20Rng,
+    words_consumed: u128,
+}
+
+/// Optional audit crumb (callers may aggregate into RunRecord tie logs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct TieCrumb {
+    pub ctx: SmolStr,
+    pub pick: u32,
+    pub word_index: u128,
+}
+
+/// Build from integer tie_seed (VM-VAR-052). Stable across platforms.
+#[inline]
+pub fn tie_rng_from_seed(seed: u64) -> TieRng {
+    TieRng {
+        rng: ChaCha20Rng::seed_from_u64(seed),
+        words_consumed: 0,
+    }
+}
+
+impl TieRng {
+    /// Next unbiased integer in [0, n) via rejection sampling. Returns None if n == 0.
+    #[inline]
+    pub fn gen_range(&mut self, n: u64) -> Option<u64> {
+        if n == 0 {
+            return None;
+        }
+        // Avoid modulo bias with rejection sampling.
+        // zone is the largest multiple of n that fits in u64.
+        let zone = u64::MAX - (u64::MAX % n);
+        loop {
+            let x = self.next_u64();
+            if x < zone {
+                return Some(x % n);
+            }
+        }
+    }
+
+    /// Choose index of winner from slice; None on empty slice.
+    #[inline]
+    pub fn choose_index<T>(&mut self, slice: &[T]) -> Option<usize> {
+        let n = slice.len() as u64;
+        self.gen_range(n).map(|v| v as usize)
+    }
+
+    /// Deterministic in-place Fisher–Yates shuffle.
+    #[inline]
+    pub fn shuffle<T>(&mut self, xs: &mut [T]) {
+        let len = xs.len();
+        if len <= 1 {
+            return;
+        }
+        // Iterate i = len-1 down to 1, choose j ∈ [0, i]
+        for i in (1..len).rev() {
+            // unwrap is safe: i >= 1 ⇒ i+1 >= 2 ⇒ domain non-zero
+            let j = self.gen_range((i as u64) + 1).unwrap() as usize;
+            xs.swap(i, j);
+        }
+    }
+
+    /// Emit next u64.
+    #[inline]
+    pub fn next_u64(&mut self) -> u64 {
+        let v = self.rng.next_u64();
+        self.words_consumed = self.words_consumed.saturating_add(1);
+        v
+    }
+
+    /// Emit next u128 (concat of two u64 draws).
+    #[inline]
+    pub fn next_u128(&mut self) -> u128 {
+        let hi = self.next_u64() as u128;
+        let lo = self.next_u64() as u128;
+        (hi << 64) | lo
+    }
+
+    /// Return how many 64-bit words have been consumed.
+    #[inline]
+    pub fn words_consumed(&self) -> u128 {
+        self.words_consumed
+    }
+
+    /// Optional: build a tiny crumb for audit logs (does not consume RNG).
+    #[inline]
+    pub fn log_pick(&self, ctx: &str, pick: usize) -> TieCrumb {
+        TieCrumb {
+            ctx: SmolStr::new(ctx),
+            pick: pick as u32,
+            word_index: self.words_consumed(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn determinism_same_seed_same_sequence() {
+        let mut a = tie_rng_from_seed(42);
+        let mut b = tie_rng_from_seed(42);
+
+        let mut va = [0u64; 8];
+        let mut vb = [0u64; 8];
+        for i in 0..8 {
+            va[i] = a.next_u64();
+            vb[i] = b.next_u64();
+        }
+        assert_eq!(va, vb);
+
+        // gen_range determinism
+        let mut a = tie_rng_from_seed(7);
+        let mut b = tie_rng_from_seed(7);
+        let sa: Vec<u64> = (0..20).map(|_| a.gen_range(10).unwrap()).collect();
+        let sb: Vec<u64> = (0..20).map(|_| b.gen_range(10).unwrap()).collect();
+        assert_eq!(sa, sb);
+    }
+
+    #[test]
+    fn different_seeds_diverge() {
+        let mut a = tie_rng_from_seed(1);
+        let mut b = tie_rng_from_seed(2);
+
+        // Very likely to diverge immediately
+        let x = a.next_u64();
+        let y = b.next_u64();
+        assert_ne!(x, y);
+    }
+
+    #[test]
+    fn choose_and_shuffle() {
+        let mut r = tie_rng_from_seed(123);
+        // choose_index
+        let empty: [i32; 0] = [];
+        assert!(r.choose_index(&empty).is_none());
+
+        let v = [10, 20, 30];
+        let idx = r.choose_index(&v).unwrap();
+        assert!(idx < v.len());
+
+        // shuffle determinism
+        let mut a = (0..10).collect::<Vec<_>>();
+        let mut b = (0..10).collect::<Vec<_>>();
+        let mut r1 = tie_rng_from_seed(9);
+        let mut r2 = tie_rng_from_seed(9);
+        r1.shuffle(&mut a);
+        r2.shuffle(&mut b);
+        assert_eq!(a, b);
+
+        // different seed ⇒ almost surely different permutation
+        let mut c = (0..10).collect::<Vec<_>>();
+        let mut r3 = tie_rng_from_seed(99);
+        r3.shuffle(&mut c);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn words_and_u128() {
+        let mut r = tie_rng_from_seed(5);
+        assert_eq!(r.words_consumed(), 0);
+        let _u = r.next_u64();
+        assert_eq!(r.words_consumed(), 1);
+        let _v = r.next_u128();
+        assert_eq!(r.words_consumed(), 3);
+    }
+
+    #[test]
+    fn crumb_does_not_consume_words() {
+        let mut r = tie_rng_from_seed(77);
+        let _ = r.next_u64();
+        let before = r.words_consumed();
+        let c = r.log_pick("tie#1", 2);
+        assert_eq!(c.ctx.as_str(), "tie#1");
+        assert_eq!(c.pick, 2);
+        assert_eq!(c.word_index, before);
+        assert_eq!(r.words_consumed(), before);
+    }
+
+    #[test]
+    fn gen_range_zero_none() {
+        let mut r = tie_rng_from_seed(0);
+        assert_eq!(r.gen_range(0), None);
+    }
+}

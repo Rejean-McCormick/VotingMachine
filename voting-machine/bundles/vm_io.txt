@@ -1,0 +1,1494 @@
+# bundle: vm_io
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_io/Cargo.toml
+--------------------------------------------------------------------------------
+[package]
+name = "vm_io"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "Apache-2.0 OR MIT"
+description = "I/O, canonical JSON, JSON Schema validation (2020-12), and SHA-256 hashing for the VM engine."
+# repository = "."; readme = "README.md"
+
+[lib]
+name = "vm_io"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+default = ["std", "serde", "schemaval", "hash", "path_utf8"]
+std = []
+serde = ["dep:serde", "dep:serde_json"]
+schemaval = ["dep:jsonschema"]
+hash = ["dep:sha2", "dep:digest"]
+path_utf8 = ["dep:camino"]
+
+[dependencies]
+vm_core     = { path = "../vm_core" } # adjust if your workspace layout differs
+
+serde       = { version = "1", features = ["derive"], optional = true, default-features = false }
+serde_json  = { version = "1", optional = true }                      # std only; used for parse/write
+
+jsonschema  = { version = "0.17", optional = true, default-features = false, features = ["draft2020-12"] }
+
+sha2        = { version = "0.10", optional = true, default-features = false }
+digest      = { version = "0.10", optional = true, default-features = false }
+hex         = { version = "0.4",  default-features = false }
+
+camino      = { version = "1", optional = true, default-features = false }
+
+thiserror   = { version = "1", default-features = false }
+
+[dev-dependencies]
+assert_json_diff = "2"
+tempfile         = "3"
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_io/src/lib.rs
+--------------------------------------------------------------------------------
+//! vm_io — canonical JSON I/O, schema validation (Draft 2020-12), hashing, and high-level loaders.
+//!
+//! This crate is I/O-facing but **offline-only** (no URLs, no network). It converts local JSON
+//! artifacts into typed `vm_core` structures, provides canonical JSON bytes (sorted keys, LF),
+//! and computes SHA-256 digests used for IDs and verification.
+//!
+//! Alignment:
+//! - Shapes and contracts come from Docs 1–7 and Annex A/B/C (see repo root).
+//! - Canonical artifacts: UTF-8, LF, **sorted keys**; arrays are pre-ordered by the engine.
+//! - Validation schemas: JSON Schema Draft 2020-12 (feature `schemaval`).
+//!
+//! Notes:
+//! - Feature matrix (see Cargo.toml): `std` (default), `serde`, `schemaval`, `hash`, `path_utf8`.
+//! - We intentionally avoid any network/file-download behavior here.
+
+#![forbid(unsafe_code)]
+#![deny(clippy::all, clippy::pedantic)]
+#![allow(clippy::module_name_repetitions)]
+
+use thiserror::Error;
+
+// Re-exports (narrow surface; callers usually import from vm_core directly)
+pub use vm_core::{
+    determinism::*,
+    rounding::*,
+    rng::*,
+    // Types commonly consumed by loaders/pipeline:
+    entities::*,
+    variables::Params,
+};
+
+/// I/O errors surfaced by this crate. Messages are short/stable for test-pack diffs.
+#[derive(Error, Debug)]
+pub enum IoError {
+    #[error("read error: {0}")]
+    Read(std::io::Error),
+    #[error("write error: {0}")]
+    Write(std::io::Error),
+    #[error("json parse error at {pointer}: {msg}")]
+    Json { pointer: String, msg: String },
+    #[error("schema validation failed at {pointer}: {msg}")]
+    Schema { pointer: String, msg: String },
+    #[error("manifest violation: {0}")]
+    Manifest(String),
+    #[error("expectation mismatch: {0}")]
+    Expect(String),
+    #[error("canonicalization: {0}")]
+    Canon(String),
+    #[error("hashing: {0}")]
+    Hash(String),
+    #[error("path: {0}")]
+    Path(String),
+    #[error("limit: {0}")]
+    Limit(&'static str),
+}
+
+/// Canonical JSON (sorted keys, LF). Serialization requires the `serde` feature.
+pub mod canonical_json {
+    use super::IoError;
+
+    #[cfg(feature = "serde")]
+    use serde::Serialize;
+    #[cfg(feature = "serde")]
+    use serde_json::{Map, Value};
+
+    /// Convert any `Serialize` value to canonical JSON bytes (sorted object keys, LF newlines).
+    #[cfg(feature = "serde")]
+    pub fn to_canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, IoError> {
+        let val = serde_json::to_value(value)
+            .map_err(|e| IoError::Json { pointer: "/".into(), msg: e.to_string() })?;
+        let canon = canonicalize_value(val);
+        let mut bytes = serde_json::to_vec(&canon)
+            .map_err(|e| IoError::Canon(e.to_string()))?;
+        // Enforce LF: replace CRLF with LF in-place (JSON writer already uses '\n', but be strict)
+        if bytes.windows(2).any(|w| w == b"\r\n") {
+            let s = String::from_utf8(bytes).map_err(|e| IoError::Canon(e.to_string()))?;
+            bytes = s.replace("\r\n", "\n").into_bytes();
+        }
+        Ok(bytes)
+    }
+
+    /// Write canonical JSON to a file at `path` (overwrites). Parent dirs must exist.
+    #[cfg(feature = "serde")]
+    pub fn write_canonical_file<T: Serialize, P: AsRef<std::path::Path>>(value: &T, path: P) -> Result<(), IoError> {
+        use std::io::Write;
+        let bytes = to_canonical_bytes(value)?;
+        let mut f = std::fs::File::create(path.as_ref()).map_err(IoError::Write)?;
+        f.write_all(&bytes).map_err(IoError::Write)
+    }
+
+    /// Recursively sort object keys; preserve array order; leave numbers/strings as-is.
+    #[cfg(feature = "serde")]
+    fn canonicalize_value(v: Value) -> Value {
+        match v {
+            Value::Object(map) => {
+                // Collect and sort keys, re-inserting in sorted order to fix iteration order.
+                let mut keys: Vec<_> = map.keys().cloned().collect();
+                keys.sort();
+                let mut out = Map::with_capacity(map.len());
+                for k in keys {
+                    out.insert(k.clone(), canonicalize_value(map.get(&k).cloned().unwrap_or(Value::Null)));
+                }
+                Value::Object(out)
+            }
+            Value::Array(xs) => Value::Array(xs.into_iter().map(canonicalize_value).collect()),
+            other => other,
+        }
+    }
+
+    // Placeholders when `serde` feature is off (crate won't be very useful without it).
+    #[cfg(not(feature = "serde"))]
+    #[allow(unused_variables)]
+    pub fn to_canonical_bytes<T>(_value: &T) -> Result<Vec<u8>, IoError> {
+        Err(IoError::Canon("serde feature disabled".into()))
+    }
+    #[cfg(not(feature = "serde"))]
+    #[allow(unused_variables)]
+    pub fn write_canonical_file<T, P>(_value: &T, _path: P) -> Result<(), IoError> {
+        Err(IoError::Canon("serde feature disabled".into()))
+    }
+}
+
+/// SHA-256 digests over canonical bytes/files. Requires `hash` feature for real hashing.
+pub mod hasher {
+    use super::IoError;
+
+    #[cfg(feature = "hash")]
+    use sha2::{Digest, Sha256};
+
+    /// Return lowercase hex SHA-256 of `bytes`.
+    #[cfg(feature = "hash")]
+    pub fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let out = hasher.finalize();
+        hex::encode(out)
+    }
+
+    /// Stream a file and return its SHA-256 hex.
+    #[cfg(feature = "hash")]
+    pub fn sha256_file<P: AsRef<std::path::Path>>(path: P) -> Result<String, IoError> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path.as_ref()).map_err(IoError::Read)?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            let n = f.read(&mut buf).map_err(IoError::Read)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+
+    /// Canonicalize a serializable value and return its SHA-256 hex.
+    #[cfg(all(feature = "hash", feature = "serde"))]
+    pub fn sha256_canonical<T: serde::Serialize>(value: &T) -> Result<String, IoError> {
+        let bytes = crate::canonical_json::to_canonical_bytes(value)?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    // Placeholders when features are off.
+    #[cfg(not(feature = "hash"))]
+    pub fn sha256_hex(_bytes: &[u8]) -> String { String::new() }
+    #[cfg(not(feature = "hash"))]
+    pub fn sha256_file<P: AsRef<std::path::Path>>(_path: P) -> Result<String, IoError> { Err(IoError::Hash("hash feature disabled".into())) }
+    #[cfg(any(not(feature = "hash"), not(feature = "serde")))]
+    pub fn sha256_canonical<T>(_value: &T) -> Result<String, IoError> { Err(IoError::Hash("hash/serde feature disabled".into())) }
+}
+
+/// Manifest loading and path resolution. Local filesystem only; URLs are rejected.
+pub mod manifest {
+    use super::IoError;
+
+    /// Parsed manifest (normative: must point to registry, params, **ballot_tally**).
+    #[derive(Debug, Clone)]
+    pub struct Manifest {
+        pub reg_path: String,
+        pub params_path: String,
+        pub ballot_tally_path: String, // required; no raw ballots path in canonical pipeline
+        pub adjacency_path: Option<String>,
+        pub expect: Option<Expect>, // optional sanity locks
+        pub digests: std::collections::BTreeMap<String, String>, // { path -> sha256 hex }
+        pub notes: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct Expect {
+        pub formula_id: Option<String>,
+        pub engine_version: Option<String>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ResolvedPaths {
+        pub base_dir: std::path::PathBuf,
+        pub reg: std::path::PathBuf,
+        pub params: std::path::PathBuf,
+        pub tally: std::path::PathBuf,
+        pub adjacency: Option<std::path::PathBuf>,
+    }
+
+    /// Load a manifest JSON file and do basic shape/URL checks. (Schema validation is feature-gated.)
+    #[cfg(feature = "serde")]
+    pub fn load_manifest<P: AsRef<std::path::Path>>(path: P) -> Result<Manifest, IoError> {
+        use std::io::Read;
+        let p = path.as_ref();
+        let mut f = std::fs::File::open(p).map_err(IoError::Read)?;
+        let mut s = String::new();
+        f.read_to_string(&mut s).map_err(IoError::Read)?;
+        let val: serde_json::Value =
+            serde_json::from_str(&s).map_err(|e| IoError::Json { pointer: "/".into(), msg: e.to_string() })?;
+
+        // Optional: schema validation
+        #[cfg(feature = "schemaval")]
+        crate::schema::validate_value(crate::schema::SchemaKind::Manifest, &val)?;
+
+        let reg_path = val.get("reg_path").and_then(|v| v.as_str()).ok_or_else(|| IoError::Manifest("missing reg_path".into()))?;
+        let params_path = val.get("params_path").and_then(|v| v.as_str()).ok_or_else(|| IoError::Manifest("missing params_path".into()))?;
+        let ballot_tally_path = val
+            .get("ballot_tally_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| IoError::Manifest("missing ballot_tally_path".into()))?;
+
+        // Reject URLs — offline-only contract
+        for (label, s) in [("reg_path", reg_path), ("params_path", params_path), ("ballot_tally_path", ballot_tally_path)] {
+            if s.starts_with("http://") || s.starts_with("https://") {
+                return Err(IoError::Manifest(format!("{label} must be a local path (no URLs)")));
+            }
+        }
+
+        let adjacency_path = val.get("adjacency_path").and_then(|v| v.as_str()).map(str::to_string);
+        let expect = val.get("expect").and_then(|e| {
+            let mut ex = Expect::default();
+            if let Some(fid) = e.get("formula_id").and_then(|v| v.as_str()) {
+                ex.formula_id = Some(fid.to_string());
+            }
+            if let Some(ev) = e.get("engine_version").and_then(|v| v.as_str()) {
+                ex.engine_version = Some(ev.to_string());
+            }
+            Some(ex)
+        });
+
+        // Optional digests map
+        let mut digests = std::collections::BTreeMap::new();
+        if let Some(obj) = val.get("digests").and_then(|d| d.as_object()) {
+            for (k, v) in obj {
+                if let Some(hex) = v.get("sha256").and_then(|h| h.as_str()) {
+                    if !is_hex64(hex) {
+                        return Err(IoError::Manifest(format!("invalid sha256 for {k}")));
+                    }
+                    digests.insert(k.clone(), hex.to_string());
+                }
+            }
+        }
+
+        Ok(Manifest {
+            reg_path: reg_path.to_string(),
+            params_path: params_path.to_string(),
+            ballot_tally_path: ballot_tally_path.to_string(),
+            adjacency_path,
+            expect,
+            digests,
+            notes: val.get("notes").and_then(|v| v.as_str()).map(str::to_string),
+        })
+    }
+
+    #[cfg(not(feature = "serde"))]
+    #[allow(unused_variables)]
+    pub fn load_manifest<P: AsRef<std::path::Path>>(_path: P) -> Result<Manifest, IoError> {
+        Err(IoError::Manifest("serde feature disabled".into()))
+    }
+
+    /// Resolve relative paths against the manifest's directory.
+    pub fn resolve_paths(base: &std::path::Path, man: &Manifest) -> Result<ResolvedPaths, IoError> {
+        let base_dir = base.to_path_buf();
+        let rp = base_dir.join(&man.reg_path);
+        let pp = base_dir.join(&man.params_path);
+        let tp = base_dir.join(&man.ballot_tally_path);
+        let ap = man.adjacency_path.as_ref().map(|s| base_dir.join(s));
+        Ok(ResolvedPaths { base_dir, reg: rp, params: pp, tally: tp, adjacency: ap })
+    }
+
+    /// Quick expectation check (called by pipeline once actual values are known).
+    pub fn verify_expectations(man: &Manifest, actual_formula_id: Option<&str>, actual_engine_version: Option<&str>) -> Result<(), IoError> {
+        if let Some(exp) = &man.expect {
+            if let (Some(want), Some(have)) = (&exp.formula_id, actual_formula_id) {
+                if want != have {
+                    return Err(IoError::Expect(format!("formula_id mismatch (want {want}, have {have})")));
+                }
+            }
+            if let (Some(want), Some(have)) = (&exp.engine_version, actual_engine_version) {
+                if want != have {
+                    return Err(IoError::Expect(format!("engine_version mismatch (want {want}, have {have})")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_hex64(s: &str) -> bool {
+        s.len() == 64 && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+    }
+}
+
+/// JSON Schema validation (Draft 2020-12). If the `schemaval` feature is disabled,
+/// `validate_value` becomes a no-op that returns `Ok(())`.
+pub mod schema {
+    use super::IoError;
+
+    #[derive(Debug, Clone, Copy)]
+    pub enum SchemaKind {
+        DivisionRegistry,
+        ParameterSet,
+        BallotTally,
+        Manifest,
+        Result,
+        RunRecord,
+        FrontierMap,
+    }
+
+    #[cfg(feature = "schemaval")]
+    pub fn validate_value(kind: SchemaKind, value: &serde_json::Value) -> Result<(), IoError> {
+        use jsonschema::{Draft, JSONSchema};
+
+        // NOTE: Schemas are expected to live in the repository; wire-up via include_str! or
+        // external file access as your build prefers. We keep literal placeholders here to
+        // avoid compile-time path coupling. Replace these with real `include_str!` in your repo.
+        fn schema_text(kind: SchemaKind) -> &'static str {
+            match kind {
+                SchemaKind::DivisionRegistry => include_str!("../../
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_io/src/canonical_json.rs
+--------------------------------------------------------------------------------
+//! crates/vm_io/src/canonical_json.rs
+//! Canonical JSON bytes (UTF-8; objects with lexicographically sorted keys; arrays untouched).
+//! Compact (default) and pretty (2-space, LF) variants; atomic file write.
+//!
+//! Notes:
+//! - Keys are sorted by UTF-8 byte order using a recursive transformer.
+//! - Compact: minimal whitespace, no trailing newline.
+//! - Pretty: 2-space indent, LF newlines (no trailing newline).
+//! - Errors bubble from serde_json/std::io (assumes crate::IoError has From conversions).
+
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+use serde_json::{self as sj, Map, Value};
+
+use crate::IoError;
+
+/// Return canonical JSON bytes (UTF-8, sorted keys, compact; no trailing newline).
+pub fn to_canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, IoError> {
+    // 1) Serialize to Value (serde_json already rejects NaN/Inf)
+    let v: Value = sj::to_value(value).map_err(IoError::from)?;
+    // 2) Recursively sort object keys; arrays untouched
+    let v = canonicalize_value(v);
+    // 3) Emit compact bytes (no trailing newline)
+    let mut out = Vec::with_capacity(4096);
+    let mut ser = sj::Serializer::new(&mut out);
+    v.serialize(&mut ser).map_err(IoError::from)?;
+    Ok(out)
+}
+
+/// Pretty variant (2-space indent) that still sorts keys and enforces LF.
+pub fn to_canonical_pretty_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, IoError> {
+    let v: Value = sj::to_value(value).map_err(IoError::from)?;
+    let v = canonicalize_value(v);
+
+    let mut out = Vec::with_capacity(4096);
+    let fmt = sj::ser::PrettyFormatter::with_indent(b"  "); // PrettyFormatter emits '\n' (LF)
+    let mut ser = sj::Serializer::with_formatter(&mut out, fmt);
+    v.serialize(&mut ser).map_err(IoError::from)?;
+    Ok(out)
+}
+
+/// Write canonical JSON file (creates parent dirs; atomic replace via temp+rename).
+pub fn write_canonical_file<T: Serialize, P: AsRef<Path>>(value: &T, path: P) -> Result<(), IoError> {
+    let path = path.as_ref();
+
+    // Build bytes
+    let bytes = to_canonical_bytes(value)?;
+
+    // Ensure parent exists
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(IoError::from)?;
+    }
+
+    // Temp path: "<file>.<ext>.tmp" or "<file>.tmp"
+    let tmp_path = make_tmp_path(path);
+
+    // Write to temp, flush, fsync
+    {
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(IoError::from)?;
+        let mut w = BufWriter::new(f);
+        w.write_all(&bytes).map_err(IoError::from)?;
+        w.flush().map_err(IoError::from)?;
+        // Ensure durability before rename
+        w.into_inner().map_err(IoError::from)?.sync_all().map_err(IoError::from)?;
+    }
+
+    // Atomic-ish replace: try rename; if the target exists on platforms where rename doesn't replace,
+    // remove and retry (best-effort cross-platform).
+    match fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Attempt best-effort replace
+            let _ = fs::remove_file(path);
+            fs::rename(&tmp_path, path).map_err(IoError::from).or_else(|_| {
+                // Final fallback: copy+remove (not strictly atomic but prevents dangling temp files)
+                let mut f = File::create(path).map_err(IoError::from)?;
+                f.write_all(&bytes).map_err(IoError::from)?;
+                let _ = fs::remove_file(&tmp_path);
+                Err(IoError::from(e))
+            })?;
+            Ok(())
+        }
+    }
+}
+
+/// Recursively sort all JSON object keys using BTreeMap; arrays/scalars untouched.
+fn canonicalize_value(v: Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            // First canonicalize children
+            let mut bt: BTreeMap<String, Value> = BTreeMap::new();
+            for (k, v) in map {
+                bt.insert(k, canonicalize_value(v));
+            }
+            // Rebuild in sorted order
+            let mut out: Map<String, Value> = Map::with_capacity(bt.len());
+            for (k, v) in bt {
+                out.insert(k, v);
+            }
+            Value::Object(out)
+        }
+        Value::Array(xs) => {
+            // Preserve array order (caller is responsible for deterministic ordering upstream)
+            Value::Array(xs.into_iter().map(canonicalize_value).collect())
+        }
+        other => other,
+    }
+}
+
+fn make_tmp_path(path: &Path) -> PathBuf {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if !ext.is_empty() => {
+            let mut s = ext.to_string();
+            s.push_str(".tmp");
+            let mut p = path.to_path_buf();
+            p.set_extension(s);
+            p
+        }
+        _ => {
+            let mut p = path.to_path_buf();
+            p.set_extension("tmp");
+            p
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+    use std::str;
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Demo {
+        a: u32,
+        m: std::collections::HashMap<String, u32>,
+        v: Vec<u8>,
+    }
+
+    #[test]
+    fn ordering_and_idempotence_compact() {
+        let mut m1 = std::collections::HashMap::new();
+        m1.insert("z".into(), 1);
+        m1.insert("a".into(), 2);
+
+        let d1 = Demo { a: 1, m: m1, v: vec![3, 2, 1] };
+        let b1 = to_canonical_bytes(&d1).unwrap();
+
+        // Reparse & reserialize → identical
+        let parsed: Value = sj::from_slice(&b1).unwrap();
+        let b2 = to_canonical_bytes(&parsed).unwrap();
+        assert_eq!(b1, b2);
+
+        // Keys sorted
+        let s = str::from_utf8(&b1).unwrap();
+        assert!(s.find("\"a\":1").is_some());
+        assert!(s.find("\"m\":{").is_some());
+        assert!(s.find("\"a\":2").is_some()); // inside "m", "a" comes before "z"
+    }
+
+    #[test]
+    fn pretty_has_only_whitespace_differences() {
+        let mut m1 = std::collections::BTreeMap::new();
+        m1.insert("b".to_string(), 1u32);
+        m1.insert("a".to_string(), 2u32);
+        let v = serde_json::json!({ "k": m1, "arr": [3,2,1] });
+
+        let c = to_canonical_bytes(&v).unwrap();
+        let p = to_canonical_pretty_bytes(&v).unwrap();
+
+        // Parse both; semantic equality
+        let vc: Value = sj::from_slice(&c).unwrap();
+        let vp: Value = sj::from_slice(&p).unwrap();
+        assert_eq!(vc, vp);
+
+        // Pretty contains LF
+        assert!(str::from_utf8(&p).unwrap().contains('\n'));
+    }
+
+    #[test]
+    fn arrays_untouched() {
+        let v = serde_json::json!({ "x": [ {"b":1,"a":2}, {"d":4,"c":3} ]});
+        let out = to_canonical_bytes(&v).unwrap();
+        let s = str::from_utf8(&out).unwrap();
+        // Inner objects have sorted keys, array order preserved
+        assert!(s.contains(r#"{"a":2,"b":1}"#));
+        assert!(s.contains(r#"{"c":3,"d":4}"#));
+        assert!(s.find(r#"{"a":2,"b":1}"#) < s.find(r#"{"c":3,"d":4}"#));
+    }
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_io/src/manifest.rs
+--------------------------------------------------------------------------------
+//! crates/vm_io/src/manifest.rs
+//! Parse, validate, and resolve the run **manifest.json** into concrete local paths,
+//! with optional expectations and digest verification. No network I/O.
+//!
+//! Contracts (concise):
+//! - Required paths: registry, params, **ballot_tally**. Optional: adjacency. (Doc 5A S0) 
+//! - Offline only: reject URLs; resolve relative paths against the manifest's directory. (Doc 3A §3) 
+//! - Optional `expect.{formula_id,engine_version}` and `digests{}` checks.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{Error as IoStdError, ErrorKind};
+use std::path::{Path, PathBuf};
+
+use camino::{Utf8Path, Utf8PathBuf};
+use serde::{Deserialize, Serialize};
+use serde_json::{self as sj, Value};
+
+#[cfg(feature = "schemaval")]
+use jsonschema::{Draft, JSONSchema};
+
+use sha2::{Digest, Sha256};
+
+use crate::IoError;
+
+// ---------- Module knobs (can be surfaced as Config later) ----------
+const REJECT_URLS: bool = true;
+const ALLOW_PARENT_TRAVERSAL: bool = true; // set false to confine inside base_dir
+const MAX_BYTES: usize = 2 * 1024 * 1024;
+
+// Schema embedded from crate root: <crate>/schemas/manifest.schema.json
+#[cfg(feature = "schemaval")]
+const MANIFEST_SCHEMA_JSON: &str = include_str!("../schemas/manifest.schema.json");
+
+// ---------- Public API types ----------
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Manifest {
+    pub id: String, // "MAN:…"
+    pub reg_path: String,
+    pub params_path: String,
+    pub ballot_tally_path: String, // REQUIRED (normative pipeline)
+    pub adjacency_path: Option<String>,
+    pub expect: Option<Expect>,
+    pub digests: Option<BTreeMap<String, DigestEntry>>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Expect {
+    pub formula_id: Option<String>,     // expected 64-hex
+    pub engine_version: Option<String>, // semver-ish string
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DigestEntry {
+    pub sha256: String, // 64-hex (lowercase preferred)
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedPaths {
+    pub base_dir: Utf8PathBuf,
+    pub reg: Utf8PathBuf,
+    pub params: Utf8PathBuf,
+    pub tally: Utf8PathBuf,
+    pub adjacency: Option<Utf8PathBuf>,
+}
+
+// ---------- Top-level functions ----------
+pub fn load_manifest<P: AsRef<Path>>(path: P) -> Result<Manifest, IoError> {
+    let path = path.as_ref();
+    // Size guard + read
+    let meta = fs::metadata(path).map_err(IoError::from)?;
+    if meta.len() as usize > MAX_BYTES {
+        return Err(invalid_data_err(format!(
+            "manifest exceeds MAX_BYTES ({} > {})",
+            meta.len(),
+            MAX_BYTES
+        )));
+    }
+    let bytes = fs::read(path).map_err(IoError::from)?;
+
+    // Parse JSON
+    let raw: Value = sj::from_slice(&bytes).map_err(|e| json_err("/", e))?;
+
+    // Defensive: reject legacy `ballots_path` if present
+    if let Some(obj) = raw.as_object() {
+        if obj.contains_key("ballots_path") {
+            return Err(invalid_data_err("legacy field `ballots_path` is not allowed".into()));
+        }
+    }
+
+    // Optional: schema validation
+    #[cfg(feature = "schemaval")]
+    {
+        let schema_v: Value = sj::from_str(MANIFEST_SCHEMA_JSON)
+            .map_err(|e| invalid_data_err(format!("invalid embedded manifest.schema.json: {e}")))?;
+        let compiled = JSONSchema::options()
+            .with_draft(Draft::Draft2020_12)
+            .compile(&schema_v)
+            .map_err(|e| invalid_data_err(format!("schema compile error: {e}")))?;
+        if let Err(iter) = compiled.validate(&raw) {
+            // Report first violation with a JSON Pointer-like path
+            if let Some(err) = iter.into_iter().next() {
+                let ptr = err.instance_path.to_string();
+                let msg = err.to_string();
+                return Err(schema_err(
+                    if ptr.is_empty() { "/" } else { ptr.as_str() },
+                    msg,
+                ));
+            }
+        }
+    }
+
+    // Into typed Manifest
+    let man: Manifest = sj::from_value(raw).map_err(|e| json_err("/", e))?;
+    Ok(man)
+}
+
+pub fn validate_manifest(man: &Manifest) -> Result<(), IoError> {
+    // Required: ballot_tally_path non-empty
+    if man.ballot_tally_path.trim().is_empty() {
+        return Err(invalid_data_err("`ballot_tally_path` is required and must be non-empty".into()));
+    }
+
+    // URL rejection (all path-like fields)
+    if REJECT_URLS {
+        for (label, s) in [
+            ("reg_path", &man.reg_path),
+            ("params_path", &man.params_path),
+            ("ballot_tally_path", &man.ballot_tally_path),
+        ] {
+            if looks_like_url(s) {
+                return Err(invalid_data_err(format!("{} must be a local file path (no URLs)", label)));
+            }
+        }
+        if let Some(adj) = &man.adjacency_path {
+            if looks_like_url(adj) {
+                return Err(invalid_data_err("adjacency_path must be a local file path (no URLs)".into()));
+            }
+        }
+    }
+
+    // Optional digests: quick shape validation (hex form only; file existence checked in verify_digests)
+    if let Some(dmap) = &man.digests {
+        for (k, v) in dmap {
+            if !["reg_path", "params_path", "ballot_tally_path", "adjacency_path"].contains(&k.as_str()) {
+                return Err(invalid_data_err(format!("unknown digest key `{}`", k)));
+            }
+            if !is_hex64(&v.sha256) {
+                return Err(invalid_data_err(format!("digest for `{}` must be 64 hex chars", k)));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn resolve_paths<P: AsRef<Path>>(manifest_file: P, man: &Manifest) -> Result<ResolvedPaths, IoError> {
+    let base_dir_fs: &Path = manifest_file
+        .as_ref()
+        .parent()
+        .ok_or_else(|| invalid_data_err("manifest_file has no parent directory".into()))?;
+
+    let base_dir_utf8 = to_utf8(base_dir_fs)?;
+
+    let reg = normalize_join(&base_dir_utf8, &man.reg_path)?;
+    let params = normalize_join(&base_dir_utf8, &man.params_path)?;
+    let tally = normalize_join(&base_dir_utf8, &man.ballot_tally_path)?;
+    let adjacency = match &man.adjacency_path {
+        Some(p) => Some(normalize_join(&base_dir_utf8, p)?),
+        None => None,
+    };
+
+    // Optional confinement: disallow escaping base_dir
+    if !ALLOW_PARENT_TRAVERSAL {
+        for (label, p) in [
+            ("reg_path", &reg),
+            ("params_path", &params),
+            ("ballot_tally_path", &tally),
+        ] {
+            if !p.starts_with(&base_dir_utf8) {
+                return Err(invalid_data_err(format!(
+                    "{} escapes base_dir after normalization",
+                    label
+                )));
+            }
+        }
+        if let Some(adj) = &adjacency {
+            if !adj.starts_with(&base_dir_utf8) {
+                return Err(invalid_data_err("adjacency_path escapes base_dir after normalization".into()));
+            }
+        }
+    }
+
+    Ok(ResolvedPaths {
+        base_dir: base_dir_utf8,
+        reg,
+        params,
+        tally,
+        adjacency,
+    })
+}
+
+pub fn enforce_expectations(
+    man: &Manifest,
+    engine_version: &str,
+    formula_id_hex: &str,
+) -> Result<(), IoError> {
+    if let Some(exp) = &man.expect {
+        if let Some(exp_fid) = &exp.formula_id {
+            if !is_hex64(exp_fid) {
+                return Err(expect_err("expect.formula_id is not a 64-hex string"));
+            }
+            if exp_fid.to_ascii_lowercase() != formula_id_hex.to_ascii_lowercase() {
+                return Err(expect_err("formula_id mismatch"));
+            }
+        }
+        if let Some(exp_eng) = &exp.engine_version {
+            if exp_eng != engine_version {
+                return Err(expect_err("engine_version mismatch"));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn verify_digests(
+    paths: &ResolvedPaths,
+    digests: &BTreeMap<String, DigestEntry>,
+) -> Result<(), IoError> {
+    for (k, v) in digests {
+        let (label, p) = match k.as_str() {
+            "reg_path" => ("registry", &paths.reg),
+            "params_path" => ("params", &paths.params),
+            "ballot_tally_path" => ("ballot_tally", &paths.tally),
+            "adjacency_path" => {
+                let adj = paths
+                    .adjacency
+                    .as_ref()
+                    .ok_or_else(|| invalid_data_err("digest provided for adjacency_path, but manifest has no adjacency_path".into()))?;
+                ("adjacency", adj)
+            }
+            _ => return Err(invalid_data_err(format!("unknown digest path: {}", k))),
+        };
+
+        // Read bytes and compute sha256
+        let bytes = fs::read(p).map_err(IoError::from)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let got = hex::encode(hasher.finalize());
+        if got.to_ascii_lowercase() != v.sha256.to_ascii_lowercase() {
+            return Err(invalid_data_err(format!(
+                "digest mismatch for {}: expected {}, got {}",
+                label, v.sha256, got
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ---------- Helpers ----------
+fn json_err(pointer: &str, e: sj::Error) -> IoError {
+    invalid_data_err(format!("JSON parse error at {}: {}", pointer, e))
+}
+
+fn schema_err(pointer: &str, msg: String) -> IoError {
+    invalid_data_err(format!("Schema violation at {}: {}", pointer, msg))
+}
+
+fn invalid_data_err(msg: impl Into<String>) -> IoError {
+    IoError::from(IoStdError::new(ErrorKind::InvalidData, msg.into()))
+}
+
+fn expect_err(msg: impl Into<String>) -> IoError {
+    IoError::from(IoStdError::new(ErrorKind::InvalidData, format!("Expect: {}", msg.into())))
+}
+
+fn is_hex64(s: &str) -> bool {
+    if s.len() != 64 {
+        return false;
+    }
+    s.bytes().all(|b| (b'0'..=b'9').contains(&b) || (b'a'..=b'f').contains(&b) || (b'A'..=b'F').contains(&b))
+}
+
+fn looks_like_url(s: &str) -> bool {
+    let sl = s.trim().to_ascii_lowercase();
+    sl.starts_with("http://") || sl.starts_with("https://")
+}
+
+fn to_utf8(p: &Path) -> Result<Utf8PathBuf, IoError> {
+    Utf8Path::from_path(p)
+        .map(|u| u.to_owned())
+        .ok_or_else(|| invalid_data_err(format!("non-UTF8 path: {}", p.display())))
+}
+
+// Lexical normalization (no filesystem access): resolves "." and ".." components.
+// This does not follow symlinks and keeps absolute vs relative-ness.
+fn lexical_normalize(mut p: Utf8PathBuf) -> Utf8PathBuf {
+    let is_abs = p.is_absolute();
+    let mut out = Utf8PathBuf::new();
+    for comp in p.components() {
+        match comp.as_str() {
+            "." => {}
+            ".." => {
+                let _ = out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    if is_abs {
+        // Ensure we keep absolute if original was absolute
+        if !out.is_absolute() {
+            out = Utf8Path::new("/").join(out);
+        }
+    }
+    out
+}
+
+fn normalize_join(base: &Utf8Path, rel: &str) -> Result<Utf8PathBuf, IoError> {
+    // If `rel` is absolute, take as-is; else join to base.
+    let relp = Utf8Path::new(rel);
+    let joined = if relp.is_absolute() {
+        relp.to_path_buf()
+    } else {
+        base.join(relp)
+    };
+    Ok(lexical_normalize(joined))
+}
+
+// ---------- Tests ----------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn expect_checks() {
+        let man = Manifest {
+            id: "MAN:demo".into(),
+            reg_path: "reg.json".into(),
+            params_path: "params.json".into(),
+            ballot_tally_path: "tally.json".into(),
+            adjacency_path: None,
+            expect: Some(Expect {
+                formula_id: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd".into()),
+                engine_version: Some("v1.2.3".into()),
+            }),
+            digests: None,
+            notes: None,
+        };
+        // OK
+        enforce_expectations(
+            &man,
+            "v1.2.3",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd",
+        )
+        .unwrap();
+
+        // Bad hex
+        let mut man_bad = man.clone();
+        man_bad.expect.as_mut().unwrap().formula_id = Some("xyz".into());
+        assert!(enforce_expectations(&man_bad, "v1.2.3", "00").is_err());
+
+        // Mismatch
+        let mut man_bad2 = man.clone();
+        man_bad2.expect.as_mut().unwrap().engine_version = Some("v9.9.9".into());
+        assert!(enforce_expectations(
+            &man_bad2,
+            "v1.2.3",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn resolve_and_verify_digests() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("cases");
+        fs::create_dir_all(&base).unwrap();
+
+        // Write three files
+        let reg_p = base.join("reg.json");
+        let params_p = base.join("params.json");
+        let tally_p = base.join("tally.json");
+        for (p, content) in [
+            (&reg_p, br#"{"a":1}"#.as_slice()),
+            (&params_p, br#"{"b":2}"#.as_slice()),
+            (&tally_p, br#"{"c":3}"#.as_slice()),
+        ] {
+            let mut f = File::create(p).unwrap();
+            f.write_all(content).unwrap();
+        }
+
+        let man = Manifest {
+            id: "MAN:demo".into(),
+            reg_path: "reg.json".into(),
+            params_path: "params.json".into(),
+            ballot_tally_path: "tally.json".into(),
+            adjacency_path: None,
+            expect: None,
+            digests: None,
+            notes: None,
+        };
+
+        let man_path = base.join("manifest.json");
+        fs::write(&man_path, br#"{"id":"x","reg_path":"reg.json","params_path":"params.json","ballot_tally_path":"tally.json"}"#).unwrap();
+
+        let res = resolve_paths(&man_path, &man).unwrap();
+
+        // Compute digests and verify
+        let mut d = BTreeMap::new();
+        for (k, p) in [
+            ("reg_path", res.reg.clone()),
+            ("params_path", res.params.clone()),
+            ("ballot_tally_path", res.tally.clone()),
+        ] {
+            let bytes = fs::read(p).unwrap();
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            d.insert(k.to_string(), DigestEntry { sha256: hex::encode(h.finalize()) });
+        }
+        verify_digests(&res, &d).unwrap();
+    }
+
+    #[test]
+    fn url_rejection_and_legacy() {
+        // URL rejection via validate_manifest
+        let man = Manifest {
+            id: "MAN:demo".into(),
+            reg_path: "https://example.com/reg.json".into(),
+            params_path: "params.json".into(),
+            ballot_tally_path: "tally.json".into(),
+            adjacency_path: None,
+            expect: None,
+            digests: None,
+            notes: None,
+        };
+        assert!(validate_manifest(&man).is_err());
+    }
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_io/src/hasher.rs
+--------------------------------------------------------------------------------
+//! SHA-256 hashing utilities over **canonical JSON** bytes,
+//! plus helpers to build prefixed IDs (RES:/RUN:/FR:) and
+//! to compute the Normative Manifest digest (nm_digest) and Formula ID (FID).
+//!
+//! Deterministic: same canonical structure ⇒ same lowercase 64-hex across OS/arch.
+
+#![forbid(unsafe_code)]
+
+use crate::IoError;
+
+#[cfg(feature = "hash")]
+use digest::Digest;
+#[cfg(feature = "hash")]
+use sha2::Sha256;
+
+#[cfg(all(feature = "hash", feature = "serde"))]
+use crate::canonical_json::to_canonical_bytes;
+#[cfg(all(feature = "hash", feature = "serde"))]
+use serde::Serialize;
+
+/// Compute lowercase 64-hex SHA-256 of raw bytes.
+#[cfg(feature = "hash")]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let out = hasher.finalize();
+    hex::encode(out) // lowercase
+}
+
+#[cfg(not(feature = "hash"))]
+pub fn sha256_hex(_bytes: &[u8]) -> String {
+    // Keep signature available even if feature is off (used rarely directly).
+    // Caller should not rely on this in no-hash builds.
+    String::new()
+}
+
+/// Streaming SHA-256 for any reader; returns lowercase 64-hex.
+#[cfg(feature = "hash")]
+pub fn sha256_stream<R: std::io::Read>(reader: &mut R) -> Result<String, IoError> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024]; // 64 KiB
+    loop {
+        let n = reader.read(&mut buf).map_err(IoError::Read)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(not(feature = "hash"))]
+pub fn sha256_stream<R: std::io::Read>(_reader: &mut R) -> Result<String, IoError> {
+    Err(IoError::Hash("hash feature disabled".into()))
+}
+
+/// SHA-256 of canonical JSON representation (sorted keys, LF); returns lowercase 64-hex.
+#[cfg(all(feature = "hash", feature = "serde"))]
+pub fn sha256_canonical<T: Serialize>(value: &T) -> Result<String, IoError> {
+    let bytes = to_canonical_bytes(value)?;
+    Ok(sha256_hex(&bytes))
+}
+
+#[cfg(not(all(feature = "hash", feature = "serde")))]
+pub fn sha256_canonical<T>(_value: &T) -> Result<String, IoError> {
+    Err(IoError::Hash("hash+serde features required".into()))
+}
+
+/// Convenience: hash a file from disk; returns lowercase 64-hex.
+#[cfg(feature = "hash")]
+pub fn sha256_file<P: AsRef<std::path::Path>>(path: P) -> Result<String, IoError> {
+    let mut f = std::fs::File::open(path).map_err(IoError::Read)?;
+    sha256_stream(&mut f)
+}
+
+#[cfg(not(feature = "hash"))]
+pub fn sha256_file<P: AsRef<std::path::Path>>(_path: P) -> Result<String, IoError> {
+    Err(IoError::Hash("hash feature disabled".into()))
+}
+
+// ---------- Prefixed ID builders (full 64-hex) ----------
+
+/// "RES:<hex64>" — Result ID from canonical JSON of the Result struct.
+#[cfg(all(feature = "hash", feature = "serde"))]
+pub fn res_id_from_canonical<T: Serialize>(value: &T) -> Result<String, IoError> {
+    let h = sha256_canonical(value)?;
+    Ok(format!("RES:{h}"))
+}
+
+#[cfg(not(all(feature = "hash", feature = "serde")))]
+pub fn res_id_from_canonical<T>(_value: &T) -> Result<String, IoError> {
+    Err(IoError::Hash("hash+serde features required".into()))
+}
+
+/// "FR:<hex64>" — FrontierMap ID from canonical JSON of the FrontierMap struct.
+#[cfg(all(feature = "hash", feature = "serde"))]
+pub fn fr_id_from_canonical<T: Serialize>(value: &T) -> Result<String, IoError> {
+    let h = sha256_canonical(value)?;
+    Ok(format!("FR:{h}"))
+}
+
+#[cfg(not(all(feature = "hash", feature = "serde")))]
+pub fn fr_id_from_canonical<T>(_value: &T) -> Result<String, IoError> {
+    Err(IoError::Hash("hash+serde features required".into()))
+}
+
+/// "RUN:<RFC3339Z>-<hex64>" — RunRecord ID built from caller-supplied UTC timestamp
+/// (exact shape "YYYY-MM-DDTHH:MM:SSZ") and arbitrary canonical-basis bytes.
+#[cfg(feature = "hash")]
+pub fn run_id_from_bytes(timestamp_utc: &str, bytes: &[u8]) -> Result<String, IoError> {
+    if !is_rfc3339_utc_seconds(timestamp_utc) {
+        return Err(IoError::Hash("bad timestamp (expect RFC3339 UTC 'YYYY-MM-DDTHH:MM:SSZ')".into()));
+    }
+    let h = sha256_hex(bytes);
+    Ok(format!("RUN:{timestamp_utc}-{h}"))
+}
+
+#[cfg(not(feature = "hash"))]
+pub fn run_id_from_bytes(_timestamp_utc: &str, _bytes: &[u8]) -> Result<String, IoError> {
+    Err(IoError::Hash("hash feature disabled".into()))
+}
+
+// ---------- Normative Manifest / Formula ID ----------
+
+/// Compute SHA-256 over the **Normative Manifest** canonical bytes.
+/// Caller must pre-filter to *Included* variables only per Annex A.
+#[cfg(all(feature = "hash", feature = "serde"))]
+pub fn nm_digest_from_value(nm: &serde_json::Value) -> Result<String, IoError> {
+    sha256_canonical(nm)
+}
+
+#[cfg(not(all(feature = "hash", feature = "serde")))]
+pub fn nm_digest_from_value(_nm: &serde_json::Value) -> Result<String, IoError> {
+    Err(IoError::Hash("hash+serde features required".into()))
+}
+
+/// Compute Formula ID (FID) from the **Normative Manifest**.
+/// Currently FID == nm_digest (64-hex). Centralized here for future policy changes.
+#[cfg(all(feature = "hash", feature = "serde"))]
+pub fn formula_id_from_nm(nm: &serde_json::Value) -> Result<String, IoError> {
+    nm_digest_from_value(nm)
+}
+
+#[cfg(not(all(feature = "hash", feature = "serde")))]
+pub fn formula_id_from_nm(_nm: &serde_json::Value) -> Result<String, IoError> {
+    Err(IoError::Hash("hash+serde features required".into()))
+}
+
+// ---------- Hex helpers ----------
+
+/// True iff string is **lowercase** 64-hex.
+pub fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.as_bytes().iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Return a short prefix of a 64-hex string (1..=64). Errors if non-hex or out of range.
+pub fn short_hex(full_hex: &str, len: usize) -> Result<String, IoError> {
+    if !(1..=64).contains(&len) {
+        return Err(IoError::Hash("short_hex length out of range".into()));
+    }
+    if !is_hex64(full_hex) {
+        return Err(IoError::Hash("short_hex expects lowercase 64-hex".into()));
+    }
+    Ok(full_hex[..len].to_string())
+}
+
+// ---------- local helpers ----------
+
+/// Strict check for "YYYY-MM-DDTHH:MM:SSZ".
+fn is_rfc3339_utc_seconds(s: &str) -> bool {
+    if s.len() != 20 { return false; }
+    let b = s.as_bytes();
+    // YYYY-MM-DDTHH:MM:SSZ
+    // 0123 5 78  11  14  17 19
+    //     -   -   T   :   :   Z
+    fn is_digit(x: u8) -> bool { (b'0'..=b'9').contains(&x) }
+    for &i in &[0,1,2,3,5,6,8,9,11,12,14,15,17,18] {
+        if !is_digit(b[i]) { return false; }
+    }
+    b[4] == b'-' && b[7] == b'-' && b[10] == b'T' &&
+    b[13] == b':' && b[16] == b':' && b[19] == b'Z'
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_io/src/loader.rs
+--------------------------------------------------------------------------------
+//! Loader: read local JSON artifacts (manifest → registry → params → ballot_tally),
+//! validate via Draft 2020-12 schemas, normalize ordering, and return a typed
+//! `LoadedContext` for the pipeline. No network I/O.
+
+#![forbid(unsafe_code)]
+
+use crate::{IoError, canonical_json, hasher, manifest as man, schema};
+use serde::{Deserialize, Serialize};
+use std::{collections::{BTreeMap, BTreeSet}, fs::File, io::Read, path::{Path, PathBuf}};
+use vm_core::{
+    determinism::StableOrd,
+    entities::{DivisionRegistry, OptionItem, Unit},
+    ids::{OptionId, UnitId},
+    variables::{self, Params},
+};
+
+// ----------------------------- Public wire-facing types -----------------------------
+
+/// Per-unit totals (mirrors `schemas/ballot_tally.schema.json`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Totals {
+    pub valid_ballots: u64,
+    pub invalid_ballots: u64,
+}
+
+/// One option’s count within a unit. JSON field is `votes`; we map into `count`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionCount {
+    pub option_id: OptionId,
+    #[serde(rename = "votes")]
+    pub count: u64,
+}
+
+/// Tally for a single unit (array-based options, ordered by registry `order_index`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnitTotals {
+    pub unit_id: UnitId,
+    pub totals: Totals,
+    pub options: Vec<OptionCount>,
+}
+
+/// Ballot type (informative; not present in canonical input). Defaults to `Plurality`.
+#[derive(Debug, Clone, Copy)]
+pub enum BallotType {
+    Plurality,
+    Approval,
+    Score,
+    RankedIrv,
+    RankedCondorcet,
+}
+
+/// Aggregated unit tallies (normative, array-based).
+#[derive(Debug, Clone)]
+pub struct UnitTallies {
+    pub ballot_type: BallotType, // not from JSON; set by loader (default: Plurality)
+    pub units: Vec<UnitTotals>,
+}
+
+/// Input digests (sha256 hex) of the three canonical inputs (+adjacency if present).
+#[derive(Debug)]
+pub struct InputDigests {
+    pub division_registry_sha256: String,
+    pub ballot_tally_sha256:      String,
+    pub parameter_set_sha256:     String,
+    pub adjacency_sha256:         Option<String>,
+}
+
+/// Loaded, validated, normalized context for the pipeline.
+#[derive(Debug)]
+pub struct LoadedContext {
+    pub registry: DivisionRegistry,
+    pub params:   Params,
+    pub tally:    UnitTallies,
+    pub adjacency_inline: Option<Vec<Adjacency>>,
+    pub digests:  InputDigests,
+}
+
+// --- Adjacency placeholder import (domain lives in vm_core if/when defined) ---
+#[allow(unused_imports)]
+use vm_core::entities::Adjacency; // Keep aligned with repo plan; optional in this revision.
+
+// ----------------------------- Orchestration -----------------------------
+
+/// Load everything from a **manifest file path**: manifest → registry → params → tally (+adjacency).
+pub fn load_all_from_manifest(path: &Path) -> Result<LoadedContext, IoError> {
+    // 1) Manifest
+    let man = man::load_manifest(path)?;
+    let resolved = man::resolve_paths(path, &man)?;
+
+    // 2) Registry
+    let mut registry = load_registry(&resolved.reg)?;
+    // normalize registry (units ↑ unit_id; each unit.options ↑ (order_index, option_id))
+    for u in &mut registry.units {
+        u.options = normalize_options(std::mem::take(&mut u.options));
+    }
+    registry.units = normalize_units(std::mem::take(&mut registry.units));
+
+    // quick uniqueness check for order_index within each unit
+    for u in &registry.units {
+        let mut seen = BTreeSet::new();
+        for opt in &u.options {
+            if !seen.insert(opt.order_index) {
+                return Err(IoError::Manifest(format!(
+                    "duplicate order_index {} in unit {}", opt.order_index, u.unit_id
+                )));
+            }
+        }
+    }
+
+    // 3) Params
+    let params = load_params(&resolved.params)?;
+    variables::validate_domains(&params)
+        .map_err(|e| IoError::Manifest(format!("parameter domain error: {:?}", e)))?;
+
+    // 4) Ballot Tally
+    let mut tally = load_ballot_tally(&resolved.tally)?;
+    // 5) Optional adjacency
+    let adjacency_inline = match &resolved.adjacency {
+        Some(p) => Some(load_adjacency(p)?),
+        None => None,
+    };
+
+    // 6) Cross-refs & normalization of tally option order to registry order
+    check_cross_refs(&registry, &[], &tally, adjacency_inline.as_deref())?;
+    // Build per-unit canonical order from registry and re-order each tally.options list accordingly.
+    let reg_unit_map: BTreeMap<&UnitId, &Unit> = registry.units.iter().map(|u| (&u.unit_id, u)).collect();
+    for u in &mut tally.units {
+        if let Some(reg_u) = reg_unit_map.get(&u.unit_id) {
+            normalize_tally_options_unit(u, &reg_u.options);
+        }
+    }
+    // And sort units ↑ unit_id
+    tally.units.sort_by(|a, b| a.unit_id.cmp(&b.unit_id));
+
+    // 7) Digests of canonical bytes (normative inputs only)
+    let division_registry_sha256 = hasher::sha256_canonical(&registry)?;
+    let ballot_tally_sha256      = {
+        // For hashing, serialize back to the canonical on-wire shape (votes, not count).
+        #[derive(Serialize)]
+        struct OnWireUnit<'a> {
+            unit_id: &'a UnitId,
+            totals:  &'a Totals,
+            options: Vec<OnWireOpt<'a>>,
+        }
+        #[derive(Serialize)]
+        struct OnWireOpt<'a> { option_id: &'a OptionId, votes: u64 }
+        #[derive(Serialize)]
+        struct OnWire<'a> { schema_version: &'a str, units: Vec<OnWireUnit<'a>> }
+
+        // By contract, schema_version is an opaque string; we pass through "1.x" here
+        // to maintain a stable shape for canonical hashing when the source omitted it.
+        let onwire = OnWire {
+            schema_version: "1.x",
+            units: tally.units.iter().map(|u| OnWireUnit {
+                unit_id: &u.unit_id,
+                totals:  &u.totals,
+                options: u.options.iter().map(|o| OnWireOpt { option_id: &o.option_id, votes: o.count }).collect(),
+            }).collect(),
+        };
+        hasher::sha256_canonical(&onwire)?
+    };
+    let parameter_set_sha256     = hasher::sha256_canonical(&params)?;
+    let adjacency_sha256         = match &adjacency_inline {
+        Some(adj) => Some(hasher::sha256_canonical(adj)?),
+        None => None,
+    };
+
+    Ok(LoadedContext {
+        registry,
+        params,
+        tally,
+        adjacency_inline,
+        digests: InputDigests {
+            division_registry_sha256,
+            ballot_tally_sha256,
+            parameter_set_sha256,
+            adjacency_sha256,
+        },
+    })
+}
+
+// ----------------------------- Targeted loaders -----------------------------
+
+pub fn load_registry(path: &Path) -> Result<DivisionRegistry, IoError> {
+    let v = read_json_value_with_limits(path)?;
+    schema::validate_value(schema::SchemaKind::DivisionRegistry, &v)?;
+    let reg: DivisionRegistry = serde_json::from_value(v)
+        .map_err(|e| IoError::Json { pointer: "/".into(), msg: e.to_string() })?;
+    Ok(reg)
+}
+
+pub fn load_params(path: &Path) -> Result<Params, IoError> {
+    let v = read_json_value_with_limits(path)?;
+    schema::validate_value(schema::SchemaKind::ParameterSet, &v)?;
+    let ps: Params = serde_json::from_value(v)
+        .map_err(|e| IoError::Json { pointer: "/".into(), msg: e.to_string() })?;
+    Ok(ps)
+}
+
+pub fn load_ballot_tally(path: &Path) -> Result<UnitTallies, IoError> {
+    // Raw, as per schema (options[].votes).
+    #[derive(Deserialize)]
+    struct RawOpt { option_id: OptionId, votes: u64 }
+    #[derive(Deserialize)]
+    struct RawUnit { unit_id: UnitId, totals: Totals, options: Vec<RawOpt> }
+    #[derive(Deserialize)]
+    struct RawTally { /* schema_version: String (ignored), */ units: Vec<RawUnit> }
+
+    let v = read_json_value_with_limits(path)?;
+    schema::validate_value(schema::SchemaKind::BallotTally, &v)?;
+    let raw: RawTally = serde_json::from_value(v)
+        .map_err(|e| IoError::Json { pointer: "/".into(), msg: e.to_string() })?;
+
+    let units = raw.units.into_iter().map(|ru| UnitTotals {
+        unit_id: ru.unit_id,
+        totals: ru.totals,
+        options: ru.options.into_iter().map(|ro| OptionCount { option_id: ro.option_id, count: ro.votes }).collect(),
+    }).collect();
+
+    Ok(UnitTallies { ballot_type: BallotType::Plurality, units })
+}
+
+pub fn load_adjacency(_path: &Path) -> Result<Vec<Adjacency>, IoError> {
+    // Adjacency is optional and its schema/type are defined elsewhere in the project.
+    // Wire it up here when the schema & vm_core::entities::Adjacency are finalized.
+    Err(IoError::Manifest("adjacency loader not implemented in this revision".into()))
+}
+
+// ----------------------------- Canonicalization & checks -----------------------------
+
+/// Sort units ↑ UnitId (lexicographic).
+pub fn normalize_units(mut units: Vec<Unit>) -> Vec<Unit> {
+    units.sort_by(|a, b| a.unit_id.cmp(&b.unit_id));
+    units
+}
+
+/// Sort options ↑ (order_index, OptionId).
+pub fn normalize_options(mut opts: Vec<OptionItem>) -> Vec<OptionItem> {
+    opts.sort_by(|a, b| {
+        match a.order_index.cmp(&b.order_index) {
+            core::cmp::Ordering::Equal => a.option_id.cmp(&b.option_id),
+            o => o,
+        }
+    });
+    opts
+}
+
+/// Reorder the **unit's** tally options to reflect the registry’s canonical order.
+fn normalize_tally_options_unit(u: &mut UnitTotals, reg_opts: &[OptionItem]) {
+    let mut map: BTreeMap<&OptionId, u64> = BTreeMap::new();
+    for oc in &u.options {
+        // If duplicates in the tally, later entries overwrite — upstream should prevent this.
+        map.insert(&oc.option_id, oc.count);
+    }
+    let mut out = Vec::with_capacity(reg_opts.len());
+    for ro in reg_opts {
+        if let Some(&cnt) = map.get(&ro.option_id) {
+            out.push(OptionCount { option_id: ro.option_id.clone(), count: cnt });
+        } else {
+            // If a registry option has no count in tally, treat as zero (common in sparse tallies).
+            out.push(OptionCount { option_id: ro.option_id.clone(), count: 0 });
+        }
+    }
+    u.options = out;
+}
+
+/// Public wrapper kept for API parity (kept for future multi-unit reorder helpers).
+pub fn normalize_tally_options(t: &mut UnitTallies, _order: &[OptionItem]) {
+    // Intentionally no-op: we reorder per-unit using the registry’s per-unit option list
+    // inside `load_all_from_manifest` where we have access to each unit's options.
+}
+
+/// Cross-file referential checks (lightweight, early failures).
+pub
