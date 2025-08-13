@@ -1,0 +1,9 @@
+{
+  "id": "MAN:part0",
+  "reg_path": "division_registry.json",
+  "params_path": "parameter_set.json",
+  "ballots_path": "ballots.json",
+  "expect": {
+    "engine_version": "v0"
+  }
+}

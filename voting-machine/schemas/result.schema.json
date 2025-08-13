@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/result.schema.json",
+  "title": "Result (Canonical Engine Output)",
+  "description": "Canonical Result produced by the engine. Minimal, normalized shape: summary + per-unit results. No input references or tie logs appear here (those live in RunRecord).",
+  "$defs": {
+    "id64hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "LowerHex64"
+    },
+    "res_id": {
+      "type": "string",
+      "pattern": "^RES:[0-9a-f]{64}$",
+      "title": "ResultIdRES64"
+    },
+    "id_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+      "title": "IdToken",
+      "$comment": "Allowed: A–Z a–z 0–9 underscore _ hyphen - colon : dot ."
+    },
+    "unit_allocation": {
+      "type": "object",
+      "title": "UnitAllocation",
+      "required": ["option_id", "votes", "share"],
+      "properties": {
+        "option_id": { "$ref": "#/$defs/id_token" },
+        "votes": { "type": "integer", "minimum": 0 },
+        "share": { "type": "number", "minimum": 0, "maximum": 1 },
+        "seats": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "unit_result": {
+      "type": "object",
+      "title": "UnitResult",
+      "required": ["unit_id", "allocations", "label"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/id_token" },
+        "allocations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/unit_allocation" },
+          "$comment": "Order mirrors Registry option order (order_index; ties by option_id)."
+        },
+        "label": { "type": "string", "enum": ["Decisive", "Marginal", "Invalid"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "required": [
+    "schema_version",
+    "result_id",
+    "formula_id",
+    "engine_version",
+    "created_at",
+    "summary",
+    "units"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "result_id": { "$ref": "#/$defs/res_id" },
+    "formula_id": { "$ref": "#/$defs/id64hex" },
+    "engine_version": { "type": "string" },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "$comment": "RFC3339 timestamp. Engine emits UTC (Z)."
+    },
+    "summary": {
+      "type": "object",
+      "title": "ResultSummary",
+      "required": ["valid_ballots_total", "invalid_ballots_total", "turnout_rate"],
+      "properties": {
+        "valid_ballots_total": { "type": "integer", "minimum": 0 },
+        "invalid_ballots_total": { "type": "integer", "minimum": 0 },
+        "turnout_rate": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "units": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/unit_result" },
+      "$comment": "Ordering (informative): units sorted by ascending unit_id. Enforced by conformance checks/tests outside JSON Schema."
+    }
+  },
+  "additionalProperties": false,
+  "$comment": "Arrays follow Doc 1A ordering rules: units ↑ unit_id; allocations ↑ order_index (tie by option_id). Input references and tie logs are not present here—they live in RunRecord.",
+  "examples": [
+    {
+      "schema_version": "1.x",
+      "result_id": "RES:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "formula_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "engine_version": "v1.0.0",
+      "created_at": "2025-08-12T14:00:00Z",
+      "summary": {
+        "valid_ballots_total": 12345,
+        "invalid_ballots_total": 67,
+        "turnout_rate": 0.95
+      },
+      "units": [
+        {
+          "unit_id": "U-001",
+          "allocations": [
+            { "option_id": "O-A1", "votes": 6000, "share": 0.486 },
+            { "option_id": "O-B1", "votes": 5000, "share": 0.405 }
+          ],
+          "label": "Decisive"
+        }
+      ]
+    }
+  ]
+}

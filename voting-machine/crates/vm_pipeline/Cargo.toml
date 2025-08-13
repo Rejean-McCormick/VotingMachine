@@ -1,0 +1,29 @@
+[package]
+name = "vm_pipeline"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "Apache-2.0 OR MIT"
+description = "Deterministic orchestration of the VM engine pipeline (load → validate → tabulate → allocate → gates → frontier → ties → label → artifacts)."
+# repository = ""
+# readme = "README.md"
+
+[lib]
+name = "vm_pipeline"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+# Compile-time switches that only change code scope, not public types.
+default  = ["std", "frontier", "mmp"]
+std      = []
+frontier = []   # frontier mapping step (040–049)
+mmp      = []   # mixed-member proportional helpers
+
+[dependencies]
+vm_core = { path = "../vm_core" }  # IDs, variables, rounding, RNG wrapper
+vm_io   = { path = "../vm_io" }    # canonical JSON, schemas, hashing, manifest loaders
+vm_algo = { path = "../vm_algo" }  # tabulation, allocation, gates/frontier primitives
+
+[dev-dependencies]
+tempfile = "3"   # optional, for integration tests

@@ -1,0 +1,41 @@
+[package]
+name = "vm_io"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "Apache-2.0 OR MIT"
+description = "I/O, canonical JSON, JSON Schema validation (2020-12), and SHA-256 hashing for the VM engine."
+# repository = "."; readme = "README.md"
+
+[lib]
+name = "vm_io"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+default = ["std", "serde", "schemaval", "hash", "path_utf8"]
+std = []
+serde = ["dep:serde", "dep:serde_json"]
+schemaval = ["dep:jsonschema"]
+hash = ["dep:sha2", "dep:digest"]
+path_utf8 = ["dep:camino"]
+
+[dependencies]
+vm_core     = { path = "../vm_core" } # adjust if your workspace layout differs
+
+serde       = { version = "1", features = ["derive"], optional = true, default-features = false }
+serde_json  = { version = "1", optional = true }                      # std only; used for parse/write
+
+jsonschema  = { version = "0.17", optional = true, default-features = false, features = ["draft2020-12"] }
+
+sha2        = { version = "0.10", optional = true, default-features = false }
+digest      = { version = "0.10", optional = true, default-features = false }
+hex         = { version = "0.4",  default-features = false }
+
+camino      = { version = "1", optional = true, default-features = false }
+
+thiserror   = { version = "1", default-features = false }
+
+[dev-dependencies]
+assert_json_diff = "2"
+tempfile         = "3"

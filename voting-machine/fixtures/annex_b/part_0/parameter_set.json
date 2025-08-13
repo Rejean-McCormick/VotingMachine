@@ -1,0 +1,24 @@
+{
+  "id": "PS:part0",
+  "schema_version": "1",
+  "variables": {
+    "VM-VAR-001": "approval",
+    "VM-VAR-007": "off",
+    "VM-VAR-010": "proportional_favor_small",
+    "VM-VAR-011": "on",
+    "VM-VAR-012": 0,
+    "VM-VAR-020": 50,
+    "VM-VAR-021": 0,
+    "VM-VAR-021_scope": "frontier_only",
+    "VM-VAR-022": 55,
+    "VM-VAR-023": 55,
+    "VM-VAR-024": "off",
+    "VM-VAR-025": "off",
+    "VM-VAR-028": "residents_only",
+    "VM-VAR-030": "equal_unit",
+    "VM-VAR-031": "country",
+    "VM-VAR-032": "status_quo",
+    "VM-VAR-033": 0,
+    "VM-VAR-040": "none"
+  }
+}

@@ -1,0 +1,26 @@
+# 03 - .cargo/config.toml — VM-ENGINE v0
+
+[net]
+offline = true         # Default: no network. Temporarily override with CARGO_NET_OFFLINE=0 for initial fetch/vendor.
+retry = 0
+git-fetch-with-cli = true
+
+[registries.crates-io]
+protocol = "sparse"    # Faster, reproducible index access when not vendored.
+
+# --- Vendoring (optional) ---
+# If you commit a vendor/ directory, force Cargo to read from it exclusively:
+# [source.crates-io]
+# replace-with = "vendored-sources"
+# [source.vendored-sources]
+# directory = "vendor"
+
+[build]
+# Optional: set in CI if you want consistent parallelism; does not affect artifact bytes.
+# jobs = 4
+
+[alias]
+b = "build --locked"
+t = "test --locked"
+m = "metadata --no-deps"
+tree = "tree -e no-dev -e features"

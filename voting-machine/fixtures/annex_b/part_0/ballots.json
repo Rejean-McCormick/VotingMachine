@@ -1,0 +1,58 @@
+{
+  "id": "REG:part0",
+  "schema_version": "1",
+  "provenance": {
+    "source": "Annex B Part-0 Synthetic Registry",
+    "published_date": "2024-01-01"
+  },
+  "units": [
+    {
+      "unit_id": "U:country",
+      "parent_id": null,
+      "name": "Part0 Country",
+      "magnitude": 1,
+      "eligible_roll": 3000,
+      "protected_area": false,
+      "tags": []
+    },
+    {
+      "unit_id": "U:region_a",
+      "parent_id": "U:country",
+      "name": "Region A",
+      "magnitude": 7,
+      "eligible_roll": 1000,
+      "protected_area": false,
+      "tags": []
+    },
+    {
+      "unit_id": "U:region_b",
+      "parent_id": "U:country",
+      "name": "Region B",
+      "magnitude": 7,
+      "eligible_roll": 1000,
+      "protected_area": false,
+      "tags": []
+    },
+    {
+      "unit_id": "U:region_c",
+      "parent_id": "U:country",
+      "name": "Region C",
+      "magnitude": 7,
+      "eligible_roll": 1000,
+      "protected_area": false,
+      "tags": []
+    }
+  ],
+  "adjacency": [
+    {
+      "a": "U:region_a",
+      "b": "U:region_b",
+      "type": "land"
+    },
+    {
+      "a": "U:region_b",
+      "b": "U:region_c",
+      "type": "land"
+    }
+  ]
+}

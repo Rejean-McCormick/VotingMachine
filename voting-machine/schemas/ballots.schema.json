@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/non-normative/ballots.schema.json",
+  "title": "Raw Ballots (Non-Normative Ingestion)",
+  "$comment": "STATUS: Non-normative (ingestion only). This schema is for upstream ballot ingestion/normalization; the engine and Canonical Test Pack consume DivisionRegistry, BallotTally, and ParameterSet only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "ballot_type", "payload"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "bal_id": { "$ref": "#/$defs/bal_id" },
+    "ballot_type": {
+      "type": "string",
+      "enum": ["plurality", "approval", "score", "ranked_irv", "ranked_condorcet"]
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": ["plurality"],
+          "properties": {
+            "plurality": {
+              "type": "object",
+              "required": ["ballots"],
+              "properties": {
+                "ballots": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/plurality_item" }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "required": ["approval"],
+          "properties": {
+            "approval": {
+              "type": "object",
+              "required": ["ballots"],
+              "properties": {
+                "ballots": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/approval_item" }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "required": ["score"],
+          "properties": {
+            "score": {
+              "type": "object",
+              "required": ["scale_min", "scale_max", "ballots"],
+              "properties": {
+                "scale_min": { "type": "integer" },
+                "scale_max": { "type": "integer" },
+                "ballots": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/score_item" }
+                }
+              },
+              "allOf": [
+                {
+                  "$comment": "Require scale_max > scale_min (uses $data extension).",
+                  "properties": {
+                    "scale_max": {
+                      "type": "integer",
+                      "exclusiveMinimum": { "$data": "1/scale_min" }
+                    }
+                  }
+                }
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "required": ["ranked_irv"],
+          "properties": {
+            "ranked_irv": {
+              "type": "object",
+              "required": ["ballots"],
+              "properties": {
+                "ballots": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/ranked" }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "required": ["ranked_condorcet"],
+          "properties": {
+            "ranked_condorcet": {
+              "type": "object",
+              "required": ["ballots"],
+              "properties": {
+                "ballots": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/ranked" }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    },
+    "notes": { "type": "string" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "ballot_type": { "const": "plurality" } }, "required": ["ballot_type"] },
+      "then": { "properties": { "payload": { "required": ["plurality"] } } }
+    },
+    {
+      "if": { "properties": { "ballot_type": { "const": "approval" } }, "required": ["ballot_type"] },
+      "then": { "properties": { "payload": { "required": ["approval"] } } }
+    },
+    {
+      "if": { "properties": { "ballot_type": { "const": "score" } }, "required": ["ballot_type"] },
+      "then": { "properties": { "payload": { "required": ["score"] } } }
+    },
+    {
+      "if": { "properties": { "ballot_type": { "const": "ranked_irv" } }, "required": ["ballot_type"] },
+      "then": { "properties": { "payload": { "required": ["ranked_irv"] } } }
+    },
+    {
+      "if": { "properties": { "ballot_type": { "const": "ranked_condorcet" } }, "required": ["ballot_type"] },
+      "then": { "properties": { "payload": { "required": ["ranked_condorcet"] } } }
+    }
+  ],
+  "$defs": {
+    "id_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+      "title": "IdToken"
+    },
+    "unit_id": { "$ref": "#/$defs/id_token" },
+    "option_id": { "$ref": "#/$defs/id_token" },
+    "bal_id": {
+      "type": "string",
+      "pattern": "^BAL:[A-Za-z0-9_.:-]{1,64}$",
+      "title": "BallotId"
+    },
+    "ranked": {
+      "type": "object",
+      "required": ["unit_id", "ranking"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/unit_id" },
+        "ranking": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/option_id" },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "approval_item": {
+      "type": "object",
+      "required": ["unit_id", "approvals"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/unit_id" },
+        "approvals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/option_id" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "plurality_item": {
+      "type": "object",
+      "required": ["unit_id", "vote"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/unit_id" },
+        "vote": {
+          "oneOf": [
+            { "$ref": "#/$defs/option_id" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "score_item": {
+      "type": "object",
+      "required": ["unit_id", "scores"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/unit_id" },
+        "scores": {
+          "type": "object",
+          "$comment": "Each property name is an option_id; each value is an integer score. Bounds reference the surrounding score payload's scale_min/scale_max via $data (validator extension).",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": { "$data": "2/scale_min" },
+            "maximum": { "$data": "2/scale_max" }
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
