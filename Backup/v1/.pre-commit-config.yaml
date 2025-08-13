@@ -1,0 +1,172 @@
+# 08 - .pre-commit-config.yaml — VM-ENGINE v0
+# Fast local gates (pre-commit) + heavier gates (pre-push), offline-friendly.
+# Assumes POSIX shell (Git Bash on Windows). No networked hook repos required.
+
+minimum_pre_commit_version: "3.2.0"
+
+repos:
+  # ------------------------------- Pre-commit (fast) -------------------------------
+  - repo: local
+    hooks:
+      # Enforce LF + final newline on text files
+      - id: lf-and-final-newline
+        name: Enforce LF + final newline (text files)
+        language: system
+        stages: [commit]
+        types: [text]
+        entry: bash -lc '
+          set -euo pipefail;
+          for f in "$@"; do
+            [ -f "$f" ] || continue
+            # Normalize CRLF -> LF
+            tr -d "\r" < "$f" > "$f.__tmp__" && mv "$f.__tmp__" "$f"
+            # Ensure file ends with a single LF
+            if [ -s "$f" ]; then
+              tail -c1 "$f" | od -An -t u1 | grep -q " 10" || printf "\n" >> "$f"
+            fi
+          done
+        '
+
+      # Strip trailing whitespace (but NOT in Markdown, to preserve hard breaks)
+      - id: trailing-whitespace
+        name: Strip trailing whitespace (exclude *.md)
+        language: system
+        stages: [commit]
+        types: [text]
+        files: '^(?!.*\.md$).*$'
+        entry: bash -lc '
+          set -euo pipefail;
+          for f in "$@"; do
+            [ -f "$f" ] || continue
+            # Use portable Python for in-place editing across GNU/BSD sed differences
+            python - "$@" << "PY"
+import sys, re, pathlib
+for p in map(pathlib.Path, sys.argv[1:]):
+    try:
+        s = p.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+    except Exception:
+        continue
+    s = [re.sub(r"[ \t]+(?=\r?\n$)", "", line) for line in s]
+    p.write_text("".join(s), encoding="utf-8")
+PY
+          done
+        '
+
+      # Ban CR characters in staged files (mixed line endings)
+      - id: mixed-line-ending
+        name: Ban CR (no CRLF)
+        language: system
+        stages: [commit]
+        types: [text]
+        entry: bash -lc '
+          set -euo pipefail;
+          bad=0
+          for f in "$@"; do
+            [ -f "$f" ] || continue
+            if grep -Iq . "$f"; then
+              if LC_ALL=C grep -n $'\''\r'\'' "$f" >/dev/null; then
+                echo "CRLF found in: $f" >&2; bad=1
+              fi
+            fi
+          done
+          exit $bad
+        '
+
+      # JSON well-formedness (schemas, fixtures, sources)
+      - id: check-json
+        name: JSON syntax check (jq or python)
+        language: system
+        stages: [commit]
+        files: '\.json$'
+        entry: bash -lc '
+          set -euo pipefail;
+          for f in "$@"; do
+            [ -f "$f" ] || continue
+            if command -v jq >/dev/null 2>&1; then
+              jq -e . "$f" >/dev/null
+            else
+              python - <<PY "$f"
+import json, sys
+json.load(open(sys.argv[1], "rb"))
+PY
+            fi
+          done
+        '
+
+      # Rust formatting (fast; fail on diff)
+      - id: cargo-fmt
+        name: cargo fmt --all -- --check
+        language: system
+        stages: [commit]
+        pass_filenames: false
+        entry: bash -lc 'cargo fmt --all -- --check'
+
+      # Canonical JSON check: keys sorted + LF (normative dirs). Skips if jq missing.
+      - id: canonical-json
+        name: Canonical JSON (sorted keys, LF) — schemas/ & fixtures/
+        language: system
+        stages: [commit]
+        files: '^(schemas/|fixtures/).*\.json$'
+        exclude: '^(dist/|artifacts/|vendor/|node_modules/)'
+        entry: bash -lc '
+          set -euo pipefail;
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "canonical-json: jq not found; skipping." >&2; exit 0
+          fi
+          tmp="$(mktemp)"
+          trap '\''rm -f "$tmp"'\'' EXIT
+          for f in "$@"; do
+            [ -f "$f" ] || continue
+            jq -S . "$f" > "$tmp"
+            # ensure LF at EOF
+            tail -c1 "$tmp" | od -An -t u1 | grep -q " 10" || printf "\n" >> "$tmp"
+            if ! cmp -s "$tmp" "$f"; then
+              echo "Non-canonical JSON (sort keys / LF) → $f" >&2
+              exit 1
+            fi
+          done
+        '
+
+  # ------------------------------- Pre-push (heavier) -------------------------------
+  - repo: local
+    hooks:
+      # Clippy must be clean (deny warnings)
+      - id: cargo-clippy
+        name: cargo clippy --all-targets -D warnings
+        language: system
+        stages: [push]
+        pass_filenames: false
+        entry: bash -lc 'cargo clippy --all-targets -- -D warnings'
+
+      # Unit tests (locked, workspace)
+      - id: cargo-test
+        name: cargo test --locked --workspace
+        language: system
+        stages: [push]
+        pass_filenames: false
+        entry: bash -lc 'cargo test --locked --workspace'
+
+      # Determinism smoke: run one Annex B fixture twice with the same seed and compare bytes
+      - id: determinism-smoke
+        name: Determinism smoke (double-run VM-TST-001)
+        language: system
+        stages: [push]
+        pass_filenames: false
+        entry: bash -lc '
+          set -euo pipefail;
+          FIX="fixtures/annex_b/VM-TST-001/manifest.json"
+          if [ ! -f "$FIX" ]; then
+            echo "determinism-smoke: $FIX not found; skipping." >&2; exit 0
+          fi
+          BIN="${BIN:-vm_cli}"
+          if ! command -v "$BIN" >/dev/null 2>&1; then
+            echo "determinism-smoke: $BIN not found in PATH; skipping." >&2; exit 0
+          fi
+          SEED="${VM_SEED:-42}"
+          A="artifacts/prepush/a"; B="artifacts/prepush/b"
+          rm -rf "$A" "$B"; mkdir -p "$A" "$B"
+          CARGO_NET_OFFLINE="${CARGO_NET_OFFLINE:-1}" "$BIN" run --manifest "$FIX" --output "$A" --rng-seed "$SEED"
+          CARGO_NET_OFFLINE="${CARGO_NET_OFFLINE:-1}" "$BIN" run --manifest "$FIX" --output "$B" --rng-seed "$SEED"
+          cmp -s "$A/result.json"     "$B/result.json"
+          cmp -s "$A/run_record.json" "$B/run_record.json"
+        '

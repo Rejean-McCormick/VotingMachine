@@ -1,0 +1,162 @@
+{
+  "version": 8,
+  "name": "VM Offline Frontier",
+  "sprite": "./sprites/sprite",
+  "glyphs": "./fonts/{fontstack}/{range}.pbf",
+  "sources": {
+    "basemap": {
+      "type": "raster",
+      "tiles": ["./tiles/raster/{z}/{x}/{y}.png"],
+      "tileSize": 256,
+      "minzoom": 0,
+      "maxzoom": 6
+    },
+    "units": {
+      "type": "geojson",
+      "data": "./data/units.geojson"
+    },
+    "frontier": {
+      "type": "geojson",
+      "data": "./data/frontier.geojson"
+    },
+    "adjacency": {
+      "type": "geojson",
+      "data": "./data/adjacency.geojson"
+    }
+  },
+  "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": {
+        "background-color": "#eef2f5"
+      }
+    },
+    {
+      "id": "basemap",
+      "type": "raster",
+      "source": "basemap",
+      "minzoom": 0,
+      "maxzoom": 6,
+      "paint": {
+        "raster-opacity": 0.8
+      }
+    },
+    {
+      "id": "units-fill",
+      "type": "fill",
+      "source": "units",
+      "paint": {
+        "fill-color": [
+          "match",
+          ["get", "status"],
+          "no_change",
+          "#B0BEC5",
+          "autonomy",
+          "#4CAF50",
+          "phased",
+          "#FFC107",
+          "immediate",
+          "#F44336",
+          "#B0BEC5"
+        ],
+        "fill-opacity": 0.6
+      }
+    },
+    {
+      "id": "units-outline",
+      "type": "line",
+      "source": "units",
+      "paint": {
+        "line-color": "#607D8B",
+        "line-width": 0.5
+      }
+    },
+    {
+      "id": "frontier-mediation",
+      "type": "fill",
+      "source": "frontier",
+      "filter": ["==", ["get", "mediation"], true],
+      "paint": {
+        "fill-color": "#FF9800",
+        "fill-opacity": 0.35
+      }
+    },
+    {
+      "id": "frontier-enclave-outline",
+      "type": "line",
+      "source": "frontier",
+      "filter": ["==", ["get", "enclave"], true],
+      "paint": {
+        "line-color": "#000000",
+        "line-width": 1.0,
+        "line-dasharray": [2, 2]
+      }
+    },
+    {
+      "id": "frontier-override-protected",
+      "type": "line",
+      "source": "frontier",
+      "filter": ["==", ["get", "protected_blocked"], true],
+      "paint": {
+        "line-color": "#673AB7",
+        "line-width": 2.0,
+        "line-dasharray": [2, 2]
+      }
+    },
+    {
+      "id": "adjacency-land",
+      "type": "line",
+      "source": "adjacency",
+      "filter": ["==", ["get", "edge_type"], "land"],
+      "paint": {
+        "line-color": "#9E9E9E",
+        "line-width": 1.0
+      }
+    },
+    {
+      "id": "adjacency-bridge",
+      "type": "line",
+      "source": "adjacency",
+      "filter": ["==", ["get", "edge_type"], "bridge"],
+      "paint": {
+        "line-color": "#616161",
+        "line-width": 1.0,
+        "line-dasharray": [3, 2]
+      }
+    },
+    {
+      "id": "adjacency-water",
+      "type": "line",
+      "source": "adjacency",
+      "filter": ["==", ["get", "edge_type"], "water"],
+      "paint": {
+        "line-color": "#90CAF9",
+        "line-width": 1.0,
+        "line-opacity": 0.6
+      }
+    },
+    {
+      "id": "unit-labels",
+      "type": "symbol",
+      "source": "units",
+      "layout": {
+        "text-field": [
+          "coalesce",
+          ["get", "name"],
+          ["get", "id"]
+        ],
+        "text-font": ["Inter Regular", "Noto Sans Regular", "Arial Unicode MS Regular"],
+        "text-size": 12,
+        "text-allow-overlap": false,
+        "text-anchor": "center",
+        "text-offset": [0, 0]
+      },
+      "paint": {
+        "text-color": "#263238",
+        "text-halo-color": "#ffffff",
+        "text-halo-width": 1.0
+      }
+    }
+  ]
+}

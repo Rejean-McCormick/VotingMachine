@@ -1,0 +1,75 @@
+
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/manifest.schema.json",
+  "title": "Run Manifest (Canonical Inputs)",
+  "description": "Names the three canonical inputs for a deterministic, offline run and optional expectations/digests.",
+  "$defs": {
+    "local_path": {
+      "type": "string",
+      "pattern": "^(?!https?://).+",
+      "title": "LocalPath",
+      "$comment": "Local filesystem only; forbid http(s) URLs to enforce offline runs."
+    },
+    "sha256_64hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Sha256LowerHex64"
+    },
+    "digest_obj": {
+      "type": "object",
+      "required": ["sha256"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/sha256_64hex" }
+      },
+      "additionalProperties": false,
+      "title": "DigestObject"
+    },
+    "expect_obj": {
+      "type": "object",
+      "properties": {
+        "formula_id": { "type": "string", "title": "ExpectedFormulaId" },
+        "engine_version": { "type": "string", "title": "ExpectedEngineVersion" }
+      },
+      "additionalProperties": false,
+      "title": "ExpectObject",
+      "$comment": "FID is typically a 64-hex string; comparison is performed by the loader/CI outside this schema."
+    }
+  },
+  "type": "object",
+  "required": ["schema_version", "reg_path", "ballot_tally_path", "params_path"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "reg_path": { "$ref": "#/$defs/local_path" },
+    "ballot_tally_path": { "$ref": "#/$defs/local_path" },
+    "params_path": { "$ref": "#/$defs/local_path" },
+    "expect": { "$ref": "#/$defs/expect_obj" },
+    "digests": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/digest_obj" },
+      "title": "DigestsMap",
+      "$comment": "Keys are relative paths as they appear in the manifest; values carry sha256 in lowercase 64-hex."
+    },
+    "notes": { "type": "string" }
+  },
+  "additionalProperties": false,
+  "$comment": "Canonical inputs for tests/runs are exactly registry.json (DivisionRegistry), tally.json (BallotTally), and params.json (ParameterSet). No raw ballots path. Canonical JSON rules (UTF-8, LF, sorted keys; arrays in spec order) apply to hashing/verification.",
+  "examples": [
+    {
+      "schema_version": "1.x",
+      "reg_path": "cases/VM-TST-101/registry.json",
+      "ballot_tally_path": "cases/VM-TST-101/tally.json",
+      "params_path": "cases/VM-TST-101/params.json",
+      "expect": {
+        "formula_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "engine_version": "v0.1.0"
+      },
+      "digests": {
+        "cases/VM-TST-101/registry.json": { "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+        "cases/VM-TST-101/tally.json":    { "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+        "cases/VM-TST-101/params.json":   { "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+      }
+    }
+  ]
+}
+

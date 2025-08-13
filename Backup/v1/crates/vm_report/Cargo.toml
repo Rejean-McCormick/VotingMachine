@@ -1,0 +1,562 @@
+//! vm_report/src/lib.rs — Pure offline report model + renderers (JSON/HTML).
+//!
+//! Determinism rules:
+//! - No network, no I/O here. Callers supply artifacts already in-memory.
+//! - Percent strings use one-decimal formatting without float arithmetic.
+//! - Stable section order and field names.
+//!
+//! Notes:
+//! - Inputs are accepted as JSON values (`serde_json::Value`) to avoid tight
+//!   coupling with vm_pipeline/vm_io concrete types while keeping signatures
+//!   stable across the workspace.
+//! - For approval ballots, the model includes an explicit sentence about the
+//!   denominator (“approvals / valid ballots”), as required by Doc 7.
+
+#![deny(unsafe_code)]
+
+use std::collections::BTreeMap;
+
+// Re-export the helper requested by the spec (handy for other crates), even if
+// we don't consume num/den here. We avoid float math in this crate.
+pub use vm_core::rounding::percent_one_decimal_tenths;
+pub use vm_core::ids::{ResultId, RunId, FrontierId};
+
+// ---- Artifact type aliases (loosely-coupled) ----
+// These keep this crate independent of vm_pipeline/vm_io concrete types.
+// Callers pass the already-parsed JSON artifacts produced by the engine.
+pub type ResultArtifact = serde_json::Value;
+pub type RunRecordArtifact = serde_json::Value;
+pub type FrontierMapArtifact = serde_json::Value;
+pub type CompareScenariosArtifact = serde_json::Value;
+
+// ===== Errors =====
+#[derive(Debug)]
+pub enum ReportError {
+    Template(&'static str),
+    MissingField(&'static str),
+    Inconsistent(&'static str),
+}
+
+// ===== Model =====
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct ReportModel {
+    pub cover: SectionCover,
+    pub snapshot: SectionSnapshot,
+    pub eligibility: SectionEligibility,
+    pub ballot_method: SectionBallotMethod,
+    pub legitimacy_panel: SectionLegitimacy,
+    pub outcome_label: SectionOutcome,
+    pub frontier: Option<SectionFrontier>,
+    pub sensitivity: Option<SectionSensitivity>,
+    pub integrity: SectionIntegrity,
+}
+
+// --- Sections (minimal but schema-aligned) ---
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct SectionCover {
+    pub title: String,
+    pub label: String,                 // "Decisive" | "Marginal" | "Invalid"
+    pub reason: Option<String>,
+}
+
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct SnapshotVar { pub key: String, pub value: String }
+
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct SectionSnapshot { pub items: Vec<SnapshotVar> }
+
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct SectionEligibility {
+    pub roll_policy: String,
+    pub registry_source: String,
+    pub totals: EligibilityTotals,
+    pub per_unit_quorum_note: Option<String>,
+}
+
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct EligibilityTotals { pub eligible_roll: u64, pub ballots_cast: u64, pub valid_ballots: u64 }
+
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct SectionBallotMethod {
+    pub method: String,                // VM-VAR-001
+    pub allocation: String,            // VM-VAR-010
+    pub weighting: String,             // VM-VAR-030
+    pub approval_denominator_sentence: Option<String>, // forced for approval ballots
+}
+
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct GateRow {
+    pub name: String,
+    pub value_pct_1dp: String,
+    pub threshold_pct_0dp: String,
+    pub pass: bool,
+    pub denom_note: Option<String>,
+}
+
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct SectionLegitimacy {
+    pub quorum: GateRow,
+    pub majority: GateRow,
+    pub double_majority: Option<(GateRow, GateRow)>, // (national, family)
+    pub symmetry: Option<bool>,
+    pub pass: bool,
+    pub reasons: Vec<String>,
+}
+
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct SectionOutcome { pub label: String, pub reason: String, pub national_margin_pp: String }
+
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct FrontierCounters {
+    pub changed: u32,
+    pub no_change: u32,
+    pub mediation: u32,
+    pub enclave: u32,
+    pub protected_blocked: u32,
+    pub quorum_blocked: u32,
+}
+
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct SectionFrontier {
+    pub mode: String,                      // VM-VAR-040
+    pub edge_policy: String,               // VM-VAR-047
+    pub island_rule: String,               // VM-VAR-048
+    pub counters: FrontierCounters,
+    pub bands_summary: Vec<String>,
+}
+
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct SectionSensitivity { pub table: Vec<Vec<String>> }
+
+#[cfg_attr(feature = "render_json", derive(serde::Serialize))]
+#[derive(Clone, Debug)]
+pub struct SectionIntegrity {
+    pub result_id: ResultId,
+    pub run_id: RunId,
+    pub frontier_id: Option<FrontierId>,
+    pub engine_vendor: String,
+    pub engine_name: String,
+    pub engine_version: String,
+    pub engine_build: String,
+    pub formula_id_hex: String,
+    pub tie_policy: String,
+    pub tie_seed: Option<String>, // only if tie_policy == "random"
+    pub started_utc: String,
+    pub finished_utc: String,
+}
+
+// ===== API =====
+
+/// Build the report model from artifacts (pure, offline).
+///
+/// This reads only well-known fields used for presentation. Missing required
+/// fields yield `ReportError::MissingField`.
+pub fn build_model(
+    result: &ResultArtifact,
+    run: &RunRecordArtifact,
+    frontier: Option<&FrontierMapArtifact>,
+    compare: Option<&CompareScenariosArtifact>,
+) -> Result<ReportModel, ReportError> {
+    // ---- Cover & Outcome ----
+    let label = json_get_str(result, "/label")?;
+    let label_reason = json_get_str(result, "/label_reason").unwrap_or_else(|_| "n/a".into());
+    let cover = SectionCover {
+        title: "Voting Model Result".to_string(),
+        label: label.clone(),
+        reason: Some(label_reason.clone()),
+    };
+    let national_margin_pp = json_get_i64(result, "/aggregates/national_margin_pp")
+        .unwrap_or(0);
+    let outcome_label = SectionOutcome {
+        label: label.clone(),
+        reason: label_reason.clone(),
+        national_margin_pp: format!("{} pp", national_margin_pp),
+    };
+
+    // ---- Snapshot (selected VM-VAR echoes if present) ----
+    let mut snapshot_items = Vec::new();
+    if let Ok(bt) = json_get_str(result, "/params/ballot_type") {
+        snapshot_items.push(SnapshotVar { key: "ballot_type".into(), value: bt });
+    }
+    if let Ok(am) = json_get_str(result, "/params/allocation_method") {
+        snapshot_items.push(SnapshotVar { key: "allocation_method".into(), value: am });
+    }
+    if let Ok(th) = json_get_u64(result, "/params/pr_entry_threshold_pct") {
+        snapshot_items.push(SnapshotVar { key: "pr_entry_threshold_pct".into(), value: format!("{}%", th) });
+    }
+    if let Ok(dm) = json_get_bool(result, "/params/double_majority_enabled") {
+        snapshot_items.push(SnapshotVar { key: "double_majority_enabled".into(), value: dm.to_string() });
+    }
+    if let Ok(sym) = json_get_bool(result, "/params/symmetry_enabled") {
+        snapshot_items.push(SnapshotVar { key: "symmetry_enabled".into(), value: sym.to_string() });
+    }
+    let snapshot = SectionSnapshot { items: snapshot_items };
+
+    // ---- Eligibility (totals) ----
+    let eligible_roll = json_get_u64(result, "/aggregates/turnout/eligible_roll").unwrap_or(0);
+    let ballots_cast = json_get_u64(result, "/aggregates/turnout/ballots_cast").unwrap_or(0);
+    let valid_ballots = json_get_u64(result, "/aggregates/turnout/valid_ballots").unwrap_or(0);
+    let eligibility = SectionEligibility {
+        roll_policy: json_get_str(result, "/params/roll_inclusion_policy").unwrap_or_else(|_| "unspecified".into()),
+        registry_source: json_get_str(result, "/provenance/registry_source").unwrap_or_else(|_| "registry".into()),
+        totals: EligibilityTotals { eligible_roll, ballots_cast, valid_ballots },
+        per_unit_quorum_note: json_get_u64(result, "/params/quorum_per_unit_pct")
+            .ok()
+            .and_then(|q| if q > 0 { Some(format!("Per-unit quorum applied at {}%", q)) } else { None }),
+    };
+
+    // ---- Ballot method (and approval denominator sentence) ----
+    let method = json_get_str(result, "/params/ballot_type").unwrap_or_else(|_| "unspecified".into());
+    let allocation = json_get_str(result, "/params/allocation_method").unwrap_or_else(|_| "unspecified".into());
+    let weighting = json_get_str(result, "/aggregates/weighting_method").unwrap_or_else(|_| "unspecified".into());
+    let approval_denominator_sentence =
+        if method == "approval" {
+            Some("Approval rate is computed as approvals_for_change / valid_ballots.".to_string())
+        } else { None };
+    let ballot_method = SectionBallotMethod { method, allocation, weighting, approval_denominator_sentence };
+
+    // ---- Legitimacy panel (quorum, majority, double, symmetry) ----
+    let gates = result.pointer("/gates")
+        .ok_or(ReportError::MissingField("gates"))?;
+
+    let quorum_row = GateRow {
+        name: "Quorum".into(),
+        value_pct_1dp: json_percent_1dp_from_number(gates.pointer("/quorum/observed"))?,
+        threshold_pct_0dp: json_get_u64(gates, "/quorum/threshold_pct").map(|v| format!("{}%", v))?,
+        pass: json_get_bool(gates, "/quorum/pass").unwrap_or(false),
+        denom_note: None,
+    };
+
+    let majority_row = GateRow {
+        name: "Majority".into(),
+        value_pct_1dp: json_percent_1dp_from_number(gates.pointer("/majority/observed"))?,
+        threshold_pct_0dp: json_get_u64(gates, "/majority/threshold_pct").map(|v| format!("{}%", v))?,
+        pass: json_get_bool(gates, "/majority/pass").unwrap_or(false),
+        denom_note: Some("Approval rate denominator is valid_ballots.".into()),
+    };
+
+    let dm = gates.pointer("/double_majority");
+    let double_majority = dm.and_then(|dmv| {
+        let n = GateRow {
+            name: "National".into(),
+            value_pct_1dp: json_percent_1dp_from_number(dmv.pointer("/national/observed")).ok()?,
+            threshold_pct_0dp: json_get_u64(dmv, "/national/threshold_pct").ok().map(|v| format!("{}%", v))?,
+            pass: json_get_bool(dmv, "/national/pass").unwrap_or(false),
+            denom_note: Some("Approval rate denominator is valid_ballots.".into()),
+        };
+        let r = GateRow {
+            name: "Family".into(),
+            value_pct_1dp: json_percent_1dp_from_number(dmv.pointer("/regional/observed")).ok()?,
+            threshold_pct_0dp: json_get_u64(dmv, "/regional/threshold_pct").ok().map(|v| format!("{}%", v))?,
+            pass: json_get_bool(dmv, "/regional/pass").unwrap_or(false),
+            denom_note: Some("Approval rate denominator is valid_ballots.".into()),
+        };
+        Some((n, r))
+    });
+
+    let symmetry = gates.pointer("/symmetry").and_then(|s| s.get("pass")).and_then(|v| v.as_bool());
+
+    // Overall pass and reasons list (stable tokens)
+    let gates_pass = json_get_bool(gates, "/pass").unwrap_or(false);
+    let reasons = result.pointer("/gates/reasons")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    let legitimacy_panel = SectionLegitimacy {
+        quorum: quorum_row,
+        majority: majority_row,
+        double_majority,
+        symmetry,
+        pass: gates_pass,
+        reasons,
+    };
+
+    // ---- Frontier (optional) ----
+    let frontier_section = frontier.map(|fr| {
+        // Counters are stored under predictable keys; fallback to zeros.
+        let counters = FrontierCounters {
+            changed: json_get_u64(fr, "/summary/changed").unwrap_or(0) as u32,
+            no_change: json_get_u64(fr, "/summary/no_change").unwrap_or(0) as u32,
+            mediation: json_get_u64(fr, "/summary/mediation").unwrap_or(0) as u32,
+            enclave: json_get_u64(fr, "/summary/enclave").unwrap_or(0) as u32,
+            protected_blocked: json_get_u64(fr, "/summary/protected_blocked").unwrap_or(0) as u32,
+            quorum_blocked: json_get_u64(fr, "/summary/quorum_blocked").unwrap_or(0) as u32,
+        };
+        let bands_summary = fr.pointer("/bands_summary")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(|x| x.to_string())).collect())
+            .unwrap_or_else(|| Vec::new());
+
+        SectionFrontier {
+            mode: json_get_str(fr, "/mode").unwrap_or_else(|_| "none".into()),
+            edge_policy: json_get_str(fr, "/edge_policy").unwrap_or_else(|_| "land".into()),
+            island_rule: json_get_str(fr, "/island_rule").unwrap_or_else(|_| "none".into()),
+            counters,
+            bands_summary,
+        }
+    });
+
+    // ---- Sensitivity (optional compare table) ----
+    let sensitivity = compare.map(|cmp| {
+        let rows = cmp.pointer("/table").and_then(|t| t.as_array())
+            .map(|a| {
+                a.iter().map(|row| {
+                    row.as_array()
+                        .map(|cells| cells.iter().map(cell_to_string).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                }).collect::<Vec<_>>()
+            }).unwrap_or_default();
+        SectionSensitivity { table: rows }
+    });
+
+    // ---- Integrity (engine + IDs + policy/seed + timestamps) ----
+    let engine_vendor  = json_get_str(run, "/engine/vendor").unwrap_or_else(|_| "vm-engine".into());
+    let engine_name    = json_get_str(run, "/engine/name").unwrap_or_else(|_| "vm".into());
+    let engine_version = json_get_str(run, "/engine/version").unwrap_or_else(|_| "0.1.0".into());
+    let engine_build   = json_get_str(run, "/engine/build").unwrap_or_else(|_| "dev".into());
+
+    let formula_id_hex = json_get_str(run, "/formula_id").unwrap_or_else(|_| {
+        // Fallback to result root if present
+        json_get_str(result, "/formula_id").unwrap_or_else(|_| "unknown".into())
+    });
+
+    let result_id: ResultId = json_get_str(run, "/outputs/result_id")
+        .map_err(|_| ReportError::MissingField("outputs.result_id"))?
+        .into();
+    let run_id: RunId = json_get_str(run, "/id")
+        .map_err(|_| ReportError::MissingField("run.id"))?
+        .into();
+    let frontier_id = run.pointer("/outputs/frontier_map_id")
+        .and_then(|v| v.as_str())
+        .map(|s| FrontierId::from(s.to_string()));
+
+    let tie_policy = json_get_str(run, "/determinism/tie_policy").unwrap_or_else(|_| "deterministic".into());
+    let tie_seed = if tie_policy == "random" {
+        json_get_str(run, "/determinism/rng_seed").ok()
+    } else { None };
+
+    let started_utc = json_get_str(run, "/started_utc").unwrap_or_else(|_| "1970-01-01T00:00:00Z".into());
+    let finished_utc = json_get_str(run, "/finished_utc").unwrap_or_else(|_| "1970-01-01T00:00:00Z".into());
+
+    let integrity = SectionIntegrity {
+        result_id,
+        run_id,
+        frontier_id,
+        engine_vendor,
+        engine_name,
+        engine_version,
+        engine_build,
+        formula_id_hex,
+        tie_policy,
+        tie_seed,
+        started_utc,
+        finished_utc,
+    };
+
+    Ok(ReportModel {
+        cover,
+        snapshot,
+        eligibility,
+        ballot_method,
+        legitimacy_panel,
+        outcome_label,
+        frontier: frontier_section,
+        sensitivity,
+        integrity,
+    })
+}
+
+// ===== Renderers =====
+
+/// Serialize the model as JSON (deterministic field order courtesy of struct layout).
+#[cfg(feature = "render_json")]
+pub fn render_json(model: &ReportModel) -> Result<String, ReportError> {
+    serde_json::to_string(model).map_err(|_| ReportError::Template("json_serialize"))
+}
+
+/// Render a compact HTML summary using an embedded template (no external assets).
+#[cfg(feature = "render_html")]
+pub fn render_html(model: &ReportModel) -> Result<String, ReportError> {
+    use minijinja::{Environment, context};
+
+    static TEMPLATE: &str = r#"<!doctype html>
+<html lang="en"><meta charset="utf-8">
+<title>{{ cover.title }} — {{ integrity.result_id }}</title>
+<h1>{{ cover.title }}</h1>
+<p><strong>Label:</strong> {{ outcome.label }} — {{ outcome.reason }} (margin: {{ outcome.margin }})</p>
+
+<h2>Legitimacy</h2>
+<ul>
+  <li>Quorum: {{ leg.quorum.value }} (≥ {{ leg.quorum.th }}) — {{ "PASS" if leg.quorum.pass else "FAIL" }}</li>
+  <li>Majority: {{ leg.majority.value }} (≥ {{ leg.majority.th }}) — {{ "PASS" if leg.majority.pass else "FAIL" }}</li>
+  {% if leg.double %}
+  <li>Double-majority:
+    <ul>
+      <li>National: {{ leg.double.0.value }} (≥ {{ leg.double.0.th }}) — {{ "PASS" if leg.double.0.pass else "FAIL" }}</li>
+      <li>Family: {{ leg.double.1.value }} (≥ {{ leg.double.1.th }}) — {{ "PASS" if leg.double.1.pass else "FAIL" }}</li>
+    </ul>
+  </li>
+  {% endif %}
+</ul>
+
+{% if frontier %}
+<h2>Frontier</h2>
+<p>Mode: {{ frontier.mode }} — Edges: {{ frontier.edges }} — Island Rule: {{ frontier.island }}</p>
+<p>Counters: changed={{ frontier.c.changed }}, none={{ frontier.c.none }}, mediation={{ frontier.c.mediation }},
+enclave={{ frontier.c.enclave }}, protected={{ frontier.c.protected }}, quorum_blocked={{ frontier.c.qblock }}</p>
+{% endif %}
+
+<h2>Integrity</h2>
+<p>Engine: {{ eng.vendor }}/{{ eng.name }} v{{ eng.version }} ({{ eng.build }}) — FID {{ integrity.formula_id_hex }}</p>
+<p>Run: {{ integrity.run_id }} — Started {{ integrity.started }} — Finished {{ integrity.finished }}</p>
+<p>Ties: policy={{ integrity.tie_policy }}{% if integrity.tie_seed %}, seed={{ integrity.tie_seed }}{% endif %}</p>
+</html>
+"#;
+
+    let mut env = Environment::new();
+    env.add_template("report.html", TEMPLATE).map_err(|_| ReportError::Template("add_template"))?;
+    let tmpl = env.get_template("report.html").map_err(|_| ReportError::Template("get_template"))?;
+
+    // Shape a tiny context (explicit to avoid surprising field leaks)
+    let ctx = context! {
+        cover => {
+            "title" => &model.cover.title,
+        },
+        outcome => {
+            "label" => &model.outcome_label.label,
+            "reason" => &model.outcome_label.reason,
+            "margin" => &model.outcome_label.national_margin_pp,
+        },
+        leg => {
+            "quorum" => {
+                "value" => &model.legitimacy_panel.quorum.value_pct_1dp,
+                "th"    => &model.legitimacy_panel.quorum.threshold_pct_0dp,
+                "pass"  => model.legitimacy_panel.quorum.pass,
+            },
+            "majority" => {
+                "value" => &model.legitimacy_panel.majority.value_pct_1dp,
+                "th"    => &model.legitimacy_panel.majority.threshold_pct_0dp,
+                "pass"  => model.legitimacy_panel.majority.pass,
+            },
+            "double" => &model.legitimacy_panel.double_majority,
+        },
+        frontier => model.frontier.as_ref().map(|f| {
+            serde_json::json!({
+                "mode": f.mode,
+                "edges": f.edge_policy,
+                "island": f.island_rule,
+                "c": {
+                    "changed": f.counters.changed,
+                    "none": f.counters.no_change,
+                    "mediation": f.counters.mediation,
+                    "enclave": f.counters.enclave,
+                    "protected": f.counters.protected_blocked,
+                    "qblock": f.counters.quorum_blocked
+                }
+            })
+        }),
+        eng => {
+            "vendor" => &model.integrity.engine_vendor,
+            "name"   => &model.integrity.engine_name,
+            "version"=> &model.integrity.engine_version,
+            "build"  => &model.integrity.engine_build,
+        },
+        integrity => {
+            "result_id" => &model.integrity.result_id,
+            "run_id"    => &model.integrity.run_id,
+            "formula_id_hex" => &model.integrity.formula_id_hex,
+            "tie_policy"=> &model.integrity.tie_policy,
+            "tie_seed"  => &model.integrity.tie_seed,
+            "started"   => &model.integrity.started_utc,
+            "finished"  => &model.integrity.finished_utc,
+        }
+    };
+
+    tmpl.render(ctx).map_err(|_| ReportError::Template("render_html"))
+}
+
+// ===== Helpers (pure; no floats) =====
+
+fn cell_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "".into(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        _ => v.to_string(),
+    }
+}
+
+fn json_get_str<'a>(root: &'a serde_json::Value, ptr: &str) -> Result<String, ReportError> {
+    root.pointer(ptr)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or(ReportError::MissingField(ptr))
+}
+fn json_get_bool(root: &serde_json::Value, ptr: &str) -> Result<bool, ReportError> {
+    root.pointer(ptr)
+        .and_then(|v| v.as_bool())
+        .ok_or(ReportError::MissingField(ptr))
+}
+fn json_get_u64(root: &serde_json::Value, ptr: &str) -> Result<u64, ReportError> {
+    root.pointer(ptr)
+        .and_then(|v| v.as_u64())
+        .ok_or(ReportError::MissingField(ptr))
+}
+fn json_get_i64(root: &serde_json::Value, ptr: &str) -> Result<i64, ReportError> {
+    root.pointer(ptr)
+        .and_then(|v| v.as_i64())
+        .ok_or(ReportError::MissingField(ptr))
+}
+
+/// Format a percentage number (already given as a JSON number 0..=100) into
+/// a one-decimal percent string *without* float arithmetic. We only massage
+/// the textual representation and clamp to a single decimal place.
+fn json_percent_1dp_from_number(maybe_num: Option<&serde_json::Value>) -> Result<String, ReportError> {
+    let n = maybe_num.ok_or(ReportError::MissingField("gates.*.observed"))?;
+    let s = match n {
+        serde_json::Value::Number(num) => num.to_string(),
+        _ => return Err(ReportError::Inconsistent("gates.*.observed:not_number")),
+    };
+    Ok(format!("{}%", to_one_decimal(&s)))
+}
+
+/// Ensure a numeric string has exactly one decimal place, without changing the
+/// value (we truncate extra decimals; upstream ensures engine precision).
+fn to_one_decimal(s: &str) -> String {
+    if let Some(dot) = s.find('.') {
+        // keep one decimal digit maximum; if none exists after dot, add one zero.
+        let after = &s[dot + 1..];
+        if after.is_empty() {
+            format!("{}{}", s, "0")
+        } else {
+            let end = dot + 2.min(s.len() - dot - 1);
+            let mut out = String::with_capacity(dot + 2);
+            out.push_str(&s[..=dot]); // include '.'
+            out.push_str(&s[dot + 1..end]);
+            out
+        }
+    } else {
+        // no decimal point → add ".0"
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push_str(s);
+        out.push_str(".0");
+        out
+    }
+}
+
+// ===== End =====

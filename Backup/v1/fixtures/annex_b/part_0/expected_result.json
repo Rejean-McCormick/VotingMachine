@@ -1,0 +1,41 @@
+{
+  "id": "EXP:part0",
+  "based_on": {
+    "manifest_id": "MAN:part0",
+    "registry_id": "REG:part0",
+    "parameter_set_id": "PS:part0",
+    "ballot_tally_id": "TLY:part0"
+  },
+  "expected": {
+    "gates": {
+      "quorum": {
+        "pass": true,
+        "turnout": { "ballots_cast": 100, "eligible_roll": 100 },
+        "threshold_pct": 50
+      },
+      "majority": {
+        "present": true,
+        "pass": true,
+        "support": {
+          "numerator": 55,
+          "denominator": 100,
+          "denominator_policy": "approval_rate"
+        },
+        "threshold_pct": 55
+      },
+      "double_majority": {
+        "present": false
+      }
+    },
+    "label": { "value": "Decisive", "reason": "margin_meets_threshold" },
+    "allocation": {
+      "national_totals_by_option": {
+        "OPT:A": 1,
+        "OPT:B": 2,
+        "OPT:C": 3,
+        "OPT:D": 4
+      }
+    }
+  },
+  "expected_canonical_hash": null
+}

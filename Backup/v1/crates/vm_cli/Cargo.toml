@@ -1,0 +1,50 @@
+[package]
+name = "vm_cli"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+resolver = "2"
+description = "Offline, deterministic CLI for the VM engine (Docs 4–5 pipeline)"
+# no build.rs
+
+[[bin]]
+name = "vm"
+path = "src/main.rs"
+
+[features]
+# Defaults: keep things deterministic and offline; JSON reporting available by default.
+default = ["std", "report-json"]
+
+# Minimal std passthrough (propagate to vm_report so it can enable std when linked from the CLI)
+std = ["vm_report/std"]
+
+# Reporting frontends (map 1:1 to vm_report features; pull serde only for JSON path)
+report-json = ["vm_report/render_json", "dep:serde", "dep:serde_json"]
+report-html = ["vm_report/render_html"]
+
+# Frontier support toggles (vm_pipeline controls the step; vm_report has no extra frontier feature)
+frontier = ["vm_pipeline/frontier"]
+
+[dependencies]
+vm_pipeline = { path = "../vm_pipeline" }
+vm_io       = { path = "../vm_io" }
+vm_report   = { path = "../vm_report", default-features = false }
+
+clap = { version = "4", features = ["derive"], default-features = false }
+
+# Optional pretty/JSON printing for CLI flags
+serde      = { version = "1", features = ["derive"], optional = true, default-features = false }
+serde_json = { version = "1", optional = true }
+
+# Optional progress UI; keep off by default to avoid nondeterministic terminal probing
+indicatif  = { version = "0.17", optional = true, default-features = false }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

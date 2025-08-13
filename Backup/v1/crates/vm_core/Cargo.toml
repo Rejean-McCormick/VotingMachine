@@ -1,0 +1,27 @@
+# crates/vm_core/Cargo.toml
+
+[package]
+name = "vm_core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.0"            # align with workspace rust-toolchain pin
+license = "Apache-2.0 OR MIT"
+description = "Core types, VM-VAR domains, rounding, and deterministic RNG for the VM engine."
+
+[lib]
+name = "vm_core"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+default = ["std"]
+std = []
+serde = ["dep:serde"]              # opt-in serde derives on core types
+
+[dependencies]
+serde       = { version = "1", features = ["derive"], optional = true, default-features = false }
+rand_core   = { version = "0.6", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+# (intentionally minimal; add only if unit tests require)
