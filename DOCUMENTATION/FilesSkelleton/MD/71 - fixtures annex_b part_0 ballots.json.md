@@ -1,41 +1,165 @@
-<!-- Converted from: 71 - fixtures annex_b part_0 ballots.json.docx on 2025-08-12T18:20:47.493257Z -->
+````md
+Pre-Coding Essentials (Component: fixtures/annex_b/part_0/ballots.json, Version/FormulaID: VM-ENGINE v0) — 71/89
+
+1) Goal & Success
+Goal: Ship a **canonical BallotTally fixture** for Part-0 that exactly matches the selected ballot type and the registry’s options/order, so TABULATE can run deterministically.
+Success: JSON validates; per-unit tallies are sane; option IDs line up with Registry; bytes canonicalize (UTF-8, LF, sorted keys) and produce stable hashes across OS/arch.
+
+2) Scope
+In scope: One tally dataset for **one** ballot type (plurality | approval | score | ranked_irv | ranked_condorcet).
+Out of scope: Parameters (separate fixture), algorithms, report wording.
+
+3) Inputs → Outputs
+Input file: `fixtures/annex_b/part_0/ballots.json`.
+Consumed by: LOAD → VALIDATE (tally sanity) → TABULATE (type-specific) → ALLOCATE/…  
+Output of TABULATE: `UnitScores` per unit (deterministic BTree order).
+
+4) Top-level Shape (common)
+```json
+{
+  "id": "TLY:part0",
+  "schema_version": "1",
+  "label": "Part 0 BallotTally",
+  "ballot_type": "approval | plurality | score | ranked_irv | ranked_condorcet",
+  "units": [ /* type-specific blocks (see §8) */ ]
+}
+````
+
+Rules:
+
+* `id` is stable; `ballot_type` must match Params VM-VAR-001.
+* Every `units[*].unit_id` must exist in the Registry.
+* For each unit: `valid_ballots = ballots_cast - invalid_or_blank` (must be ≥ 0).
+
+5. Variables (read by engine in later stages)
+
+* VM-VAR-001 ballot\_type (must match this file).
+* Score only: VM-VAR-002/003 scale\_min/max; VM-VAR-004 normalization.
+* IRV only: VM-VAR-006 exhaustion policy (engine uses reduce\_continuing\_denominator).
+* Condorcet only: VM-VAR-005 completion rule (Schulze/Minimax).
+* Gates note: Approval majority uses **approval rate** = approvals\_for\_change / **valid\_ballots** (fixed rule); VM-VAR-007 may widen **gate** denominators (not tabulation).
+
+6. Functions
+   N/A (fixture). Loader → typed structs; Validator → sanity checks; Tabulation → per family.
+
+7. How the engine consumes it
+
+* VALIDATE: per-unit tally sanity + option/ID cross-refs + score caps (from VM-VAR).
+* TABULATE: builds `UnitScores` from the natural tallies (no floats, no RNG).
+* Allocation & gates later use integers/ratios derived from these tallies.
+
+8. Type-Specific Unit Shapes (author exactly one family)
+
+**A) Plurality**
+
+```json
+{
+  "unit_id": "U:...",
+  "ballots_cast": 100,
+  "invalid_or_blank": 0,
+  "votes": { "OPT:A": 10, "OPT:B": 20, "OPT:C": 30, "OPT:D": 40 }
+}
+```
+
+Sanity: Σvotes ≤ valid\_ballots.
+
+**B) Approval**
+
+```json
+{
+  "unit_id": "U:...",
+  "ballots_cast": 100,
+  "invalid_or_blank": 0,
+  "approvals": { "OPT:Change": 55, "OPT:SQ": 60 }
+}
+```
+
+Sanity: for every option, approvals\_opt ≤ valid\_ballots. (Σapprovals may exceed valid\_ballots.)
+
+**C) Score**
+
+```json
+{
+  "unit_id": "U:...",
+  "ballots_cast": 100,
+  "invalid_or_blank": 0,
+  "ballots_counted": 100,                  // = valid_ballots when all counted
+  "score_sum": { "OPT:A": 210, "OPT:B": 340, "OPT:C": 450, "OPT:D": 560 },
+  "scale": { "min": 0, "max": 5 },         // mirrors VM-VAR-002/003
+  "normalization": "off | linear"          // mirrors VM-VAR-004
+}
+```
+
+Sanity: for each option, score\_sum\_opt ≤ ballots\_counted \* max. If ballots\_counted==0 then all sums must be 0.
+
+**D) Ranked IRV**
+*Compressed groups of identical rankings; order = top→down.*
+
+```json
+{
+  "unit_id": "U:...",
+  "ballots_cast": 100,
+  "invalid_or_blank": 0,
+  "ballots": [
+    { "ranking": ["OPT:A","OPT:C","OPT:B","OPT:D"], "count": 28 },
+    { "ranking": ["OPT:B","OPT:D"], "count": 27 },
+    { "ranking": ["OPT:C","OPT:B"], "count": 25 },
+    { "ranking": ["OPT:D"], "count": 20 }
+  ]
+}
+```
+
+Sanity: Σcount = valid\_ballots. Unknown/duplicate IDs in a ranking are invalid.
+
+**E) Ranked Condorcet**
+
+```json
+{
+  "unit_id": "U:...",
+  "ballots_cast": 100,
+  "invalid_or_blank": 0,
+  "ballots": [
+    { "ranking": ["OPT:A","OPT:C","OPT:B","OPT:D"], "count": 28 },
+    { "ranking": ["OPT:B","OPT:D"], "count": 27 },
+    { "ranking": ["OPT:C","OPT:B"], "count": 25 },
+    { "ranking": ["OPT:D"], "count": 20 }
+  ]
+}
+```
+
+Sanity: Σcount = valid\_ballots. Pairwise abstention for unranked pairs is implied.
+
+9. Determinism & Numeric Rules
+
+* Option keys must be **OptionId**s from Registry; missing options are treated as 0 in tabulators (but unknown extras are an error).
+* Engine iterates options by canonical order (order\_index, OptionId); stores tallies in BTreeMap.
+* Pure integers; no floats; round-half-even is used later only where spec allows.
+
+10. Edge Cases & Failure Policy
+
+* Negative or non-integer counts ⇒ schema/validate error.
+* Plurality: Σvotes > valid\_ballots ⇒ error.
+* Approval: any approvals\_opt > valid\_ballots ⇒ error; valid\_ballots=0 with non-zero approvals ⇒ error.
+* Score: caps violated (sum > ballots\_counted\*max) ⇒ error; missing scale/normalization fields ⇒ error.
+* Ranked: Σgroup counts ≠ valid\_ballots, unknown option IDs, or malformed rankings ⇒ error.
+
+11. Test Checklist (must pass)
+
+* Schema validation for the chosen `ballot_type`.
+* Registry alignment: every option key exists; no extras.
+* Tally sanity holds (per-family rules above).
+* Baselines reproduce Part-0 expectations:
+
+  * Approval + Sainte-Laguë with m=10 over {10,20,30,40} ⇒ seats 1/2/3/4.
+  * Plurality + WTA m=1 over {10,20,30,40} ⇒ winner D gets 100%.
+  * PR convergence (shares 34/33/33, m=7) ⇒ D’Hondt/Sainte-Laguë/LR all 3/2/2.
+* Canonicalization: shuffled key orders re-serialize to identical canonical bytes & SHA-256.
+
+12. Authoring Notes
+
+* Provide **all** options present in Registry; omit none (zeros allowed).
+* Keep IDs/strings NFC; prefer LF newlines; avoid trailing spaces.
+* If multiple ballot families are needed for different scenarios, ship separate files; this fixture is for **one** family only.
 
 ```
-Lean pre-coding sheet — 71/89
-Component: fixtures/annex_b/part_0/ballots.json (Part 0 fixture: BallotTally dataset)
- Version/FormulaID: Data fixture (not part of FID; FID covers rule primitives only).
-1) Goal & success
-Goal: Provide the canonical BallotTally for Part 0 in the exact shape required for each ballot type. Must align with Registry options/order and with ParameterSet variables.
-Success: Schema-valid; tally sanity holds per unit; deterministic option order respected; loads into pipeline and drives TABULATE correctly.
-2) Scope
-In scope: One BallotTally dataset with ID/label; per-unit tallies by ballot type (approval/plurality/score/ranked IRV/ranked Condorcet).
-Out of scope: Parameter values (separate fixture), allocation/aggregation logic, reporting prose.
-3) Inputs → outputs
-Input artifact: fixtures/annex_b/part_0/ballots.json (BallotTally).
-Used by pipeline: Feeds TABULATE (step 2) after VALIDATE; then flows into allocation/aggregation.
-4) Entities/Tables (minimal)
-5) Variables (only ones used here)
-6) Functions (signatures only)
-N/A (fixture only).
-7) Algorithm outline (how it’s consumed)
-VALIDATE checks tally sanity per unit: Σ(valid option tallies) + invalid_or_blank ≤ ballots_cast.
-TABULATE interprets shape per VM-VAR-001: plurality→vote counts; approval→approval counts; score→score sums (with scale/normalization context); IRV→round logs with exhaustion; Condorcet→pairwise from rankings.
-Gate denominators: approval gate is fixed to approval rate = approvals_for_change / valid_ballots (not approvals share). Others use support/valid ballots unless VM-VAR-007=on (valid+blank for gates only).
-8) Fixture shapes (must match exactly) — per Annex B Part 0
-Approval: per Unit: ballots_cast, invalid_or_blank, approvals { Option → count }.
-Plurality: per Unit: ballots_cast, invalid_or_blank, votes { Option → count }.
-Score: per Unit: ballots_cast, invalid_or_blank, score_sum { Option → sum }, ballots_counted; plus scale (VM-VAR-002..003) and normalization (VM-VAR-004).
-Ranked IRV: rounds[{ ranking[], count }]; exhaustion policy is reduce_continuing_denominator (VM-VAR-006).
-Ranked Condorcet: ballots[{ ranking[], count }]; completion rule per VM-VAR-005.
-9) State flow (very short)
-Loaded at LOAD; validated at VALIDATE; consumed by TABULATE to produce UnitScores, which then feed allocation/aggregation.
-10) Determinism & numeric rules
-Stable option order (by Option.order_index) and sorted JSON keys; counts are integers; presentation rounding occurs only in reports (one decimal).
-Approval gate denominator remains approval rate; internal comparisons use round half to even.
-11) Edge cases & failure policy
-Mismatch with registry options/order; negative counts; sum tallies > ballots_cast; missing scale/normalization for score; malformed IRV rounds or Condorcet rankings → VALIDATE error; run goes down Invalid path.
-WTA interplay: if later allocation_method=winner_take_all, ensure involved units have magnitude=1 (checked elsewhere but affects acceptance).
-12) Test checklist (must pass)
-Schema validates for the selected ballot_type; tally sanity passes in all units.
-Baseline 6A cases reproduce expected allocations (PR 1–2–3–4; WTA winner D; LR/D’Hondt/Sainte-Laguë → 3–2–2).
 ```

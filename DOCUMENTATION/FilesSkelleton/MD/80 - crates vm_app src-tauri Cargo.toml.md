@@ -1,36 +1,112 @@
-<!-- Converted from: 80 - crates vm_app src-tauri Cargo.toml.docx on 2025-08-12T18:20:47.725862Z -->
+````md
+Perfect Skeleton Sheet — crates/vm_app/src-tauri/Cargo.toml — 80/89
+(Aligned with VM-ENGINE v0 offline/determinism rules)
 
-```toml
-Lean pre-coding sheet — 80/89
-Component: crates/vm_app/src-tauri/Cargo.toml (Tauri backend manifest)
- Version/FormulaID: VM-ENGINE v0
-1) Goal & success
-Goal: Define the Tauri backend crate manifest for the desktop app; pin deps; respect offline/determinism rules; target Win/macOS/Linux (x86-64/arm64).
-Success: cargo build -p vm_app/src-tauri --locked succeeds on all targets; runtime has no network/telemetry; assets (fonts/styles/tiles) are bundled.
+1) Goal & Success
+Goal: Manifest for the Tauri desktop backend. Pinned, offline, deterministic; bundles local assets; targets Win/macOS/Linux (x86-64/arm64).
+Success: `cargo build -p vm_app/src-tauri --locked` succeeds on supported targets; runtime has no telemetry/network; fonts/styles/tiles are local.
+
 2) Scope
-In: [package] meta; [dependencies] (tauri + app crates); [features] passthrough (e.g., report-html, frontier); profiles/determinism hints.
-Out: UI build (vite/npm), map assets, filesystem policy (lives in tauri.conf.json), app Rust code (src-tauri/src/main.rs). Security posture and CI belong to Doc 3B.
-3) Inputs → outputs
-Inputs: Workspace toolchain pin; Cargo.lock; local UI bundle under ui/; MapLibre assets (tiles/styles) packaged.
-Outputs: Desktop backend binary packaged by Tauri; no external asset fetch at runtime.
+In: [package], [dependencies], [build-dependencies], [features], deterministic [profile]s; optional target-gated deps.  
+Out: UI build (vite/npm), map assets, security policy (lives in `tauri.conf.json`), app Rust code.
+
+3) Inputs → Outputs
+Inputs: Workspace toolchain + lockfile; UI bundle under `ui/`; MapLibre tiles/styles (local).  
+Outputs: Desktop backend binary packaged by Tauri; emits canonical JSON artifacts only (via downstream crates).
+
 4) Entities/Tables (minimal)
+N/A (manifest only).
+
 5) Variables (only ones used here)
-6) Functions (signatures only)
-N/A (manifest).
-7) Algorithm outline (what the manifest enforces)
-Pin Rust toolchain and crate versions; --locked builds only.
-Depend on tauri and internal crates (vm_report, vm_core, etc.) with features gated.
-Ensure offline runtime: no telemetry, no network; bundle fonts/styles/tiles.
-Target Win/macOS/Linux, x86-64/arm64 (CI matrix will enforce).
-8) State flow (very short)
-Manifest → compile backend → Tauri packages app with local assets. No pipeline semantics here; adheres to platform/offline rules used by reports.
-9) Determinism & numeric rules
-Canonical serialization and hashing rules apply to artifacts the app emits; manifest itself must not introduce nondeterminism (no build-time net, fixed versions, stable ordering).
-10) Edge cases & failure policy
-Build scripts or deps that attempt network access under --locked → fail the build (policy).
-Filesystem scope and shell commands are restricted by Tauri config (security posture); treat violations as packaging errors, not code paths.
-11) Test checklist (must pass)
-cargo build -p vm_app/src-tauri --locked OK on Windows/macOS/Ubuntu; x86-64 and arm64.
-Runtime checks: no telemetry/network; fonts/styles/tiles are local.
-Changing critical math/serialization deps triggers determinism re-cert (6C-020).
+Feature flags (pass-through):
+- `frontier` → enables frontier map support (maps to downstream crates).
+- `report-html` → enables HTML renderer in reporting.
+
+6) Functions
+(Manifest only.)
+
+7) Recommended Cargo.toml (template)
+```toml
+[package]
+name = "vm_app_tauri"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Tauri backend for the VM Engine desktop app (offline, deterministic)."
+
+# Use resolver v2 for correct feature unification
+resolver = "2"
+
+# --- Binaries ---
+[[bin]]
+name = "vm-app"
+path = "src/main.rs"
+
+# --- Features (pass-through toggles; backend remains offline) ---
+[features]
+default = []
+frontier = ["vm_pipeline?/frontier", "vm_report?/frontier"]
+report-html = ["vm_report?/render-html"]
+
+# --- Dependencies ---
+[dependencies]
+# Prefer workspace-pinned versions for determinism.
+tauri = { workspace = true, features = ["fs-all", "dialog-all", "shell-open"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# Internal crates (paths or workspace deps)
+vm_core = { workspace = true }
+vm_io = { workspace = true }
+vm_algo = { workspace = true }
+vm_pipeline = { workspace = true, optional = true }
+vm_report = { workspace = true, optional = true }
+
+# If the workspace does not define these deps, replace `workspace = true`
+# with pinned versions or local paths, e.g.:
+# tauri = { version = "=1.5.12", features = ["fs-all","dialog-all","shell-open"] }
+# vm_pipeline = { path = "../../vm_pipeline", optional = true }
+
+# --- Build dependencies ---
+[build-dependencies]
+tauri-build = { workspace = true }
+
+# --- Target-specific hints (optional, purely local tooling) ---
+[target."cfg(windows)".dependencies]
+# winresource crate can be used if embedding icons locally (no network).
+# winresource = { workspace = true, optional = true }
+
+# --- Deterministic profiles ---
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+panic = "abort"
+````
+
+8. State Flow
+   This manifest compiles the backend; Tauri packages the app with **local** assets. All pipeline/report logic stays in internal crates; no network calls.
+
+9. Determinism & Numeric Rules
+
+* Builds with `--locked`; all external versions pinned via workspace.
+* No build-time network access (fail fast if any dep tries).
+* Artifacts produced via downstream crates use canonical JSON (UTF-8, sorted keys, LF, UTC).
+
+10. Edge Cases & Failure Policy
+
+* Missing UI bundle or tiles: backend still compiles; packaging step will fail clearly (by design).
+* Feature combos are pass-through; if `frontier` is enabled without adjacency data, downstream simply omits mapping (no net).
+* Any dependency that attempts network access under `--locked` must fail the build.
+
+11. Test Checklist (must pass)
+
+* `cargo build -p vm_app/src-tauri --locked` on Windows/macOS/Linux, x86-64/arm64.
+* Runtime: no telemetry/network; fonts/styles/tiles loaded from the app bundle.
+* Changing serialization/math deps triggers re-certification per determinism policy.
+
+```
 ```

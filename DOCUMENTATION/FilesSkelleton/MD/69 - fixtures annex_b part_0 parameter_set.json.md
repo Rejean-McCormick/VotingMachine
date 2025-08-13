@@ -1,39 +1,90 @@
-<!-- Converted from: 69 - fixtures annex_b part_0 parameter_set.json.docx on 2025-08-12T18:20:47.425061Z -->
+````md
+Pre-Coding Essentials (Component: fixtures/annex_b/part_0/parameter_set.json, Version/FormulaID: VM-ENGINE v0) — 69/89
+
+1) Goal & Success
+Goal: Provide the canonical Part-0 ParameterSet fixture (a frozen VM-VAR map) that drives the engine’s behavior in tests.
+Success: Loads under the Part-0 schema, produces byte-identical pipeline outputs across OS/arch when paired with the matching Registry/Tallies; JSON is canonicalizable (UTF-8, LF, sorted keys).
+
+2) Scope
+In scope: One JSON file defining engine variables (VM-VAR-###) and fixed defaults for Part-0 runs.
+Out of scope: Any run-specific inputs or external data; algorithm math; report rendering.
+
+3) Inputs → Outputs
+Input (path): `fixtures/annex_b/part_0/parameter_set.json`
+Output (loader): typed `Params` (with a stable `ParamSetId`) consumed by TABULATE/ALLOCATE/AGGREGATE/GATES.
+
+4) Entities/Tables (shape)
+JSON object (no extraneous fields):
+```json
+{
+  "id": "PS:part0",                 // stable, referenced in artifacts
+  "schema_version": "1",            // per Annex B Part 0
+  "variables": {
+    "VM-VAR-001": "approval",       // ballot_type
+    "VM-VAR-007": "off",            // include_blank_in_denominator
+    "VM-VAR-010": "proportional_favor_small",
+    "VM-VAR-011": "on",
+    "VM-VAR-012": 0,
+    "VM-VAR-020": 50,
+    "VM-VAR-021": 0,                // or integer % with scope sibling
+    "VM-VAR-021_scope": "frontier_only",
+    "VM-VAR-022": 55,
+    "VM-VAR-023": 55,
+    "VM-VAR-024": "off",
+    "VM-VAR-025": "off",
+    "VM-VAR-028": "residents_only",
+    "VM-VAR-030": "equal_unit",
+    "VM-VAR-031": "country",
+    "VM-VAR-032": "status_quo",
+    "VM-VAR-033": 0,
+    "VM-VAR-040": "none"
+  }
+}
+````
+
+(Values above are illustrative Part-0-style defaults; the fixture must choose a coherent set.)
+
+5. Variables (domains to enforce)
+
+* Ballot/Tabulation: **001** ∈ {plurality, approval, score, ranked\_irv, ranked\_condorcet}; **007** ∈ {on, off}.
+* Allocation: **010** ∈ {winner\_take\_all, proportional\_favor\_big, proportional\_favor\_small, largest\_remainder, mixed\_local\_correction}; **011** ∈ {on, off}; **012** ∈ integer % \[0..10].
+* Gates: **020** (quorum\_global\_pct) ∈ \[0..100]; **021** (per-unit quorum) ∈ \[0..100], with **021\_scope** ∈ {frontier\_only, frontier\_and\_family} if 021>0; **022**/**023** ∈ \[50..75]; **024**, **025** ∈ {on, off}.
+* Rolls/Weighting/Aggregation: **028** ∈ {residents\_only, residents\_plus\_displaced, custom\:list}; **030** ∈ {equal\_unit, population\_baseline}; **031** = country (v1).
+* Frontier: **040** ∈ {none, sliding\_scale, autonomy\_ladder} (Part-0 typically “none”).
+* Ties/RNG: **032** ∈ {status\_quo, deterministic, random}; **033** ∈ integer ≥ 0 (used only if 032=random).
+
+6. Functions
+   N/A (fixture). Engine loads via vm\_io → `Params`.
+
+7. Algorithm Outline (how the engine consumes values)
+
+* Ballot & denominators: **001** selects tabulation; approval gate always uses approval rate = approvals\_for\_change / valid\_ballots; **007** can widen **gate** denominators only.
+* Allocation: **010** picks family (WTA/PR/LR/MMP); **012** filters below-threshold options; **011** must be “on” in v1 (use unit magnitudes).
+* Aggregation: **030** chooses weighting; **031** fixes aggregate level to country.
+* Gates: quorum **020/021**, majority **022**, regional majority **023**, double-majority **024**, symmetry **025**; scope **021\_scope** affects family inclusion/exclusion (not tabulation).
+
+8. State Flow
+   LOAD (parse & validate) → VALIDATE (domain & coherence) → consumed in TABULATE → ALLOCATE → AGGREGATE → APPLY\_DECISION\_RULES → (optional) MAP\_FRONTIER → …
+
+9. Determinism & Numeric Rules
+
+* Integers/rationals only; half-even rounding used only where the spec allows (gates/reporting).
+* Canonicalization: JSON must serialize deterministically (sorted keys, UTF-8, LF) for hashing.
+
+10. Edge Cases & Failure Policy
+
+* Unknown VM-VAR key or out-of-domain value ⇒ validation issue.
+* **010=winner\_take\_all** with any Unit.magnitude≠1 ⇒ configuration error.
+* **030=population\_baseline** without baselines in Registry ⇒ validation error.
+* **024=on** with unresolved/empty family (when required) ⇒ validation error.
+* **032=random** without a numeric **033** seed ⇒ validation error (no OS RNG fallback).
+
+11. Test Checklist (must pass)
+
+* Schema validation passes; keys/values in range; no extra fields.
+* Loading this PS with Part-0 Registry/Tallies yields identical Result/RunRecord hashes across OS (canonical JSON).
+* Approval ballot renders the mandatory “approval-rate denominator” sentence in reports.
+* Threshold & gate cutoffs behave with ≥ semantics (e.g., 55.0% vs 55 passes).
 
 ```
-Lean pre-coding sheet — 69/89
-Component: fixtures/annex_b/part_0/parameter_set.json (Part 0 fixtures)
- Version/FormulaID: per Annex A; does not encode run-time values (FID covers rule primitives, not specific runs).
-1) Goal & success
-Goal: Provide the canonical ParameterSet fixture for Part 0 tests: a frozen map of VM-VAR-### → value used by the engine; acts as the single source of truth for thresholds, allocation family, weighting, and operational defaults.
-Success: Loads under the Part 0 schema and yields deterministic runs when combined with the matching Registry/Tallies (JSON canonicalization, sorted keys, LF, UTC).
-2) Scope
-In scope: Structure of one Part 0 ParameterSet fixture; allowed variables and default domains.
-Out of scope: Engine FID contents (covered by Annex A); algorithm details (Doc 4); report rendering (Doc 7).
-3) Inputs → outputs
-Inputs (loader): JSON file at fixtures/annex_b/part_0/parameter_set.json.
-Outputs: In LoadedContext, a frozen ParameterSet (PS:… id, vars map); values feed TABULATE/ALLOCATE/AGGREGATE/GATES per Doc 4.
-4) Entities/Tables (minimal)
-5) Variables (used here)
-Use only variables defined in Doc 2; percentages are integer %. Baseline set for Part 0 small tests typically includes:
- 001, 007, 010–012, 020–025, 030–031, 040 (if frontier later), 050–052 (ties/RNG when needed). Defaults and domains per tables.
-6) Functions (signatures only)
-N/A (fixture only).
-7) Algorithm outline (how values are consumed)
-Ballot & denominators: VM-VAR-001 selects tabulation family; approval gate uses approval rate = approvals_for_change / valid_ballots (fixed). VM-VAR-007 may widen gate denominator only.
-Allocation: VM-VAR-010 selects WTA/PR/LR/MMP; VM-VAR-012 PR entry threshold; constraint: if WTA then Unit.magnitude=1.
-Aggregation: VM-VAR-030 weighting (population_baseline vs equal_unit); VM-VAR-031 aggregate level = country.
-Gates: quorum/majority/double-majority/symmetry: VM-VAR-020..025.
-8) State flow (very short)
-Use in pipeline: Loaded at LOAD, validated at VALIDATE, applied through TABULATE → … → LABEL exactly per step order.
-9) Determinism & numeric rules
-Integers/rationals; no float equality. Presentation rounding only in reports; internal comparisons use round half to even.
-Canonicalization: UTF-8, sorted JSON keys, LF, UTC timestamps (affects later hashing).
-10) Edge cases & failure policy
-Reject if any VM-VAR is unknown, out of domain, or violates dependencies (e.g., WTA with m>1; population weighting without baselines; DM on with bad family mode).
-Approvals/score/ranked: ensure downstream rules read the correct natural denominators; gates use the fixed approval rule.
-11) Test checklist (must pass)
-Schema-validate as a ParameterSet; all ids/values in range.
-Engine run using this PS with Part 0 tallies/registry yields identical Result/RunRecord across OS/arch (determinism).
-Approval gate sentence enforced when ballot_type=approval.
 ```

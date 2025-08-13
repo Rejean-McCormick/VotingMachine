@@ -1,71 +1,145 @@
-<!-- Converted from: 18 - schemas result.schema.json, Version FormulaID VM-ENGINE v0).docx on 2025-08-12T18:20:46.005062Z -->
 
 ```
 Pre-Coding Essentials (Component: schemas/result.schema.json, Version/FormulaID: VM-ENGINE v0) — 18/89
+
 1) Goal & Success
-Goal: JSON Schema for Result—the computed outcome bundle for a run.
-Success: Validates RES: ID; carries input IDs (REG, TLY, PS); includes per-unit blocks, aggregates, legitimacy gates, and the final label (Decisive|Marginal|Invalid). Shapes/fields align with Docs 1/4/5/7; integers/ratios only (percentages are presentation-only).
+Goal: JSON Schema for the canonical Result output produced by the engine.
+Success: Requires `result_id` and `formula_id`; accepts only the minimal, normalized shape defined in Doc 1 (summary + per-unit results), with shares as JSON numbers and arrays ordered deterministically. No input references or tie logs appear in Result. :contentReference[oaicite:3]{index=3} :contentReference[oaicite:4]{index=4}
+
 2) Scope
-In scope: Top-level identifiers, per-unit summaries (scores/turnout/allocation/flags), aggregates by level, gate outcomes as exact ratios, final label (+reason), optional frontier_map_id, optional tie_log.
-Out of scope: Frontier geometry/content (that’s FrontierMap), provenance timestamps (that’s RunRecord), rendering/rounding (Doc 7 handles presentation).
+In scope (normative for this schema):
+- Root: { schema_version, result_id, formula_id, engine_version, created_at, summary{}, units[] }.
+- Unit result: { unit_id, allocations[], label }.
+- Allocation: { option_id, votes, share, (optional) seats/*family-specific deriveds*/ }.
+Out of scope (captured elsewhere):
+- Inputs/digests, RNG/tie details → **RunRecord**. :contentReference[oaicite:5]{index=5}
+- Frontier diagnostics → **FrontierMap** (separate artifact). :contentReference[oaicite:6]{index=6}
+
 3) Inputs → Outputs
-Inputs (by reference): reg_id (REG:...), ballot_tally_id (TLY:...), parameter_set_id (PS:...).
-Output: A single strict Result JSON object; report consumes it (plus optional FrontierMap and RunRecord).
+Inputs: (none; this is an output artifact)
+Outputs: A strict **Result** JSON used by reports and verification; `result_id` is sha256 of canonical payload; `formula_id` is FID of the Normative Manifest. :contentReference[oaicite:7]{index=7} :contentReference[oaicite:8]{index=8}
+
 4) Entities/Fields (schema shape to encode)
-Root
-id (required, string) — RES:<short-hash>
-reg_id (required, string) — REG:<...>
-ballot_tally_id (required, string) — TLY:<...>
-parameter_set_id (required, string) — PS:<...>
-label (required, enum) — Decisive | Marginal | Invalid
-label_reason (optional, string) — short rationale used in report
-aggregates (required, object) — by level
-units (required, array) — list of UnitBlock
-gates (required, object) — quorum / majority / double-majority / symmetry outcomes
-tie_log (optional, array) — entries from tie resolution (if any)
-frontier_map_id (optional, string) — FR:<...> when mapping run produced one.
-UnitBlock (array items)
-unit_id (required, string) — U:REG:...
-turnout (required, object) — { ballots_cast:int≥0, invalid_or_blank:int≥0, valid_ballots:int≥0 }
-scores (required for non-ranked inputs) — map OPT:... → int≥0 (plurality=votes, approval=approvals, score=score_sum)
-allocation (required, object) — map OPT:... → int (seats) or power_pct:int (WTA 100)
-flags (required, object) — { unit_data_ok:bool, unit_quorum_met:bool, unit_pr_threshold_met:bool, protected_override_used:bool, mediation_flagged:bool }.
-Aggregates (by level)
-Object keyed by level (country, region, district used), each with:
-totals — map OPT:... → int (seats or votes as applicable)
-shares — map OPT:... → ratio{num:int, den:int}
-turnout — { ballots_cast:int, invalid_or_blank:int, valid_ballots:int, eligible_roll:int }
-weighting_method — echo of VM-VAR-030 for clarity.
-Gates (legitimacy outcomes)
-quorum — { observed:ratio, threshold_pct:int, pass:bool }
-majority — { observed:ratio, threshold_pct:int, pass:bool }
-double_majority — { national: {observed:ratio, threshold_pct:int, pass:bool}, regional: {observed:ratio, threshold_pct:int, pass:bool}, pass:bool }
-symmetry — { pass:bool }
-Ratios are integers only; reporting does the 1-decimal rendering. Approval gate’s observed value is the approval rate (approvals_for_change / valid_ballots).
-5) Variables (validators & enums to embed in the schema)
+Root object
+- schema_version (string, required) — e.g., "1.x".
+- result_id (string, required) — "RES:" + 64-hex (lowercase). :contentReference[oaicite:9]{index=9}
+- formula_id (string, required) — 64-hex FID (see Doc 1A §2.3). :contentReference[oaicite:10]{index=10}
+- engine_version (string, required) — "vX.Y.Z". :contentReference[oaicite:11]{index=11}
+- created_at (string, required) — RFC3339 UTC. :contentReference[oaicite:12]{index=12}
+- summary (object, required)
+  - valid_ballots_total (integer ≥ 0, required)
+  - invalid_ballots_total (integer ≥ 0, required)
+  - turnout_rate (number ≥ 0, required)  // engine precision; reporter rounds. :contentReference[oaicite:13]{index=13}
+- units (array, required, minItems ≥ 1) — ordered by ascending unit_id. :contentReference[oaicite:14]{index=14}
+
+Unit result object (items of units[])
+- unit_id (string, required) — FK → Registry.units.unit_id. :contentReference[oaicite:15]{index=15}
+- allocations (array, required, minItems ≥ 1) — ordered by Registry `order_index`. :contentReference[oaicite:16]{index=16}
+  Allocation item:
+  - option_id (string, required) — FK → Registry.options.option_id
+  - votes (integer ≥ 0, required)
+  - share (number in [0,1], required)       // JSON number, not {num,den}. :contentReference[oaicite:17]{index=17} :contentReference[oaicite:18]{index=18}
+  - seats (integer ≥ 0, optional)            // only if relevant to the algorithm family. :contentReference[oaicite:19]{index=19}
+- label (string, required) — "Decisive" | "Marginal" | "Invalid" (presentation label). :contentReference[oaicite:20]{index=20}
+
+Notes (informative)
+- Do **not** include `reg_id`, `ballot_tally_id`, `parameter_set_id`; those are recorded in **RunRecord.inputs*** as sha256 digests, not in Result. :contentReference[oaicite:21]{index=21}
+- Do **not** include `tie_log`; **RunRecord.ties[]** is the authoritative location for tie events. :contentReference[oaicite:22]{index=22}
+- Arrays follow Doc 1A ordering rules: units ↑ unit_id; options ↑ order_index (tie by option_id). :contentReference[oaicite:23]{index=23}
+
+5) Variables
+None (schema-only component).
+
 6) Functions
-(Schema only.)
-7) Algorithm Outline (schema authoring steps)
-$schema = JSON Schema 2020-12; set $id.
-$defs: ResId, RegId, TlyId, PsId, UnitId, OptId, Ratio, UnitBlock, GateOutcome.
-Root object: required = ["id","reg_id","ballot_tally_id","parameter_set_id","label","aggregates","units","gates"], additionalProperties:false.
-UnitBlock: strict object; integers ≥0; allocation either seats map or WTA power (choose one via oneOf).
-Aggregates: require turnout and either totals or shares (allow both); ratios encoded as {num,den} ints.
-Gates: encode shapes above; require integers for thresholds; ratios only.
-Optional tie_log array item schema: { context:string, candidates:array<OPT>, policy:enum, order_or_seed:string, winner:OPT }. (Produced only when ties block decisions.)
-Non-normative $comment: arrays should be sorted (Units by unit_id; Options by order_index then id)—enforced in code for determinism.
+None (schema-only component).
+
+7) Schema authoring outline (JSON Schema Draft 2020-12)
+- $schema: "https://json-schema.org/draft/2020-12/schema"
+- $id: "https://…/schemas/result.schema.json"
+- $defs:
+  * id64hex: { "type":"string", "pattern":"^[0-9a-f]{64}$" }
+  * res_id: { "type":"string", "pattern":"^RES:[0-9a-f]{64}$" }
+  * unit_allocation: {
+      "type":"object",
+      "required":["option_id","votes","share"],
+      "properties":{
+        "option_id":{"type":"string"},
+        "votes":{"type":"integer","minimum":0},
+        "share":{"type":"number","minimum":0,"maximum":1},
+        "seats":{"type":"integer","minimum":0}
+      },
+      "additionalProperties":false
+    }
+  * unit_result: {
+      "type":"object",
+      "required":["unit_id","allocations","label"],
+      "properties":{
+        "unit_id":{"type":"string"},
+        "allocations":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/unit_allocation"}},
+        "label":{"enum":["Decisive","Marginal","Invalid"]}
+      },
+      "additionalProperties":false
+    }
+- Root:
+  {
+    "type":"object",
+    "required":["schema_version","result_id","formula_id","engine_version","created_at","summary","units"],
+    "properties":{
+      "schema_version":{"type":"string"},
+      "result_id":{"$ref":"#/$defs/res_id"},
+      "formula_id":{"$ref":"#/$defs/id64hex"},
+      "engine_version":{"type":"string"},
+      "created_at":{"type":"string","format":"date-time"},
+      "summary":{
+        "type":"object",
+        "required":["valid_ballots_total","invalid_ballots_total","turnout_rate"],
+        "properties":{
+          "valid_ballots_total":{"type":"integer","minimum":0},
+          "invalid_ballots_total":{"type":"integer","minimum":0},
+          "turnout_rate":{"type":"number","minimum":0}
+        },
+        "additionalProperties":false
+      },
+      "units":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/unit_result"}}
+    },
+    "additionalProperties":false,
+    "$comment":"Ordering contract (informative): units ordered by ascending unit_id; allocations reflect Registry option order (order_index, then option_id)."
+  }
+
 8) State Flow
-Populated by BUILD_RESULT after LABEL step; then RunRecord is built pointing to it. Reports read Result (+ optional FrontierMap, RunRecord).
-9) Determinism & Numeric Rules
-Integers & ratios only; no floats inside Result.
-Percentages are derived at report time; round half to even only at defined comparison points; report shows one decimal.
-Ordering is stable: Units by Unit ID, Options by order_index then ID; canonical JSON (UTF-8, LF, sorted keys).
+Produced by the engine after allocation/labeling and canonicalization; `result_id` computed then; **RunRecord** is built referencing this Result and capturing inputs, NM digest, variables, and ties. :contentReference[oaicite:24]{index=24} :contentReference[oaicite:25]{index=25}
+
+9) Determinism & Numeric Rules (informative)
+- Canonical JSON: UTF-8, LF, **sorted keys**; arrays ordered per Doc 1A §5; numbers emitted as JSON numbers (engine precision). :contentReference[oaicite:26]{index=26}
+- Shares are JSON numbers in \[0,1\]; reporters handle rounding for display. :contentReference[oaicite:27]{index=27}
+
 10) Edge Cases & Failure Policy
-Validation failed earlier ⇒ label="Invalid", gates panel contains N/A/Fail as per report rules; frontier omitted.
-Gates failed ⇒ label="Invalid"; frontier omitted.
-IRV/Condorcet: carry round logs/pairwise only via audit/TieLog if used; continuing-denominator policy is fixed.
-WTA: allocation uses 100% power for the winner; schema must allow either seat map or power%.
+Schema rejects:
+- Missing required fields; unknown fields (strict mode); wrong ID formats.
+Engine/test validation (outside schema) rejects:
+- FK violations against Registry; misordered arrays; mismatched FID or hashes during verification. :contentReference[oaicite:28]{index=28}
+
 11) Test Checklist (must pass)
-Minimal Decisive result with one unit, Sainte-Laguë seats in canonical order; label present.
-aggregates.turnout.valid_ballots = ballots_cast - invalid_or_blank
+Happy path (thin result, one unit):
+{
+  "schema_version":"1.x",
+  "result_id":"RES:<64hex>",
+  "formula_id":"<64hex>",
+  "engine_version":"v1.0.0",
+  "created_at":"2025-08-12T14:00:00Z",
+  "summary":{"valid_ballots_total":12345,"invalid_ballots_total":67,"turnout_rate":0.95},
+  "units":[
+    {"unit_id":"U-001","allocations":[
+      {"option_id":"O-A1","votes":6000,"share":0.486},
+      {"option_id":"O-B1","votes":5000,"share":0.405}
+    ],"label":"Decisive"}
+  ]
+}
+→ pass (ordering verified in tests; inputs & ties are checked via RunRecord). :contentReference[oaicite:29]{index=29} :contentReference[oaicite:30]{index=30}
 ```
+
+### Other fixes I applied (beyond your notes)
+
+* Removed root-level `frontier_map_id` (FrontierMap is a separate optional artifact; not referenced from Result).&#x20;
+* Ensured **snake\_case** across fields and kept minimal required set (summary + units) exactly as Doc 1 shows.&#x20;
+

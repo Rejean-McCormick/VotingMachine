@@ -1,32 +1,105 @@
-<!-- Converted from: 70 - fixtures annex_b part_0 division_registry.json.docx on 2025-08-12T18:20:47.459474Z -->
+````md
+Pre-Coding Essentials (Component: fixtures/annex_b/part_0/division_registry.json, Version/FormulaID: VM-ENGINE v0) — 70/89
+
+1) Goal & Success
+Goal: Ship the canonical DivisionRegistry fixture for Part-0 tests: a versioned, single-root unit tree (plus optional adjacency) with required provenance and baseline fields.
+Success: Parses & schema-validates; exactly one root, no cycles; magnitudes/rolls in range; adjacency references known units only; bytes are canonicalizable (UTF-8, LF, sorted keys) so downstream hashes are stable across OS/arch.
+
+2) Scope
+In scope: Registry identity & provenance; Units[] (tree, magnitudes, rolls, optional flags/tags); optional Adjacency[] for frontier/contiguity tests.
+Out of scope: Options and tallies (separate fixtures), reporting content, algorithm math.
+
+3) Inputs → Outputs
+Input: `fixtures/annex_b/part_0/division_registry.json` (local file).
+Output (LOAD stage): `DivisionRegistry` + `Units` + optional `Adjacency` inside `LoadedContext`. Used by VALIDATE (tree, magnitudes, data presence) and by later gates/frontier steps.
+
+4) Entities/Tables (shape)
+Canonical JSON object (no extra fields):
+```json
+{
+  "id": "REG:part0",
+  "schema_version": "1",
+  "provenance": {
+    "source": "string",              // publisher or dataset name
+    "published_date": "YYYY-MM-DD"   // ISO date
+  },
+  "units": [
+    {
+      "unit_id": "U:root",           // unique, canonical string
+      "parent_id": null,             // null for the single root
+      "name": "Country",
+      "magnitude": 1,                // u32 ≥ 1
+      "eligible_roll": 12345,        // u64 ≥ 0
+      "protected_area": false,       // optional, default false
+      "tags": []                     // optional array<string>
+    }
+    // children: parent_id = some "U:*"
+  ],
+  "adjacency": [
+    {
+      "a": "U:child1",
+      "b": "U:child2",
+      "type": "land"                 // enum: land | bridge | water
+      // optional corridor flag if needed by tests:
+      // "corridor": false
+    }
+  ]
+}
+````
+
+5. Variables (fields & domains enforced by schema/validate)
+
+* `id`: `RegId` string; stable across fixtures.
+* `schema_version`: "1".
+* `provenance.source`: non-empty string; `provenance.published_date`: ISO date.
+* `units[*].unit_id`: unique; exactly one `parent_id=null` (root); others reference existing unit IDs.
+* `units[*].magnitude` ≥ 1 (WTA configs elsewhere also require m=1).
+* `units[*].eligible_roll` ≥ 0.
+* `units[*].protected_area`: optional bool (default false).
+* `adjacency[*].a`/`b`: existing unit IDs; `type` ∈ {"land","bridge","water"}; optional `corridor` bool (default false).
+
+6. Functions
+   N/A (fixture). Engine loads this via vm\_io → `loader::load_registry()` and validates via pipeline VALIDATE.
+
+7. Algorithm Outline (how the engine consumes it)
+
+* LOAD: parse JSON → typed structs; normalize Units by `UnitId` (stable order).
+* VALIDATE:
+
+  * Tree checks: exactly one root, no cycles.
+  * Magnitudes: all ≥ 1.
+  * Rolls: `eligible_roll` present and ≥ ballots\_cast when quorum enabled (cross-checked later with tallies).
+  * Adjacency: all endpoints exist; `type` in domain.
+  * If weighting method = `population_baseline`, baselines must be present (not typical for Part-0 unless tests require).
+* Later:
+
+  * Gates use `eligible_roll` to compute turnout.
+  * Frontier (if enabled in other tests) uses `adjacency` and `protected_area`.
+
+8. State Flow
+   `division_registry.json` → LOAD → VALIDATE → (if pass) TABULATE … GATES/FRONTIER. On validation fail, run is marked **Invalid**; pipeline still packages Result/RunRecord with reasons.
+
+9. Determinism & Numeric Rules
+
+* Engine will re-iterate Units by `UnitId` and use BTreeMaps for stable ordering.
+* JSON must be canonicalizable (UTF-8, LF, sorted keys); hashing is over canonical bytes.
+* All counts are integers; no floating-point inside the registry.
+
+10. Edge Cases & Failure Policy
+
+* Multiple roots / no root / cycle ⇒ validation error.
+* `magnitude < 1` ⇒ error.
+* Unknown `adjacency.type` or edges referencing unknown units ⇒ error.
+* Quorum enabled but missing/zero `eligible_roll` where ballots exist ⇒ validation error.
+* If frontier tests are run: missing adjacency while frontier mode demands contiguity ⇒ validation error in that scenario.
+
+11. Test Checklist (must pass)
+
+* Schema validation succeeds; no additionalProperties.
+* Tree invariants: single root, acyclic; all `parent_id` valid.
+* Magnitudes ≥ 1 everywhere.
+* Adjacency endpoints exist; `type` ∈ {land, bridge, water}.
+* Canonicalization: serializing this JSON (after key shuffling) yields identical canonical bytes & SHA-256 across OS/arch.
 
 ```
-Lean pre-coding sheet — 70/89
-Component: fixtures/annex_b/part_0/division_registry.json (Part 0 fixtures)
- Version/FormulaID: Registry content is data (not in FID); FID covers rule primitives only.
-1) Goal & success
-Goal: Provide the canonical DivisionRegistry for Part 0: a versioned unit tree (plus optional adjacency) with required provenance and baseline fields.
-Success: Loads and validates; exactly one root, no cycles; fields present and in-range; determinism preserved via canonical JSON (UTF-8, sorted keys, LF).
-2) Scope
-In scope: id, provenance{source,published_date}, Units[] with locked fields, optional **Adjacency[]`.
-Out of scope: Options and tallies (separate fixtures), report rendering.
-3) Inputs → outputs
-Input artifact: fixtures/annex_b/part_0/division_registry.json.
-Pipeline output usage: Appears in LoadedContext (Registry, Units, Adjacency) at LOAD; then checked at VALIDATE before any math.
-4) Entities/Tables (minimal)
-5) Variables (only ones used here)
-6) Functions (signatures only)
-N/A (fixture only).
-7) Algorithm outline (how it’s consumed)
-LOAD reads Registry (units+adjacency) into LoadedContext.
-VALIDATE enforces: tree with one root; magnitude≥1; roll/baseline requirements; adjacency type domain; WTA ⇒ magnitude=1.
-8) State flow (very short)
-Used at LOAD → VALIDATE; on success the pipeline proceeds; on failure, run is marked Invalid and later stages are skipped per rules.
-9) Determinism & numeric rules
-Ordering: stable orders (Units by Unit ID) before any hashing/serialization; JSON canonicalization (UTF-8, sorted keys, LF).
-Counts are integers; no float equality; presentation rounding occurs in reports, not here.
-10) Edge cases & failure policy
-Missing or multiple roots; cycles; magnitude<1; negative rolls; population weighting selected but missing/zero baselines; adjacency referencing unknown units or unknown type. Reject at VALIDATE with clear errors.
-11) Test checklist (must pass)
-Schema validates; hierarchy and magnitude constraints pass; if VM-VAR-030=population_baseline, all aggregated Units have positive baselines and a year. Determinism is indirect (same input ⇒
 ```

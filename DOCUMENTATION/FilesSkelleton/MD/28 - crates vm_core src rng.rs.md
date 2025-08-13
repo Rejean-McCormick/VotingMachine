@@ -1,79 +1,110 @@
-<!-- Converted from: 28 - crates vm_core src rng.rs, Version FormulaID VM-ENGINE v0).docx on 2025-08-12T18:20:46.242366Z -->
 
-```
-Pre-Coding Essentials (Component: crates/vm_core/src/rng.rs, Version/FormulaID: VM-ENGINE v0) — 28/89
-Goal & Success
+
+````
+Pre-Coding Essentials (Component: crates/vm_core/src/rng.rs, Version FormulaID VM-ENGINE v0) — 28/89
+
+1) Goal & Success
 Goal: Deterministic RNG utilities for tie resolution only, using a fixed, seeded stream cipher (ChaCha20).
-Success: With the same integer tie_seed and the same inputs, choices/shuffles are byte-identical across OS/arch; no reliance on OS entropy or time; API is minimal and safe.
-Scope
-In scope: Seed handling from VM-VAR-033 tie_seed (integer), ChaCha20 wrapper, uniform choice without modulo bias, deterministic shuffle (Fisher–Yates), reproducible u64/u128 streams, small log hook.
-Out of scope: Any non-tie randomness, parallel RNG (not permitted), OS RNG, time-based seeding.
-Inputs → Outputs
-Inputs: tie_seed (VM-VAR-033, integer ≥ 0) when tie_policy (VM-VAR-032) = random; candidate sets; optional domain bounds.
-Outputs: Indices/permutes/integers; optional compact trace (context label + picks) to be forwarded to TieLog (owned by pipeline).
-Entities/Tables (minimal)
-None.
-Variables
-VM-VAR-032 tie_policy ∈ {status_quo, deterministic, random} (default: status_quo) — RNG used only if = random.
-VM-VAR-033 tie_seed ∈ integers (≥ 0) (default: 0) — recorded in RunRecord/TieLog when used.
-Functions (signatures only)
-/// Opaque deterministic RNG for ties.
-pub struct TieRng(ChaCha20Rng);
+Success: With the same integer tie_seed (VM-VAR-052) and the same call sequence, choices/shuffles are byte-identical across OS/arch; no reliance on OS entropy or time; API is minimal and safe.
 
-/// Build from integer tie_seed; stable across platforms.
+2) Scope
+In scope: Seed handling from VM-VAR-052 (integer ≥ 0), ChaCha20 wrapper, uniform choice without modulo bias, deterministic shuffle (Fisher–Yates), reproducible u64/u128 streams, optional crumb for audit.
+Out of scope: Any non-tie randomness, parallel RNG, OS RNG, time-based seeding.
+
+3) Inputs → Outputs
+Inputs: `tie_seed` (u64) when `tie_policy` (VM-VAR-050) = Random; candidate slices; optional bounds.
+Outputs: Indices/permutes/integers; optional compact crumb (context + pick + word index) for the pipeline’s TieLog.
+
+4) Types (minimal)
+- `pub struct TieRng(ChaCha20Rng);`              // opaque
+- `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum RngError { EmptyDomain }`
+- `pub struct TieCrumb { pub ctx: SmolStr, pub pick: u32, pub word_index: u128 }`  // optional; pipeline aggregates
+
+5) Functions (signatures only)
+```rust
+/// Build from integer tie_seed (VM-VAR-052). Stable across platforms.
 pub fn tie_rng_from_seed(seed: u64) -> TieRng;
 
 impl TieRng {
-/// Next unbiased integer in [0, n) using rejection sampling.
-pub fn gen_range(&mut self, n: u64) -> u64;
+    /// Next unbiased integer in [0, n) via rejection sampling. Returns None if n == 0.
+    pub fn gen_range(&mut self, n: u64) -> Option<u64>;
 
-/// Choose index of winner from non-empty slice; error on empty.
-pub fn choose_index<T>(&mut self, slice: &[T]) -> Result<usize, RngError>;
+    /// Choose index of winner from slice; None on empty slice.
+    pub fn choose_index<T>(&mut self, slice: &[T]) -> Option<usize>;
 
-/// Deterministic in-place Fisher–Yates shuffle (stable given same seed).
-pub fn shuffle<T>(&mut self, xs: &mut [T]);
+    /// Deterministic in-place Fisher–Yates shuffle.
+    pub fn shuffle<T>(&mut self, xs: &mut [T]);
 
-/// Emit next u64 / u128 for audit or higher-level use.
-pub fn next_u64(&mut self) -> u64;
-pub fn next_u128(&mut self) -> u128;
+    /// Emit next u64 / u128 (u128 = concat of two u64 draws).
+    pub fn next_u64(&mut self) -> u64;
+    pub fn next_u128(&mut self) -> u128;
 
-/// Return how many 64-bit words have been consumed.
-pub fn words_consumed(&self) -> u128;
+    /// Return how many 64-bit words have been consumed.
+    pub fn words_consumed(&self) -> u128;
 
-/// Optional: record a tiny crumb for TieLog (context/candidates/pick).
-pub fn log_pick(&self, ctx: &str, pick: usize) -> TieCrumb;
+    /// Optional: build a tiny crumb for audit logs.
+    pub fn log_pick(&self, ctx: &str, pick: usize) -> TieCrumb;
 }
+````
 
-/// Small, serializable crumb (pipeline aggregates into TieLog).
-pub struct TieCrumb { pub ctx: SmolStr, pub pick: u32, pub word_index: u128 }
-Algorithm Outline (implementation plan)
-Seed handling
-Initialize RNG with ChaCha20Rng::seed_from_u64(tie_seed).
-Start counter at 0; bump by 1 per next_u64 (two bumps for next_u128).
-Unbiased range generation
-Rejection sampling: draw 64-bit x; compute zone = u64::MAX - (u64::MAX % n); if x < zone, return x % n; else redraw.
-Handles any n ∈ [1, 2^63]; reject n = 0.
-Choice & shuffle
-choose_index: error on empty slice; otherwise gen_range(len).
-shuffle: Fisher–Yates descending for i in (1..len).rev() with j = gen_range(i as u64 + 1).
-Audit/trace
-words_consumed returns monotonic count; TieCrumb stores context string, chosen index (u32 ok for list sizes), and the word index when decision was made.
-No parallelism
-Callers must serialize all tie resolutions in the deterministic order defined by the pipeline.
-State Flow
-Pipeline enters RESOLVE_TIES only when needed; it constructs TieRng from Params.tie_seed when Params.tie_policy = random; each tie resolution calls choose_index/gen_range in stable context order; crumbs (optional) are collected and written into the final TieLog in RunRecord/Result.
-Determinism & Numeric Rules
-Identical tie_seed ⇒ identical output sequence and crumbs.
-No floats; no OS RNG/time; no global mutable state.
-All consumers must keep a fixed call sequence (stable ordering from determinism module).
-Edge Cases & Failure Policy
-gen_range(0) or choose_index([]) ⇒ RngError::EmptyDomain.
-Extremely skewed n values are fine (rejection loops terminate quickly on average).
-Do not expose internal state beyond words_consumed (audit only).
-Test Checklist (must pass)
-Seed determinism: same u64 seed → identical sequences for next_u64, gen_range, shuffle; different seeds differ.
-Unbiasedness (sanity): histogram for gen_range(10) over large N is ~uniform (statistical smoke).
-Choice: empty slice errors; non-empty returns valid index.
-Shuffle: two runs with same seed produce identical permutation; changing seed changes permutation.
-Crumbs: log_pick reports correct word index; sequence of crumbs matches call order.
+6. Algorithm Outline (implementation plan)
+
+* Seed handling
+
+  * Initialize with `ChaCha20Rng::seed_from_u64(seed)`.
+  * Maintain an internal `words_consumed: u128` counter; +1 per `next_u64`, +2 per `next_u128`.
+
+* Unbiased range generation
+
+  * Rejection sampling to avoid modulo bias:
+
+    * Draw `x = next_u64()`.
+    * `let zone = u64::MAX - (u64::MAX % n);`
+    * If `n == 0` → `None`; else loop until `x < zone`, return `x % n`.
+
+* Choice & shuffle
+
+  * `choose_index`: `slice.is_empty() ? None : Some(gen_range(len as u64)? as usize)`.
+  * `shuffle`: standard Fisher–Yates (descending `i`, choose `j ∈ [0, i]` via `gen_range`).
+
+* Audit crumb (optional)
+
+  * `TieCrumb { ctx: SmolStr::new(ctx), pick: pick as u32, word_index: self.words_consumed() }`.
+
+* No parallelism
+
+  * Callers must resolve ties in the deterministic order defined elsewhere (options ordered by `(order_index, option_id)`).
+
+7. State Flow
+   Pipeline enters RESOLVE\_TIES only when needed; constructs `TieRng` from `Params.v052_tie_seed` when `v050_tie_policy == Random`; every tie uses `choose_index`/`gen_range` in a fixed call sequence; crumbs (optional) collected and later written into **RunRecord.ties\[]**.
+
+8. Determinism & Numeric Rules
+
+* Identical `tie_seed` + identical call sequence ⇒ identical outputs and crumbs.
+* No floats; no OS RNG/time; no globals. Single stream, single thread.
+
+9. Edge Cases & Failure Policy
+
+* `gen_range(0)` or `choose_index([])` ⇒ `None` (callers handle and never call with empty domain in production).
+* Highly skewed `n` values are fine; rejection loop terminates quickly in expectation.
+* Internal state is opaque; only `words_consumed()` is exposed for audit.
+
+10. Test Checklist (must pass)
+
+* Seed determinism: same `u64` seed → identical sequences for `next_u64`, `gen_range`, `shuffle`; different seeds diverge.
+* Unbiasedness (smoke): histogram for `gen_range(10)` over large N is \~uniform.
+* Choice: empty slice ⇒ `None`; non-empty returns valid index in range.
+* Shuffle: two runs with same seed produce identical permutation; different seed changes permutation.
+* Crumbs: `log_pick` reports the correct `word_index`; crumb sequence matches call order.
+
+11. Notes for coding
+
+* Keep this module self-contained and I/O-free.
+* Do not use `rand::thread_rng()` or any OS entropy source.
+* Keep signatures returning `Option` for empty domains to match the core API style used elsewhere (e.g., `choose(..) -> Option<usize>`).
+* Any additional helpers must not expose internal RNG state beyond what’s specified.
+
+```
+
+
 ```

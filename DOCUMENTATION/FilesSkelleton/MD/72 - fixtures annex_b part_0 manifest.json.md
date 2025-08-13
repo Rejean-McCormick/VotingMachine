@@ -1,39 +1,121 @@
-<!-- Converted from: 72 - fixtures annex_b part_0 manifest.json.docx on 2025-08-12T18:20:47.528074Z -->
+````md
+Pre-Coding Essentials (Component: fixtures/annex_b/part_0/manifest.json, Version/FormulaID: VM-ENGINE v0) — 72/89
+
+1) Goal & Success
+Goal: Ship a **run manifest** that the engine can parse directly (via `vm_io::manifest`) to resolve local files, verify digests, and assert engine/FormulaID expectations for a fully reproducible, offline run.
+Success: Schema/shape matches what `vm_io/src/manifest.rs` consumes; paths are local (no URLs); **exactly one** ballots source is chosen; digests verify; expectations match; bytes are canonicalizable (UTF-8, LF, sorted keys) and yield stable SHA-256 across OS/arch.
+
+2) Scope
+In scope: Minimal, engine-native manifest fields (paths, expectations, digests).  
+Out of scope: Algorithm knobs (live in ParameterSet), RNG control (tie policy/seed live in ParameterSet and/or CLI).
+
+3) Inputs → Outputs
+Input artifact: `fixtures/annex_b/part_0/manifest.json` (this file).  
+Output to engine: `Manifest` + `ResolvedPaths` used by the loader to read Registry/Params and **either** Ballots **or** Ballot Tally (optional Adjacency).
+
+4) Canonical Engine Shape (author exactly this)
+```jsonc
+{
+  "id": "MAN:part0",
+  "reg_path": "division_registry.json",
+  "params_path": "parameter_set.json",
+
+  // choose exactly one of the following two:
+  "ballots_path": "ballots.json",
+  // "ballot_tally_path": "ballot_tally.json",
+
+  // optional:
+  "adjacency_path": "adjacency.json",
+
+  // assert we’re running the right code/rules:
+  "expect": {
+    "formula_id": "fid:xxxxxxxx…",        // lowercase hex (sha256 of Normative Manifest)
+    "engine_version": "v0"
+  },
+
+  // strong, local reproducibility (hex must be 64-lowercase):
+  "digests": {
+    "division_registry.json": { "sha256": "<64-hex>" },
+    "parameter_set.json":     { "sha256": "<64-hex>" },
+    "ballots.json":           { "sha256": "<64-hex>" },   // or "ballot_tally.json"
+    "adjacency.json":         { "sha256": "<64-hex>" }    // if present
+  }
+}
+````
+
+5. Field Rules (engine-aligned)
+
+* `reg_path`, `params_path`: required, **local** paths only.
+* Exactly one of `ballots_path` **xor** `ballot_tally_path` is present.
+* `adjacency_path`: optional (needed only if frontier is enabled downstream).
+* `expect`: Optional but recommended. `formula_id` (lowercase hex) and `engine_version` must match what the engine reports; otherwise the loader errors.
+* `digests`: Optional but recommended. Keys are the same relative file names you use in the \*\_path fields; values carry `sha256` (64-hex). Engine verifies bytes on read.
+
+6. RNG & Policy Alignment (important)
+
+* **Do not** encode RNG here. Tie behavior is controlled by `Params`:
+
+  * `VM-VAR-032 tie_policy ∈ {status_quo, deterministic, random}`
+  * `VM-VAR-033 tie_seed : u64` (used only when tie\_policy = random)
+* If you also accept a CLI `--seed`, ensure the pipeline normalizes it to `tie_seed (u64)`; the manifest remains agnostic.
+
+7. How the engine consumes it
+
+* Read & parse → schema/shape check.
+* Reject **any** `http(s)://` path (local only).
+* Resolve each path relative to the manifest’s directory; normalize `.` and `..`.
+* Enforce “exactly one” ballots vs tally.
+* If `expect` present → compare against engine identifiers; mismatch ⇒ error.
+* If `digests` present → compute SHA-256 of each referenced file and compare (case-insensitive hex); mismatch ⇒ error.
+
+8. Determinism & Numeric Rules
+
+* Manifest is plain data; no numeric computations.
+* Reproducibility comes from local files + verified digests + fixed expectations.
+* Canonical JSON elsewhere: UTF-8, **LF** newlines, **sorted keys**; SHA-256 over canonical bytes (done by I/O layer, not here).
+
+9. Edge Cases & Failure Policy
+
+* Both or neither of ballots/tally present ⇒ **error**.
+* Any path begins with `http://` or `https://` ⇒ **error**.
+* Normalized path escapes the manifest base dir (and policy forbids) ⇒ **error**.
+* `digests` includes a filename that is not one of the declared paths ⇒ **error** (strict fixture).
+* Any `sha256` not 64-hex lowercase ⇒ **error**.
+* `expect` provided but wrong engine/FormulaID ⇒ **error**.
+
+10. Minimal Happy Example (tally mode)
+
+```json
+{
+  "id": "MAN:part0",
+  "reg_path": "division_registry.json",
+  "params_path": "parameter_set.json",
+  "ballot_tally_path": "ballot_tally.json",
+  "expect": {
+    "formula_id": "1a2b3c…(64-hex)…",
+    "engine_version": "v0"
+  },
+  "digests": {
+    "division_registry.json": { "sha256": "aaaaaaaa…(64)…" },
+    "parameter_set.json":     { "sha256": "bbbbbbbb…(64)…" },
+    "ballot_tally.json":      { "sha256": "cccccccc…(64)…" }
+  }
+}
+```
+
+11. Authoring Notes
+
+* Keep file names stable and relative to the manifest (the engine resolves them against the manifest’s directory).
+* Use **lowercase** hex for all digests and FID.
+* If you maintain both ballots and tally fixtures, publish two manifests (one per source); don’t put both in one.
+
+12. Test Checklist (must pass)
+
+* **Exactly-one** ballots vs tally.
+* All paths are local; normalization doesn’t escape base dir.
+* `expect` matches the engine identifiers.
+* All `digests` verify (content changes are detected).
+* Loading this manifest leads to successful LOAD/VALIDATE in the pipeline, with deterministic downstream hashes on all OSes.
 
 ```
-Lean pre-coding sheet — 72/89
-Component: fixtures/annex_b/part_0/manifest.json (Part 0 run manifest fixture)
- Version/FormulaID: This is data; FID covers rule primitives, not per-run inputs.
-1) Goal & success
-Goal: Provide a complete, unambiguous manifest that pins engine/formula, RNG mode/seed, canonicalization policy, and the exact input artifacts (with SHA-256) for a reproducible run.
-Success: Schema passes; exactly one Registry and one ParameterSet; exactly one of Ballots or BallotTally; seed decodes to 32 bytes; canonicalization tag matches constant; IO can verify file hashes and the pipeline can lock seed and compute hashes.
-2) Scope
-In scope: engine{version,formula_id,build?}, created_utc, rng{mode,seed}, canonicalization tag, inputs[] {kind, sha256, length?, path?, id?}, optional meta.
-Out of scope: Recomputing hashes (done by IO), enforcing JSON canonicalization at write-time (done by IO), executing the run.
-3) Inputs → outputs
-Input artifact: manifest.json (validated by schemas/manifest.schema.json).
-Output to system: typed Manifest → IO verifies file hashes; pipeline locks RNG and contributes to Result/RunRecord hashing (canonical JSON, LF, sorted keys, UTC).
-4) Entities/Tables (minimal)
-5) Variables (only ones used here)
-None. Parameterization lives in ParameterSet; seed value lives here but is not a VM-VAR.
-6) Functions (signatures only)
-(Fixture only; no functions.)
-Validation invariants used by the schema/loader (for reference): require_exactly_one(DivisionRegistry), require_exactly_one(ParameterSet), require_exactly_one_of(Ballots|BallotTally), validate_seed_hex_len_32(), validate_canonicalization_tag(), validate_sha256_format_all().
-7) Algorithm outline (how it’s consumed)
-Parse manifest.json.
-Validate engine fields, RNG mode ∈ {order,rng} and seed = 32-byte hex.
-Require canonicalization tag to equal the agreed constant.
-Enforce exactly one Registry and exactly one ParameterSet; exactly one of Ballots | BallotTally.
-For each input: sha256 = 64 lowercase hex; nonnegative length? if present.
-State flow: load → schema-validate (manifest) → file-hash verify (IO) → lock seed → run pipeline.
-8) State flow (very short)
-Used before VM-FUN-001 loads artifacts, to ensure a reproducible selection; IDs and seeds echo later in RunRecord.
-9) Determinism & numeric rules
-Canonicalization policy must be the fixed JSON form (UTF-8, sorted keys, single trailing \n; UTC timestamps). Hashing uses SHA-256 over canonical bytes.
-Seed fixes RNG stream; no floats appear in manifest.
-10) Edge cases & failure policy
-Missing Registry/ParameterSet; both or neither of Ballots/Tally; duplicate kinds; wrong canonicalization tag; seed not 32-byte hex; non-64-hex sha256; negative length. Error and halt before run.
-11) Test checklist (must pass)
-Valid minimal manifest passes; malformed cases hit the right validation errors.
-After IO hash-verification, pipeline runs and later RunRecord echoes engine, formula_id, IDs, and rng_seed.
 ```

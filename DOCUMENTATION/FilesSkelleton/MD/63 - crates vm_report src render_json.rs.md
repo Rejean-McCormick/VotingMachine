@@ -1,48 +1,90 @@
-<!-- Converted from: 63 - crates vm_report src render_json.rs, Version FormulaID VM-ENGINE v0).docx on 2025-08-12T18:20:47.224592Z -->
+````markdown
+Pre-Coding Essentials (Component: crates/vm_report/src/render_json.rs, Version/FormulaID: VM-ENGINE v0) — 64/89
+
+1) Goal & Success
+Goal: Serialize a `ReportModel` into **deterministic JSON** that mirrors Doc 7’s fixed section order and field names, using the model’s already-formatted values (one-decimal %), with **no recomputation**.
+Success: Same `ReportModel` → byte-identical JSON string across OS/arch; sections appear in the exact Doc 7 order; the approval-denominator sentence is emitted only for approval ballots; no extra or missing keys.
+
+2) Scope
+In scope: Deterministic construction of a JSON tree, stable key order within each object, omission of `None`/empty optionals per spec, and footer identifiers from artifacts.
+Out of scope: Any I/O or canonical hashing (lives in `vm_io`), HTML rendering (other module), math/formatting (already done in the model).
+
+3) Inputs → Outputs
+Input: `&ReportModel` (built from `Result`, optional `FrontierMap`, and `RunRecord`).
+Output: `String` (UTF-8 JSON) with sections:
+`cover`, `eligibility`, `ballot`, `legitimacy_panel`, `outcome`, optional `frontier`, optional `sensitivity`, `integrity`, `footer`.
+
+4) Entities/Tables (minimal)
+Pure data serializer. Uses `serde_json::Value` and **insertion-ordered** `serde_json::Map` to keep stable order; internally builds maps from sorted sources (e.g., `BTreeMap`) then inserts in required order.
+
+5) Variables (render-only)
+None computed. Displayed values (percent strings, pp strings, policy names, thresholds) come **verbatim** from `ReportModel`.
+
+6) Functions (signatures only)
+```rust
+use serde_json::{Map, Value};
+
+// Public API
+pub fn render_json(model: &ReportModel) -> String;
+
+// Internal builders (pure; no I/O)
+fn to_ordered_json(model: &ReportModel) -> Value;
+
+// One builder per section (keeps stable field order)
+fn cover_json(m: &ReportModel) -> Value;
+fn eligibility_json(m: &ReportModel) -> Value;
+fn ballot_json(m: &ReportModel) -> Value;                 // adds approval sentence flag
+fn panel_json(m: &ReportModel) -> Value;                  // quorum, majority, double-majority, symmetry
+fn outcome_json(m: &ReportModel) -> Value;                // label + reason + national margin (pp)
+fn frontier_json(m: &ReportModel) -> Option<Value>;       // only if model.frontier.is_some()
+fn sensitivity_json(m: &ReportModel) -> Option<Value>;    // table or “N/A”
+fn integrity_json(m: &ReportModel) -> Value;              // engine/FID/seed/UTCs
+fn footer_json(m: &ReportModel) -> Value;                 // IDs: RES/RUN/FR?/REG/PS/TLY
+````
+
+7. Algorithm Outline (implementation plan)
+
+* **Top-level ordering:** Build a `serde_json::Map` and **insert sections in Doc-order**:
+
+  1. `cover`
+  2. `eligibility`
+  3. `ballot`
+  4. `legitimacy_panel`
+  5. `outcome`
+  6. `frontier` (insert only if present)
+  7. `sensitivity` (insert only if present)
+  8. `integrity`
+  9. `footer`
+* **Stable field order inside each section:** Fill objects via helper builders that push keys in a fixed sequence. When mapping collections (e.g., family members), iterate already-sorted inputs (`BTreeMap`/`Vec` in model).
+* **No recomputation:** Every numeric is already a string (e.g., `"55.0%"`, `"+3 pp"`). Do **not** parse or round again.
+* **Approval sentence:** In `ballot_json`, emit `approval_denominator_sentence: true` iff `model.ballot.approval_denominator_sentence` is true; renderer wording is fixed elsewhere.
+* **Optional keys:** Omit keys whose values are `None` in the model (don’t emit `null` unless Doc 7 requires it; prefer omission).
+* **Footer/IDs:** Copy verbatim from `RunRecord/Result/FrontierMap` via the model; never modify casing or add prefixes.
+
+8. State Flow (very short)
+   `vm_report::build_model` → **this** serializer → JSON string returned to caller (CLI/app). Any canonicalization/hashing happens upstream/downstream, not here.
+
+9. Determinism & Numeric Rules
+
+* Deterministic order via explicit insert sequence and sorted inputs.
+* No floats; strings only for percents/pp. The serializer **never** formats numbers.
+* UTF-8 only; no BOM; no trailing newline appended.
+
+10. Edge Cases & Failure Policy
+
+* **Invalid/gates-fail:** `panel_json` shows pass=false rows; `frontier` omitted; `outcome` contains “Invalid” and reason—copied from model.
+* **No sensitivity:** Emit `"sensitivity": "N/A (not executed)"` or omit the section per Doc 7 binding (pick one policy and keep it consistent—default: include with that string).
+* **Empty families/counters:** Emit empty arrays/zeros; do not invent placeholders.
+* **Unknown policy strings (custom roll policy):** Render the raw value; do not error.
+
+11. Test Checklist (must pass)
+
+* **Order:** Keys at top level appear exactly in Doc 7 order (cover → … → footer).
+* **Approval sentence:** Present only for approval ballots.
+* **Frontier conditional:** Emitted only when `model.frontier.is_some()`.
+* **One-decimal integrity:** All percent strings in output match model (no changes).
+* **Stability:** Serializing the same `ReportModel` twice yields identical bytes.
+* **Footer correctness:** All IDs/engine/FID/seed/UTCs match the model; seed present only if tie\_policy=`random`.
 
 ```
-Pre-Coding Essentials (Component: crates/vm_report/src/render_json.rs, Version/FormulaID: VM-ENGINE v0) — 64/89
-1) Goal & Success
-Goal: Serialize the ReportModel to JSON that mirrors Doc 7’s fixed sections, fields, precision, and data sources—no extra data.
-Success: Output includes sections in exact order with one-decimal percentages; approval-denominator sentence appears when ballot type is approval.
-2) Scope
-In scope: Convert ReportModel into a deterministic JSON structure (stable key order), preserving Doc 7 wording/fields and preformatted numerics.
-Out of scope: HTML/CSS templates, assets, maps; any recomputation of gates/percentages (must already be in the model).
-3) Inputs → Outputs (with schemas/IDs)
-Input: ReportModel built solely from Result, optional FrontierMap, and RunRecord.
-Output: JSON object with sections §1–§10 and Fixed footer, matching Doc 7 bindings (no extra fields).
-4) Entities/Tables (minimal)
-5) Variables (only ones used here)
-None computed here. All VM-VAR values are displayed per bindings; approval ballots require the approval-rate denominator sentence.
-6) Functions (signatures only)
-rust
-CopyEdit
-pub fn render_json(model: &ReportModel) -> String;
-// helpers
-fn to_ordered_json(model: &ReportModel) -> serde_json::Value; // stable section order, stable key order
-fn write_footer_ids(run: &RunRecordDb, result: &ResultDb, frontier: Option<&FrontierMapDb>) -> FooterJson;
-
-(Footer content strictly from RunRecord/Result IDs; optional FrontierMap ID.)
-7) Algorithm Outline (bullet steps)
-Section order: emit §1→§10 exactly as Doc 7 lists them.
-Ballot paragraph: if ballot type is approval, include the mandatory approval-rate denominator sentence.
-Frontier section: include only if a FrontierMap was produced; map statuses/diagnostics from FrontierMap and mirror per-unit flags.
-Sensitivity: include 2×3 ±1pp/±5pp table only if CompareScenarios exists; otherwise "N/A (not executed)".
-Integrity & footer: list identifiers (FID, Engine, REG, PS, TLY label, RNG seed if used, Run UTC, Result ID, optional FrontierMap ID) and duplicate fixed footer line.
-Precision: ensure all percentages/margins are one decimal (model should already be formatted; renderer must not round again).
-8) State Flow (very short)
-Called by vm_report::lib after ReportModel creation; reads artifacts only via the model; strictly offline.
-9) Determinism & Numeric Rules
-No double rounding; keep one-decimal strings as-is.
-Stable key order for map-like structures in JSON to avoid diff noise.
-No external assets (JSON is pure data).
-10) Edge Cases & Failure Policy
-Validation failed: emit sections and texts per Doc 7 fallbacks; omit Frontier; mark outcome Invalid.
-Gates failed: render up to panel with ❌ flags; outcome Invalid (gate failed: …); omit Frontier.
-Mediation/protected flags: include diagnostics counts under Outcome; label is Marginal (already set upstream).
-11) Test Checklist (must pass)
-Sections appear in Doc 7 order; approval sentence present for approval ballots.
-Frontier only when FR exists; diagnostics mirror FR + per-unit flags.
-Sensitivity logic respected (table vs “N/A”).
-Footer identifiers sourced verbatim from RunRecord/Result; values match fixed footer line.
 ```

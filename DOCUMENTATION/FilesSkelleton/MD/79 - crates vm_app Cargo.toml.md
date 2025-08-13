@@ -1,35 +1,82 @@
-<!-- Converted from: 79 - crates vm_app Cargo.toml.docx on 2025-08-12T18:20:47.697857Z -->
+````md
+Pre-Coding Essentials (Component: crates/vm_app/Cargo.toml, Version/FormulaID: VM-ENGINE v0) — 79/89
 
-```toml
-Lean pre-coding sheet — 79/89
-Component: crates/vm_app/Cargo.toml (App meta-manifest)
- Version/FormulaID: VM-ENGINE v0
-1) Goal & success
-Goal: Define a minimal Cargo package for the desktop app wrapper that owns packaging metadata and does not add runtime/network deps. The actual Tauri backend lives in src-tauri/.
-Success: cargo metadata -p vm_app works; cargo build -p vm_app/src-tauri --locked produces the app backend when explicitly targeted; offline requirements upheld (no telemetry; assets bundled).
+1) Goal & Success
+Goal: Minimal “meta-manifest” for the desktop app wrapper. It declares package metadata and mirrors feature flags, but adds **no** runtime/network deps. The actual Tauri backend is a separate crate at `vm_app/src-tauri/`.  
+Success: `cargo metadata -p vm_app` works; building the backend explicitly (`-p vm_app/src-tauri`) succeeds under `--locked`; offline/deterministic constraints are preserved.
+
 2) Scope
-In scope: Package name/version/license; publish = false; pointing to src-tauri crate (documented relationship); optional feature flags mirrored to the backend (HTML reporting, frontier map); deterministic build profile hints.
-Out of scope: Backend Rust code (in src-tauri/), UI build (npm/vite), map assets; those are separate files (80–89).
-3) Inputs → outputs
-Inputs: Workspace toolchain pin; backend crate src-tauri; UI bundle under ui/ (consumed by Tauri at runtime, not by this manifest).
-Outputs: None directly (meta-manifest). Building the app targets vm_app/src-tauri which emits an offline desktop binary per Doc 3.
+In scope: Package stanza, edition/license, `publish=false`, resolver v2, deterministic release profile, feature names documented (mirrored by backend).  
+Out of scope: Any backend/UI code (lives in `src-tauri/` and `ui/`); no dependencies here to avoid pulling Tauri unless directly targeted.
+
+3) Inputs → Outputs
+Inputs: Workspace toolchain; backend crate at `src-tauri/`; UI bundle under `ui/` (consumed by Tauri only).  
+Outputs: None directly. This package exists to group app metadata and surface features consistently.
+
 4) Entities/Tables (minimal)
+N/A (manifest only).
+
 5) Variables (only ones used here)
-6) Functions (signatures only)
-N/A (manifest).
-7) Algorithm outline (what this file enforces)
-Declare package as private (publish=false).
-Define passthrough features: report-html, frontier (forwarded to src-tauri and downstream).
-Document that the build target is vm_app/src-tauri to avoid accidental workspace default builds (Tauri toolchain not required unless explicitly built).
-8) State flow (very short)
-Acts as a container package; actual app build runs in 80/89 with Tauri, which packages the offline UI, fonts, and MapLibre tiles/styles locally.
-9) Determinism & numeric rules
-Follows workspace rules: no network at runtime, canonical JSON in artifacts, stable ordering; the app layer must not introduce telemetry or online fonts.
-10) Edge cases & failure policy
-If built without Node/vite present, this meta package should still parse; only src-tauri requires those assets at run/pack time.
-Feature combo errors are deferred to backend crates (e.g., frontier without adjacency data skips map step rather than failing).
-11) Test checklist (must pass)
-cargo metadata -p vm_app OK.
-cargo build -p vm_app/src-tauri --locked succeeds on supported OS/arch (when explicitly targeted).
-Enabling --features report-html,frontier links downstream features and still respects offline constraints.
+Feature flags (names only, **no wiring from this crate**):
+- `frontier` — enables frontier map support in the backend.
+- `report-html` — enables HTML renderer in the backend.
+
+6) Functions
+(Manifest only.)
+
+7) Suggested Cargo.toml shape (deterministic & offline)
+```toml
+[package]
+name = "vm_app"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Desktop app wrapper (meta); backend is in src-tauri/"
+# This crate should not pull the backend automatically.
+# Build the app explicitly with: cargo build -p vm_app/src-tauri --locked
+
+# Keep resolver v2 for correct feature unification across workspace.
+resolver = "2"
+
+[features]
+# Intentionally empty arrays here: the real behavior is implemented in src-tauri.
+# These names are mirrored there; callers should enable features on the backend crate.
+default = []
+frontier = []
+report-html = []
+
+# No [dependencies] here on purpose — prevents tauri/network deps from being pulled
+# unless the backend crate is explicitly built.
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+````
+
+8. State Flow
+   Acts as a container package only. Building the actual app targets `vm_app/src-tauri`, which bundles offline UI/assets and links downstream crates (pipeline/report) deterministically.
+
+9. Determinism & Numeric Rules
+
+* No networked build scripts or deps at this level.
+* Release profile enforces deterministic codegen (`lto`, `codegen-units=1`, `panic="abort"`).
+* The app layer must not introduce telemetry or online fonts; assets are bundled by the backend.
+
+10. Edge Cases & Failure Policy
+
+* If Node/Vite or UI assets are missing, **this** meta package still resolves; only `src-tauri` builds should fail (by design).
+* Enabling `frontier`/`report-html` on this crate alone has no effect; they must be enabled on `vm_app/src-tauri`. This is documented to avoid confusion.
+
+11. Test Checklist (must pass)
+
+* `cargo metadata -p vm_app` succeeds.
+* `cargo build -p vm_app/src-tauri --locked` succeeds on supported OS/arch (when backend & UI are present).
+* Building `vm_app` alone does **not** attempt to fetch networked deps or compile Tauri.
+* With `--features frontier,report-html` targeting the backend crate, downstream features link and runtime remains offline.
+
+```
 ```

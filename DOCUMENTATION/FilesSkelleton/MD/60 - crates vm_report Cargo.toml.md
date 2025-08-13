@@ -1,34 +1,88 @@
-<!-- Converted from: 60 - crates vm_report Cargo.toml, Version FormulaID VM-ENGINE v0).docx on 2025-08-12T18:20:47.138189Z -->
-
 ```toml
-Pre-Coding Essentials (Component: crates/vm_report/Cargo.toml, Version/FormulaID: VM-ENGINE v0) — 61/89
+Pre-Coding Essentials (Component: crates/vm_report/Cargo.toml, Version/FormulaID: VM-ENGINE v0) — 60/89
+
 1) Goal & Success
-Goal: Declare a reporting crate that renders reports offline, with deterministic builds, and outputs matching Doc 7 specs (one-decimal %; structure fixed).
-Success: Builds with workspace lock; no network/runtime assets; provides opt-in features for JSON and HTML/PDF render paths required by Doc 7.
+Goal: Declare the reporting crate that renders Result/RunRecord (and optional FrontierMap) offline with deterministic, reproducible output per Doc 7.
+Success: Builds as an rlib under a locked toolchain; strictly offline (no network deps); percent formatting is one-decimal; JSON and HTML renderers are feature-gated and consume only engine artifacts.
+
 2) Scope
-In scope: Crate metadata; feature flags (e.g., render_json, render_html); dependencies only for deterministic, offline rendering; test profile hooks.
-Out of scope: Report structure/content (lives in code & templates per Doc 7), pipeline objects.
-3) Inputs → Outputs (with schemas/IDs)
-Inputs: Workspace toolchain & lock; vm_report::structure and render modules consume Result, RunRecord, optional FrontierMap.
-Outputs: Build artifacts for report renderers (JSON/HTML), which must show one-decimal percentages and include mandated sections/footers.
+In scope: Manifest metadata, edition/rust-version, features for renderers, minimal deps with `default-features = false`, and deterministic profiles.
+Out of scope: Pipeline/algorithms/I/O; report structure and code live in `src/` and templates bundled locally.
+
+3) Inputs → Outputs
+Inputs: Workspace toolchain; vm_core (percent helpers), vm_io (types if needed for serde), local templates.
+Outputs: Library usable by CLI/app to render JSON/HTML reports; no binaries here.
+
 4) Entities/Tables (minimal)
-5) Variables (only ones used here)
-6) Functions (signatures only)
-(manifest has no functions)
-7) Algorithm Outline (build configuration)
-Define crate with edition + resolver v2 (inherits workspace).
-Add render_json feature: depends on serialization stack only (no net). Output must bind to Result/RunRecord/FrontierMap fields.
-Add render_html feature: includes template engine/assets bundled locally; forbid remote fonts/tiles/scripts.
-Ensure one-decimal formatting helpers are part of the crate (exposed for both renderers).
-Profiles: deterministic release (inherits workspace settings).
+N/A (manifest only).
+
+5) Variables (build/features)
+Feature toggles:
+- `render_json` — JSON renderer (serde only).
+- `render_html` — HTML renderer (pure offline templating; templates embedded).
+- `std` — default on.
+
+6) Functions
+(Manifest only.)
+
+7) Manifest skeleton (deterministic, offline)
+[package]
+name = "vm_report"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.76"            # pin ≥ workspace
+license = "Apache-2.0 OR MIT"
+description = "Deterministic offline report renderers for VM-ENGINE results"
+repository = "<workspace>"
+
+[lib]
+name = "vm_report"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+default      = ["std", "render_json"]
+std          = []
+render_json  = ["dep:serde", "dep:serde_json"]
+render_html  = ["dep:minijinja", "dep:include_dir"]   # offline, embedded templates
+
+[dependencies]
+vm_core     = { path = "../vm_core", default-features = false }          # percent_one_decimal helpers
+vm_io       = { path = "../vm_io",   default-features = false, optional = true } # types if reused in renderer API
+serde       = { version = "1", features = ["derive"], default-features = false, optional = true }
+serde_json  = { version = "1", default-features = false, optional = true }
+minijinja   = { version = "1", default-features = false, optional = true }       # pure rust templates, no net
+include_dir = { version = "0.7", default-features = false, optional = true }     # bundle templates at compile time
+itoa        = { version = "1", default-features = false }                        # fast int→string for % formatting
+
+[dev-dependencies]
+insta              = { version = "1", default-features = false }        # snapshot tests for deterministic output
+similar-asserts    = "1"
+serde_json         = { version = "1", default-features = false }
+minijinja          = { version = "1", default-features = false }        # used in tests when render_html on
+include_dir        = { version = "0.7", default-features = false }
+
+[package.metadata.vm]
+offline = true
+deterministic = true
+
+# No build.rs. All templates embedded via include_dir. No network/font/map tiles at runtime.
+
 8) State Flow (very short)
-Used by vm_report library to render §1–§10 sections fixed by Doc 7; consumes Result/RunRecord/FrontierMap only.
+`vm_report` is linked by the app/CLI after pipeline completion. It consumes Result/RunRecord/FrontierMap and renders JSON/HTML strictly offline.
+
 9) Determinism & Numeric Rules
-Offline only; no external assets; percent formatting at one decimal; integers for seats.
+- One-decimal percentage formatting implemented via vm_core integer helpers (no floats).
+- No time/locale dependencies; UTF-8 only.
+- Template assets embedded; no remote fetches.
+
 10) Edge Cases & Failure Policy
-If render_html templates missing external assets, do not fetch—fail build; templates must be bundled.
-Internationalization: if bilingual is enabled in code, crate must ship mirrored templates; never mix languages in paragraphs.
+- If `render_html` is enabled but templates missing, builds/tests fail (no fallback to network).
+- No optional transitive defaults that could introduce networking or floats.
+
 11) Test Checklist (must pass)
-JSON/HTML feature builds succeed under --locked; no network during render.
-Renderers show one-decimal percentages; footer IDs sourced from RunRecord/Result.
+- `cargo check -p vm_report` with defaults (std+render_json).
+- `cargo check -p vm_report --no-default-features --features "std,render_html"` (HTML only) builds.
+- Snapshot tests confirm identical HTML/JSON bytes across OS/arch.
+- `cargo tree -e features` shows no net/reqwest and no float-formatting deps pulled in by default.
 ```
