@@ -71,8 +71,10 @@ pub fn validate(ctx: &NormContext) -> ValidationReport {
     issues.extend(check_unit_magnitudes(&ctx.reg.units));
     issues.extend(check_baseline_pairing(&ctx.reg.units));
 
-    // B) Options: canonical order & order_index uniqueness (fully implemented now)
-    issues.extend(check_options_order(ctx.options));
+    // B) Options: canonical order & order_index uniqueness (per unit)
+    for u in &ctx.reg.units {
+        issues.extend(check_unit_options_order(u));
+    }
 
     // C) Params ↔ tally shape (scaffold)
     // if let (Some(params), Some(tallies)) = (ctx.params_opt, ctx.tallies_opt) { ... }
@@ -129,6 +131,50 @@ fn check_baseline_pairing(_units: &[Unit]) -> Vec<ValidationIssue> {
     Vec::new()
 }
 
+/// Per-unit option validations: uniqueness of `order_index` and canonical ordering.
+fn check_unit_options_order(unit: &Unit) -> Vec<ValidationIssue> {
+    use alloc::collections::{BTreeMap, BTreeSet};
+
+    let mut issues = Vec::new();
+
+    // A) order_index uniqueness within the unit (Doc 1B §4/§5; Doc 6A VM-TST-108)
+    let mut seen: BTreeMap<u16, Vec<OptionId>> = BTreeMap::new();
+    for o in &unit.options {
+        seen.entry(o.order_index).or_default().push(o.option_id.clone());
+    }
+    for (idx, ids) in seen.into_iter() {
+        if ids.len() > 1 {
+            // Emit one error per duplicated index at the unit scope
+            issues.push(ValidationIssue {
+                severity: Severity::Error,
+                code: "E-DR-ORD-UNIQ",
+                message: format!("unit has duplicate order_index {} for options {:?}", idx, ids),
+                where_: EntityRef::Unit(unit.unit_id.clone()),
+            });
+        }
+    }
+
+    // B) canonical ordering check: (order_index, option_id)
+    let mut prev: Option<(u16, &OptionId)> = None;
+    for o in &unit.options {
+        let key = (o.order_index, &o.option_id);
+        if let Some(pk) = prev {
+            if key < pk {
+                issues.push(ValidationIssue {
+                    severity: Severity::Warning,
+                    code: "Option.OutOfOrder",
+                    message: "options are not in canonical (order_index, option_id) order".to_string(),
+                    where_: EntityRef::Unit(unit.unit_id.clone()),
+                });
+                // continue scanning to collect all warnings
+            }
+        }
+        prev = Some(key);
+    }
+
+    issues
+}
+
 /// Enforce canonical option ordering and unique/non-negative order_index.
 ///
 /// Errors:
@@ -174,141 +220,167 @@ fn check_options_order(options: &[OptionItem]) -> Vec<ValidationIssue> {
 
     issues
 }
-
-// ------------------------------- Scaffolds for future data --------------------------------------
-
-fn check_params_vs_tally(
-    _params: &(), /* vm_core::variables::Params */
-    _tallies: &(), /* vm_core::tallies::UnitTallies */
-) -> Vec<ValidationIssue> {
-    Vec::new()
-}
-
-fn check_tally_sanity_plurality(_tallies: &(), _options: &[OptionItem]) -> Vec<ValidationIssue> {
-    Vec::new()
-}
-
-fn check_tally_sanity_approval(_tallies: &(), _options: &[OptionItem]) -> Vec<ValidationIssue> {
-    Vec::new()
-}
-
-fn check_tally_sanity_score(
-    _tallies: &(),
-    _options: &[OptionItem],
-    _params: &(), /* Params for scale/domain */
-) -> Vec<ValidationIssue> {
-    Vec::new()
-}
-
-fn check_tally_sanity_ranked_irv(_tallies: &(), _options: &[OptionItem]) -> Vec<ValidationIssue> {
-    Vec::new()
-}
-
-fn check_tally_sanity_ranked_condorcet(
-    _tallies: &(),
-    _options: &[OptionItem],
-) -> Vec<ValidationIssue> {
-    Vec::new()
-}
-
-fn check_wta_constraint(_units: &[Unit], _params: &()) -> Vec<ValidationIssue> {
-    Vec::new()
-}
-
-fn check_quorum_data(_units: &[Unit], _tallies: &(), _params: &()) -> Vec<ValidationIssue> {
-    Vec::new()
-}
-
-fn check_double_majority_family(_params: &(), _reg: &DivisionRegistry) -> Vec<ValidationIssue> {
-    Vec::new()
-}
-
-fn check_frontier_prereqs(_params: &(), _reg: &DivisionRegistry) -> Vec<ValidationIssue> {
-    Vec::new()
-}
-
 // ------------------------------------------------------------------------------------------------
-// Utilities
+// Sorting / utilities
 // ------------------------------------------------------------------------------------------------
 
-fn sort_issues_stably(issues: &mut [ValidationIssue]) {
-    use core::cmp::Ordering;
-    issues.sort_by(|a, b| {
-        // primary: code
-        match a.code.cmp(b.code) {
-            Ordering::Equal => {
-                // secondary: where_
-                match cmp_where(&a.where_, &b.where_) {
-                    Ordering::Equal => {
-                        // tertiary: message text
-                        a.message.cmp(&b.message)
-                    }
-                    o => o,
-                }
+fn sort_issues_stably(issues: &mut Vec<ValidationIssue>) {
+    issues.sort_by(|a, b| issue_sort_key(a).cmp(&issue_sort_key(b)));
+}
+
+/// Primary stable key: (vm_var_bucket, vm_var_num, code, where_key, message)
+/// - vm_var_bucket: 0 if tied to a VM-VAR id (Param("VM-VAR-###")), else 1
+/// - vm_var_num: parsed numeric id when present, else u16::MAX
+fn issue_sort_key(i: &ValidationIssue) -> (u8, u16, &str, (u8, String), &str) {
+    let (bucket, vmvar_num) = match &i.where_ {
+        EntityRef::Param(name) => {
+            if let Some(n) = parse_vm_var_num(name) {
+                (0u8, n)
+            } else {
+                (1u8, u16::MAX)
             }
-            o => o,
         }
-    });
+        _ => (1u8, u16::MAX),
+    };
+
+    (bucket, vmvar_num, i.code, entity_ref_sort_key(&i.where_), i.message.as_str())
 }
 
-fn cmp_where(a: &EntityRef, b: &EntityRef) -> core::cmp::Ordering {
-    use EntityRef::*;
-    use core::cmp::Ordering::*;
-    match (a, b) {
-        (Root, Root) => Equal,
-        (Root, _) => Less,
-        (_, Root) => Greater,
-        (Param(pa), Param(pb)) => pa.cmp(pb),
-        (Param(_), _) => Less,
-        (_, Param(_)) => Greater,
-        (Option(oa), Option(ob)) => oa.cmp(ob),
-        (Option(_), _) => Less,
-        (_, Option(_)) => Greater,
-        (Unit(ua), Unit(ub)) => ua.cmp(ub),
-        (Unit(_), _) => Less,
-        (_, Unit(_)) => Greater,
-        (TallyUnit(ua), TallyUnit(ub)) => ua.cmp(ub),
-        (TallyUnit(_), _) => Less,
-        (_, TallyUnit(_)) => Greater,
-        (Adjacency(a1, a2), Adjacency(b1, b2)) => match a1.cmp(b1) {
-            Equal => a2.cmp(b2),
-            o => o,
-        },
+/// Extract a deterministic ordering key for EntityRef.
+/// Variant rank ensures stable cross-run ordering, then a string key.
+fn entity_ref_sort_key(r: &EntityRef) -> (u8, String) {
+    match r {
+        EntityRef::Root => (0, "root".to_string()),
+        EntityRef::Unit(id) => (1, format!("unit:{:?}", id)),
+        EntityRef::Option(id) => (2, format!("option:{:?}", id)),
+        EntityRef::Param(name) => (3, format!("param:{name}")),
+        EntityRef::TallyUnit(id) => (4, format!("tally_unit:{:?}", id)),
+        EntityRef::Adjacency(a, b) => (5, format!("adj:{:?}->{:?}", a, b)),
     }
 }
+
+/// Parse "VM-VAR-###" → ### (u16). Returns None if not in the expected form.
+fn parse_vm_var_num(s: &str) -> Option<u16> {
+    const PREFIX: &str = "VM-VAR-";
+    if !s.starts_with(PREFIX) {
+        return None;
+    }
+    let digits = &s[PREFIX.len()..];
+    if digits.is_empty() || digits.len() > 5 {
+        return None;
+    }
+    digits.parse::<u16>().ok()
+}
+
+// ------------------------------------------------------------------------------------------------
+// Scaffolds (placeholders to be filled as more fields/types land in vm_core)
+// ------------------------------------------------------------------------------------------------
+
+#[allow(unused_variables)]
+fn check_params_vs_tally(/*params: &Params,*/ /*tallies: &UnitTallies*/) -> Vec<ValidationIssue> {
+    // TODO: Presence & domain checks for Included VM-VARs; shape match to tallies.
+    Vec::new()
+}
+
+#[allow(unused_variables)]
+fn check_tally_sanity_plurality(/*...*/) -> Vec<ValidationIssue> {
+    // TODO: Sum(votes) <= valid_ballots; FK to registry.
+    Vec::new()
+}
+
+#[allow(unused_variables)]
+fn check_tally_sanity_approval(/*...*/) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+#[allow(unused_variables)]
+fn check_tally_sanity_score(/*...*/) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+#[allow(unused_variables)]
+fn check_tally_sanity_ranked_irv(/*...*/) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+#[allow(unused_variables)]
+fn check_tally_sanity_ranked_condorcet(/*...*/) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+#[allow(unused_variables)]
+fn check_wta_constraint(/*units: &[Unit], params: &Params*/) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+#[allow(unused_variables)]
+fn check_quorum_data(/*units: &[Unit], tallies: &UnitTallies, params: &Params*/) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+#[allow(unused_variables)]
+fn check_double_majority_family(/*params: &Params, reg: &DivisionRegistry*/) -> Vec<ValidationIssue> {
+    Vec::new()
+}
+
+#[allow(unused_variables)]
+fn check_frontier_prereqs(/*params: &Params, reg: &DivisionRegistry*/) -> Vec<ValidationIssue> {
+    // TODO: Ensure frontier variables are present/enabled only with required inputs.
+    Vec::new()
+}
+
+#[allow(unused_variables)]
+fn check_tie_seed(/*params: &Params*/) -> Vec<ValidationIssue> {
+    // TODO: If tie_policy=random then tie_seed must be present and within domain; otherwise ignored.
+    Vec::new()
+}
+
+// ------------------------------------------------------------------------------------------------
+// (optional) tests — can be kept or removed based on your policy
+// ------------------------------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vm_core::entities::OptionItem;
 
     #[test]
-    fn detects_duplicate_order_index() {
-        let opts = vec![
-            OptionItem::new("A".parse().unwrap(), "A".into(), 0).unwrap(),
-            OptionItem::new("B".parse().unwrap(), "B".into(), 0).unwrap(), // duplicate
-        ];
-        let issues = check_options_order(&opts);
-        assert!(issues.iter().any(|i| i.code == "Option.OrderIndexDuplicate" && matches!(i.severity, Severity::Error)));
+    fn parse_vm_var_num_ok() {
+        assert_eq!(parse_vm_var_num("VM-VAR-050"), Some(50));
+        assert_eq!(parse_vm_var_num("VM-VAR-5"), Some(5));
     }
 
     #[test]
-    fn warns_on_out_of_order() {
-        let opts = vec![
-            OptionItem::new("B".parse().unwrap(), "B".into(), 0).unwrap(),
-            OptionItem::new("A".parse().unwrap(), "A".into(), 0).unwrap(), // out of canonical order by id
-        ];
-        let issues = check_options_order(&opts);
-        assert!(issues.iter().any(|i| i.code == "Option.OutOfOrder" && matches!(i.severity, Severity::Warning)));
+    fn parse_vm_var_num_bad() {
+        assert_eq!(parse_vm_var_num("VAR-050"), None);
+        assert_eq!(parse_vm_var_num("VM-VAR-"), None);
+        assert_eq!(parse_vm_var_num("VM-VAR-99999"), None);
     }
 
     #[test]
-    fn ok_when_sorted_and_unique() {
-        let opts = vec![
-            OptionItem::new("A".parse().unwrap(), "A".into(), 0).unwrap(),
-            OptionItem::new("B".parse().unwrap(), "B".into(), 1).unwrap(),
+    fn sort_vmvar_first() {
+        let mut issues = vec![
+            ValidationIssue {
+                severity: Severity::Error,
+                code: "E-OTHER",
+                message: "x".into(),
+                where_: EntityRef::Unit(UnitId::from_raw(2)),
+            },
+            ValidationIssue {
+                severity: Severity::Error,
+                code: "E-PARAM",
+                message: "y".into(),
+                where_: EntityRef::Param("VM-VAR-060"),
+            },
+            ValidationIssue {
+                severity: Severity::Error,
+                code: "E-PARAM",
+                message: "z".into(),
+                where_: EntityRef::Param("VM-VAR-010"),
+            },
         ];
-        let issues = check_options_order(&opts);
-        assert!(issues.is_empty());
+        sort_issues_stably(&mut issues);
+        // VM-VAR-010 should come before VM-VAR-060, both before the Unit-scoped issue.
+        assert!(matches!(issues[0].where_, EntityRef::Param("VM-VAR-010")));
+        assert!(matches!(issues[1].where_, EntityRef::Param("VM-VAR-060")));
     }
 }

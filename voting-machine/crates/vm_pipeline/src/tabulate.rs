@@ -13,7 +13,7 @@ use vm_core::{
     variables::Params,
 };
 use vm_algo::{
-    tabulation,      // pure algorithm entry points
+    tabulation, // pure algorithm entry points
     IrvLog, Pairwise, UnitScores,
 };
 
@@ -74,12 +74,27 @@ trait TabulateParamView {
 }
 
 impl TabulateParamView for Params {
-    // These forwarders assume `Params` exposes the same-named getters (Doc 2 / Annex A).
-    #[inline] fn ballot_is_plurality_001(&self) -> bool { self.ballot_is_plurality_001() }
-    #[inline] fn ballot_is_approval_001(&self) -> bool { self.ballot_is_approval_001() }
-    #[inline] fn ballot_is_score_001(&self) -> bool { self.ballot_is_score_001() }
-    #[inline] fn ballot_is_ranked_irv_001(&self) -> bool { self.ballot_is_ranked_irv_001() }
-    #[inline] fn ballot_is_ranked_condorcet_001(&self) -> bool { self.ballot_is_ranked_condorcet_001() }
+    // Forwarders must call inherent `Params` methods; avoid recursive self-calls.
+    #[inline]
+    fn ballot_is_plurality_001(&self) -> bool {
+        vm_core::variables::Params::ballot_is_plurality_001(self)
+    }
+    #[inline]
+    fn ballot_is_approval_001(&self) -> bool {
+        vm_core::variables::Params::ballot_is_approval_001(self)
+    }
+    #[inline]
+    fn ballot_is_score_001(&self) -> bool {
+        vm_core::variables::Params::ballot_is_score_001(self)
+    }
+    #[inline]
+    fn ballot_is_ranked_irv_001(&self) -> bool {
+        vm_core::variables::Params::ballot_is_ranked_irv_001(self)
+    }
+    #[inline]
+    fn ballot_is_ranked_condorcet_001(&self) -> bool {
+        vm_core::variables::Params::ballot_is_ranked_condorcet_001(self)
+    }
 }
 
 // ----- Public entry point ----------------------------------------------------------------------
@@ -150,42 +165,66 @@ pub fn tabulate_all(
 // ----- Per-type dispatchers (thin wrappers around vm_algo::tabulation) --------------------------
 
 fn tabulate_unit_plurality(unit: &UnitInput) -> UnitScores {
+    // vm_algo requires (unit_id, votes, turnout, options)
     tabulation::tabulate_plurality(
         unit.unit_id.clone(),
         &unit.plurality_votes,
         unit.turnout,
+        &unit.options,
     )
+    .expect("tabulate_plurality: inputs must be validated upstream")
 }
 
 fn tabulate_unit_approval(unit: &UnitInput) -> UnitScores {
+    // vm_algo requires (unit_id, approvals, turnout, options)
     tabulation::tabulate_approval(
         unit.unit_id.clone(),
         &unit.approvals,
         unit.turnout,
+        &unit.options,
     )
+    .expect("tabulate_approval: inputs must be validated upstream")
 }
 
-fn tabulate_unit_score(unit: &UnitInput, _p: &Params) -> UnitScores {
-    // Score scale/normalization (002/003/004) are enforced in vm_algo; inputs are already validated.
+fn tabulate_unit_score(unit: &UnitInput, p: &Params) -> UnitScores {
+    // vm_algo requires (unit_id, score_sums, turnout, params, options)
     tabulation::tabulate_score(
         unit.unit_id.clone(),
         &unit.score_sums,
         unit.turnout,
+        p,
+        &unit.options,
     )
+    .expect("tabulate_score: inputs must be validated upstream")
 }
 
 fn tabulate_unit_ranked_irv(
     unit: &UnitInput,
-    _p: &Params,
+    p: &Params,
 ) -> (UnitScores, Option<IrvLog> /*, Option<crate::ties::TieContext>*/) {
-    let (sc, log) = tabulation::tabulate_ranked_irv(&unit.ranked_ballots, &unit.options);
+    // vm_algo requires (unit_id, ballots, options, turnout, params)
+    let (sc, log) = tabulation::tabulate_ranked_irv(
+        unit.unit_id.clone(),
+        &unit.ranked_ballots,
+        &unit.options,
+        unit.turnout,
+        p,
+    );
     (sc, Some(log) /*, None*/)
 }
 
 fn tabulate_unit_ranked_condorcet(
     unit: &UnitInput,
-    _p: &Params,
+    p: &Params,
 ) -> (UnitScores, Option<Pairwise>, Option<CondorcetLog>) {
-    let (sc, pw) = tabulation::tabulate_ranked_condorcet(&unit.ranked_ballots, &unit.options);
-    (sc, Some(pw), None) // CondorcetLog placeholder until vm_algo exposes one
+    // vm_algo requires (unit_id, ballots, options, turnout, params) and returns (scores, pairwise, log)
+    let (sc, pw, _algo_log) = tabulation::tabulate_ranked_condorcet(
+        unit.unit_id.clone(),
+        &unit.ranked_ballots,
+        &unit.options,
+        unit.turnout,
+        p,
+    );
+    // Until a concrete CondorcetLog type is exposed here, stash a minimal placeholder.
+    (sc, Some(pw), Some(CondorcetLog { steps: vec!["condorcet: see algorithm log".into()] }))
 }

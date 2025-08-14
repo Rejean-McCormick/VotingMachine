@@ -1,418 +1,273 @@
-//! vm_report/src/structure.rs
-//! Pure report model + mappers (no I/O, no RNG).
+
+//! vm_report main library — Part 1/2
 //!
-//! Inputs are artifact JSONs (Result / RunRecord / FrontierMap). This module
-//! builds a renderer-friendly `ReportModel` mirroring Doc 7, with all human-
-//! visible numbers preformatted (one-decimal percent; signed pp).
-//!
-//! Determinism: stable field order, BTree maps when needed, no floats.
+//! Aligned to Docs 1–7 and Annexes A–C:
+//!   • Renderer reads canonical artifacts only (no recompute)
+//!   • Outcome-affecting vars come from RunRecord.vars_effective
+//!   • Footer uses *_sha256 digests for inputs
+//!   • Tie policy token matches VM-VAR-050 vocabulary
 
-#![deny(unsafe_code)]
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use vm_io::RunRecord;
 
-use std::collections::BTreeMap;
-
-use vm_core::ids::{FrontierId, ParamSetId, RegId, ResultId, RunId, TallyId};
-use vm_core::rounding::percent_one_decimal_tenths;
-
-// ----- Artifact aliases (decoupled from vm_pipeline/vm_io concrete types) -----
-pub type ResultDb = serde_json::Value;
-pub type RunRecordDb = serde_json::Value;
-pub type FrontierMapDb = serde_json::Value;
-
-// ===================== Model root =====================
-
-#[derive(Clone, Debug)]
-pub struct ReportModel {
-    pub cover: CoverSnapshot,
-    pub eligibility: EligibilityBlock,
-    pub ballot: BallotBlock,
-    pub panel: LegitimacyPanel,
-    pub outcome: OutcomeBlock,
-    pub frontier: Option<FrontierBlock>,
-    pub sensitivity: Option<SensitivityBlock>,
-    pub integrity: IntegrityBlock,
-    pub footer: FooterIds,
-}
-
-// ---------------- Sections ----------------
-
-#[derive(Clone, Debug)]
+/// Snapshot for the cover section (Doc 7)
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoverSnapshot {
-    pub label: String,               // Decisive|Marginal|Invalid
-    pub reason: Option<String>,
-    pub snapshot_vars: Vec<SnapshotVar>, // key/value VM-VARs for cover box
-    pub registry_name: String,
-    pub registry_published_date: String,
-}
-#[derive(Clone, Debug)]
-pub struct SnapshotVar { pub key: String, pub value: String }
-
-#[derive(Clone, Debug)]
-pub struct EligibilityBlock {
-    pub roll_policy: String,                // pretty VM-VAR-028
-    pub totals_eligible_roll: u64,
-    pub totals_ballots_cast: u64,
-    pub totals_valid_ballots: u64,
-    pub per_unit_quorum_note: Option<String>, // VM-VAR-021 + scope
-    pub provenance: String,                 // source/edition string
+    pub fid: String,
+    pub engine_version: String,
+    pub variant: Option<String>,
+    pub created_at: Option<String>, // from Result.created_at
+    pub jurisdiction: Option<String>,
+    pub election_name: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct BallotBlock {
-    pub ballot_type: String,                // VM-VAR-001
-    pub allocation_method: String,          // VM-VAR-010
-    pub weighting_method: String,           // VM-VAR-030
-    pub approval_denominator_sentence: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct GateRow {
-    pub value_pct_1dp: String,              // e.g., "55.0%"
-    pub threshold_pct_0dp: String,          // e.g., "55%"
-    pub pass: bool,
-    pub denom_note: Option<String>,         // “approval rate = approvals / valid ballots”
-    pub members_hint: Option<Vec<String>>,  // double-majority family (ids/names) if present
-}
-
-#[derive(Clone, Debug)]
-pub struct LegitimacyPanel {
-    pub quorum: GateRow,
-    pub majority: GateRow,
-    pub double_majority: Option<(GateRow, GateRow)>, // (national, family)
-    pub symmetry: Option<bool>,
+/// Legitimacy gate pass/fail panel (Doc 4B / 5C)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatePanel {
+    pub label: String,
     pub pass: bool,
     pub reasons: Vec<String>,
+    pub denom_note: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct OutcomeBlock {
-    pub label: String,
-    pub reason: String,
-    pub national_margin_pp: String,         // signed "±pp"
-}
-
-#[derive(Clone, Debug)]
+/// Frontier appendix (Doc 5C, VM-VAR-034=true)
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontierCounters {
-    pub changed: u32, pub no_change: u32, pub mediation: u32,
-    pub enclave: u32, pub protected_blocked: u32, pub quorum_blocked: u32,
+    pub units_total: u64,
+    pub units_passed: u64,
+    pub edges_total: u64,
+    pub edges_passed: u64,
 }
 
-#[derive(Clone, Debug)]
-pub struct FrontierBlock {
-    pub mode: String,                       // VM-VAR-040
-    pub edge_types: String,                 // VM-VAR-047 summary
-    pub island_rule: String,                // VM-VAR-048
-    pub bands_summary: Vec<String>,         // ladder/sliding descriptors
-    pub counters: FrontierCounters,
+/// Footer IDs/digests (Doc 7 integrity)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FooterIntegrity {
+    pub result_id: String,              // "RES:..."
+    pub run_id: String,                 // "RUN:..."
+    pub frontier_id: Option<String>,    // "FR:..." if present
+    pub registry_sha256: String,
+    pub tally_sha256: String,
+    pub params_sha256: String,
+    pub tie_policy: Option<String>,     // "status_quo" | "deterministic_order" | "random"
+    pub tie_seed: Option<u64>,          // only if policy == "random"
 }
 
-#[derive(Clone, Debug)]
-pub struct SensitivityBlock { pub table_2x3: Vec<Vec<String>> }
-
-#[derive(Clone, Debug)]
-pub struct IntegrityBlock {
-    pub engine_vendor: String, pub engine_name: String,
-    pub engine_version: String, pub engine_build: String,
-    pub formula_id_hex: String,
-    pub tie_policy: String, pub tie_seed: Option<String>,
-    pub started_utc: String, pub finished_utc: String,
+/// Top-level report model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportModel {
+    pub cover: CoverSnapshot,
+    pub gates: Vec<GatePanel>,
+    pub frontier: Option<FrontierCounters>,
+    pub footer: FooterIntegrity,
 }
 
-#[derive(Clone, Debug)]
-pub struct FooterIds {
-    pub result_id: ResultId,
-    pub run_id: RunId,
-    pub frontier_id: Option<FrontierId>,
-    pub reg_id: RegId,
-    pub param_set_id: ParamSetId,
-    pub tally_id: Option<TallyId>,
+/// Helper: fetch string at JSON Pointer
+#[inline]
+pub fn j_str(v: &Value, ptr: &str) -> Option<String> {
+    v.pointer(ptr).and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
-// ===================== Top-level mapping API =====================
+/// Helper: parse integer at JSON Pointer
+#[inline]
+pub fn j_u64(v: &Value, ptr: &str) -> Option<u64> {
+    v.pointer(ptr).and_then(|x| x.as_u64())
+}
 
-/// Build the full model from artifacts (pure, deterministic; no I/O).
-pub fn model_from_artifacts(
-    result: &ResultDb,
-    run: &RunRecordDb,
-    frontier: Option<&FrontierMapDb>
-) -> ReportModel {
-    let cover = map_cover_snapshot(result);
-    let eligibility = map_eligibility(result);
-    let ballot = map_ballot(result);
-    let panel = map_panel_from_gates(result);
-    let outcome = map_outcome_from_result(result);
-    let frontier_block = frontier.map(|fr| map_frontier(fr, result));
-    let sensitivity = map_sensitivity(result);
-    let (integrity, footer) = map_integrity_footer(run, result, frontier);
-
-    ReportModel {
-        cover,
-        eligibility,
-        ballot,
-        panel,
-        outcome,
-        frontier: frontier_block,
-        sensitivity,
-        integrity,
-        footer,
+/// Map cover snapshot from canonical Result + RunRecord
+pub fn map_cover_snapshot(result: &Value, run: &RunRecord) -> CoverSnapshot {
+    CoverSnapshot {
+        fid: run.fid.clone(),
+        engine_version: run.engine_version.clone(),
+        variant: run.variant.clone(),
+        created_at: j_str(result, "/created_at"),
+        jurisdiction: j_str(result, "/jurisdiction"),
+        election_name: j_str(result, "/election_name"),
     }
 }
 
-// ===================== Mapping helpers =====================
+/// Map gates panel list from canonical Result.gates
+pub fn map_gates(result: &Value) -> Vec<GatePanel> {
+    let mut panels = Vec::new();
+    if let Some(gates_obj) = result.pointer("/gates").and_then(|x| x.as_object()) {
+        for (gate_name, gate_val) in gates_obj {
+            let pass = gate_val.get("pass").and_then(|x| x.as_bool()).unwrap_or(false);
+            let reasons = gate_val
+                .get("reasons")
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default();
 
-pub fn map_cover_snapshot(result: &ResultDb) -> CoverSnapshot {
-    let label = j_str(result, "/label").unwrap_or_else(|| "Invalid".into());
-    let reason = j_str(result, "/label_reason");
-    let mut snapshot_vars = Vec::<SnapshotVar>::new();
+            // No hard-coded denom_note — only if engine provided
+            let denom_note = gate_val
+                .get("denom_note")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string());
 
-    if let Some(bt) = j_str(result, "/params/ballot_type") {
-        snapshot_vars.push(SnapshotVar{ key: "ballot_type".into(), value: bt });
-    }
-    if let Some(am) = j_str(result, "/params/allocation_method") {
-        snapshot_vars.push(SnapshotVar{ key: "allocation_method".into(), value: am });
-    }
-    if let Some(wm) = j_str(result, "/aggregates/weighting_method") {
-        snapshot_vars.push(SnapshotVar{ key: "weighting_method".into(), value: wm });
-    }
-    if let Some(th) = j_u64(result, "/params/pr_entry_threshold_pct") {
-        snapshot_vars.push(SnapshotVar{ key: "pr_entry_threshold_pct".into(), value: format!("{}%", th) });
-    }
-    if let Some(dm) = j_bool(result, "/params/double_majority_enabled") {
-        snapshot_vars.push(SnapshotVar{ key: "double_majority_enabled".into(), value: dm.to_string() });
-    }
-    if let Some(sym) = j_bool(result, "/params/symmetry_enabled") {
-        snapshot_vars.push(SnapshotVar{ key: "symmetry_enabled".into(), value: sym.to_string() });
-    }
-    if let Some(fm) = j_str(result, "/params/frontier_mode") {
-        snapshot_vars.push(SnapshotVar{ key: "frontier_mode".into(), value: fm });
-    }
-
-    let registry_name = j_str(result, "/provenance/registry_name").unwrap_or_else(|| "registry".into());
-    let registry_published_date = j_str(result, "/provenance/registry_published_date").unwrap_or_else(|| "".into());
-
-    CoverSnapshot { label, reason, snapshot_vars, registry_name, registry_published_date }
-}
-
-pub fn map_eligibility(result: &ResultDb) -> EligibilityBlock {
-    let roll_policy = j_str(result, "/params/roll_inclusion_policy").unwrap_or_else(|| "unspecified".into());
-    let totals_eligible_roll = j_u64(result, "/aggregates/turnout/eligible_roll").unwrap_or(0);
-    let totals_ballots_cast  = j_u64(result, "/aggregates/turnout/ballots_cast").unwrap_or(0);
-    let totals_valid_ballots = j_u64(result, "/aggregates/turnout/valid_ballots").unwrap_or(0);
-
-    let per_unit_quorum_note = j_u64(result, "/params/quorum_per_unit_pct")
-        .and_then(|q| if q > 0 {
-            let scope = j_str(result, "/params/quorum_per_unit_scope").unwrap_or_else(|| "units".into());
-            Some(format!("Per-unit quorum applied at {}% (scope: {})", q, scope))
-        } else { None });
-
-    let provenance = j_str(result, "/provenance/registry_source")
-        .or_else(|| j_str(result, "/provenance/registry_name"))
-        .unwrap_or_else(|| "registry".into());
-
-    EligibilityBlock {
-        roll_policy,
-        totals_eligible_roll,
-        totals_ballots_cast,
-        totals_valid_ballots,
-        per_unit_quorum_note,
-        provenance,
-    }
-}
-
-pub fn map_ballot(result: &ResultDb) -> BallotBlock {
-    let ballot_type = j_str(result, "/params/ballot_type").unwrap_or_else(|| "unspecified".into());
-    let allocation_method = j_str(result, "/params/allocation_method").unwrap_or_else(|| "unspecified".into());
-    let weighting_method  = j_str(result, "/aggregates/weighting_method").unwrap_or_else(|| "unspecified".into());
-    let approval_denominator_sentence = ballot_type == "approval";
-
-    BallotBlock { ballot_type, allocation_method, weighting_method, approval_denominator_sentence }
-}
-
-pub fn map_panel_from_gates(result: &ResultDb) -> LegitimacyPanel {
-    let gates = result.pointer("/gates").cloned().unwrap_or_default();
-
-    let quorum = GateRow {
-        value_pct_1dp: percent_number_to_1dp_str(gates.pointer("/quorum/observed")),
-        threshold_pct_0dp: j_u64(&gates, "/quorum/threshold_pct").map(|v| format!("{}%", v)).unwrap_or_else(|| "0%".into()),
-        pass: j_bool(&gates, "/quorum/pass").unwrap_or(false),
-        denom_note: None,
-        members_hint: None,
-    };
-
-    let majority = GateRow {
-        value_pct_1dp: percent_number_to_1dp_str(gates.pointer("/majority/observed")),
-        threshold_pct_0dp: j_u64(&gates, "/majority/threshold_pct").map(|v| format!("{}%", v)).unwrap_or_else(|| "0%".into()),
-        pass: j_bool(&gates, "/majority/pass").unwrap_or(false),
-        denom_note: Some("approval rate = approvals / valid ballots".into()),
-        members_hint: None,
-    };
-
-    let double_majority = gates.pointer("/double_majority").and_then(|dm| {
-        let nat = GateRow {
-            value_pct_1dp: percent_number_to_1dp_str(dm.pointer("/national/observed")),
-            threshold_pct_0dp: j_u64(dm, "/national/threshold_pct").map(|v| format!("{}%", v)).unwrap_or_else(|| "0%".into()),
-            pass: j_bool(dm, "/national/pass").unwrap_or(false),
-            denom_note: Some("approval rate = approvals / valid ballots".into()),
-            members_hint: None,
-        };
-        let fam = GateRow {
-            value_pct_1dp: percent_number_to_1dp_str(dm.pointer("/regional/observed")),
-            threshold_pct_0dp: j_u64(dm, "/regional/threshold_pct").map(|v| format!("{}%", v)).unwrap_or_else(|| "0%".into()),
-            pass: j_bool(dm, "/regional/pass").unwrap_or(false),
-            denom_note: Some("approval rate = approvals / valid ballots".into()),
-            members_hint: dm.pointer("/members")
-                .and_then(|lst| lst.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
-        };
-        Some((nat, fam))
-    });
-
-    let symmetry = gates.pointer("/symmetry").and_then(|s| s.get("pass")).and_then(|v| v.as_bool());
-    let pass = j_bool(&gates, "/pass").unwrap_or(false);
-    let reasons = gates.pointer("/reasons")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    LegitimacyPanel { quorum, majority, double_majority, symmetry, pass, reasons }
-}
-
-pub fn map_outcome_from_result(result: &ResultDb) -> OutcomeBlock {
-    let label  = j_str(result, "/label").unwrap_or_else(|| "Invalid".into());
-    let reason = j_str(result, "/label_reason").unwrap_or_else(|| "gates_failed".into());
-    let nmargin = j_i64(result, "/aggregates/national_margin_pp").unwrap_or(0) as i32;
-
-    OutcomeBlock {
-        label,
-        reason,
-        national_margin_pp: pp_signed(nmargin),
-    }
-}
-
-pub fn map_frontier(fr: &FrontierMapDb, result: &ResultDb) -> FrontierBlock {
-    // Mode/edges/island can be read from params echoed in Result; fallback to FR if present.
-    let mode        = j_str(result, "/params/frontier_mode")
-        .or_else(|| j_str(fr, "/mode")).unwrap_or_else(|| "none".into());
-    let edge_types  = j_str(result, "/params/contiguity_edge_types")
-        .or_else(|| j_str(fr, "/edge_policy")).unwrap_or_else(|| "land".into());
-    let island_rule = j_str(result, "/params/island_exception_rule")
-        .or_else(|| j_str(fr, "/island_rule")).unwrap_or_else(|| "none".into());
-
-    let bands_summary = fr.pointer("/bands_summary")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|s| s.as_str().map(|x| x.to_string())).collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    let counters = FrontierCounters {
-        changed: j_u64(fr, "/summary/changed").unwrap_or(0) as u32,
-        no_change: j_u64(fr, "/summary/no_change").unwrap_or(0) as u32,
-        mediation: j_u64(fr, "/summary/mediation").unwrap_or(0) as u32,
-        enclave: j_u64(fr, "/summary/enclave").unwrap_or(0) as u32,
-        protected_blocked: j_u64(fr, "/summary/protected_blocked").unwrap_or(0) as u32,
-        quorum_blocked: j_u64(fr, "/summary/quorum_blocked").unwrap_or(0) as u32,
-    };
-
-    FrontierBlock { mode, edge_types, island_rule, bands_summary, counters }
-}
-
-pub fn map_sensitivity(_result: &ResultDb) -> Option<SensitivityBlock> {
-    // v1: no scenario compare; return None for a lean model.
-    None
-}
-
-pub fn map_integrity_footer(
-    run: &RunRecordDb,
-    result: &ResultDb,
-    frontier: Option<&FrontierMapDb>
-) -> (IntegrityBlock, FooterIds) {
-    let engine_vendor  = j_str(run, "/engine/vendor").unwrap_or_else(|| "vm-engine".into());
-    let engine_name    = j_str(run, "/engine/name").unwrap_or_else(|| "vm".into());
-    let engine_version = j_str(run, "/engine/version").unwrap_or_else(|| "0.1.0".into());
-    let engine_build   = j_str(run, "/engine/build").unwrap_or_else(|| "dev".into());
-    let formula_id_hex = j_str(run, "/formula_id")
-        .or_else(|| j_str(result, "/formula_id"))
-        .unwrap_or_else(|| "unknown".into());
-    let tie_policy     = j_str(run, "/determinism/tie_policy").unwrap_or_else(|| "deterministic".into());
-    let tie_seed       = if tie_policy == "random" { j_str(run, "/determinism/rng_seed") } else { None };
-    let started_utc    = j_str(run, "/started_utc").unwrap_or_else(|| "1970-01-01T00:00:00Z".into());
-    let finished_utc   = j_str(run, "/finished_utc").unwrap_or_else(|| "1970-01-01T00:00:00Z".into());
-
-    let integrity = IntegrityBlock {
-        engine_vendor, engine_name, engine_version, engine_build,
-        formula_id_hex, tie_policy, tie_seed, started_utc, finished_utc,
-    };
-
-    let result_id   : ResultId   = j_str(run, "/outputs/result_id").unwrap_or_else(|| "RES:unknown".into()).into();
-    let run_id      : RunId      = j_str(run, "/id").unwrap_or_else(|| "RUN:unknown".into()).into();
-    let frontier_id : Option<FrontierId> = frontier
-        .and_then(|_| j_str(run, "/outputs/frontier_map_id"))
-        .map(Into::into);
-
-    let reg_id      : RegId      = j_str(run, "/inputs/reg_id").unwrap_or_else(|| "REG:unknown".into()).into();
-    let param_set_id: ParamSetId = j_str(run, "/inputs/parameter_set_id").unwrap_or_else(|| "PS:unknown".into()).into();
-    let tally_id    : Option<TallyId> = j_str(run, "/inputs/ballot_tally_id").map(Into::into);
-
-    let footer = FooterIds {
-        result_id, run_id, frontier_id, reg_id, param_set_id, tally_id
-    };
-
-    (integrity, footer)
-}
-
-// ===================== Formatting helpers (integer math; no floats) =====================
-
-/// Format % to one decimal using integer tenths from `percent_one_decimal_tenths`.
-pub fn pct_1dp(num: i128, den: i128) -> String {
-    if den <= 0 { return "0.0%".into(); }
-    let tenths = percent_one_decimal_tenths(num, den);
-    let whole = tenths / 10;
-    let frac  = (tenths % 10).abs();
-    format!("{}.{}%", whole, frac)
-}
-/// "55%"
-pub fn pct0(value_u8: u8) -> String { format!("{}%", value_u8) }
-
-/// "+3 pp" / "-2 pp"
-pub fn pp_signed(pp_i32: i32) -> String {
-    if pp_i32 >= 0 { format!("+{} pp", pp_i32) } else { format!("{} pp", pp_i32) }
-}
-
-// ===================== Small JSON helpers (pure) =====================
-
-fn j_str(root: &serde_json::Value, ptr: &str) -> Option<String> {
-    root.pointer(ptr).and_then(|v| v.as_str().map(|s| s.to_string()))
-}
-fn j_u64(root: &serde_json::Value, ptr: &str) -> Option<u64> {
-    root.pointer(ptr).and_then(|v| v.as_u64())
-}
-fn j_i64(root: &serde_json::Value, ptr: &str) -> Option<i64> {
-    root.pointer(ptr).and_then(|v| v.as_i64())
-}
-fn j_bool(root: &serde_json::Value, ptr: &str) -> Option<bool> {
-    root.pointer(ptr).and_then(|v| v.as_bool())
-}
-
-/// Convert a JSON number 0..=100 (stringified) to one-decimal percent **without**
-/// float arithmetic. If not present, returns "0.0%".
-fn percent_number_to_1dp_str(maybe: Option<&serde_json::Value>) -> String {
-    let s = match maybe {
-        Some(serde_json::Value::Number(n)) => n.to_string(),
-        _ => return "0.0%".into(),
-    };
-    // Ensure exactly one decimal place (truncate if more; add ".0" if none).
-    if let Some(dot) = s.find('.') {
-        let after = &s[dot + 1..];
-        if after.is_empty() {
-            format!("{}0%", s)
-        } else {
-            let end = dot + 2.min(s.len() - dot - 1);
-            let mut out = String::with_capacity(dot + 2 + 1);
-            out.push_str(&s[..=dot]); // include '.'
-            out.push_str(&s[dot + 1..end]);
-            out.push('%');
-            out
+            panels.push(GatePanel {
+                label: gate_name.clone(),
+                pass,
+                reasons,
+                denom_note,
+            });
         }
-    } else {
-        format!("{}.0%", s)
+    }
+    panels
+}
+
+/// Map frontier counters from canonical FrontierMap (if VM-VAR-034=true)
+pub fn map_frontier(frontier: &Value) -> Option<FrontierCounters> {
+    let units_total = j_u64(frontier, "/units_total")?;
+    let units_passed = j_u64(frontier, "/units_passed")?;
+    let edges_total = j_u64(frontier, "/edges_total")?;
+    let edges_passed = j_u64(frontier, "/edges_passed")?;
+    Some(FrontierCounters {
+        units_total,
+        units_passed,
+        edges_total,
+        edges_passed,
+    })
+}
+
+/// Map footer integrity block from RunRecord (+ optional vars_effective)
+pub fn map_footer(_result: &Value, run: &RunRecord) -> FooterIntegrity {
+    // Outcome-affecting vars are echoed via RunRecord.vars_effective.
+    // We read the canonical strings and normalize policy tokens at the source (engine).
+    let tie_policy = run.vars_effective.get("tie_policy").cloned();
+    let tie_seed = run
+        .vars_effective
+        .get("tie_seed")
+        .and_then(|s| s.parse::<u64>().ok());
+
+    FooterIntegrity {
+        result_id: run.result_id.clone(),
+        run_id: run.run_id.clone(),
+        frontier_id: run.frontier_id.clone(),
+        registry_sha256: run.inputs.registry_sha256.clone(),
+        tally_sha256: run.inputs.tally_sha256.clone(),
+        params_sha256: run.inputs.params_sha256.clone(),
+        tie_policy,
+        tie_seed,
+    }
+}
+//! vm_report main library — Part 2/2
+//! Completes the report mappers and provides a single entry to build the model
+//! from canonical artifacts. Includes safe, spec-aligned percent formatting.
+
+/* --------------------------- Report assembly entrypoint --------------------------- */
+
+/// Build the full `ReportModel` from canonical artifacts.
+/// - `result_json`: parsed `result.json`
+/// - `run`: parsed `run_record.json`
+/// - `frontier_map`: parsed `frontier_map.json` **iff** it was emitted
+///
+/// Notes:
+/// • We only include the frontier appendix if a `frontier_map` was provided.
+/// • No recomputation: all fields are echoed from canonical artifacts.
+pub fn build_report_model(
+    result_json: &serde_json::Value,
+    run: &vm_io::RunRecord,
+    frontier_map: Option<&serde_json::Value>,
+) -> ReportModel {
+    let cover: CoverSnapshot = map_cover_snapshot(result_json, run);
+    let gates: Vec<GatePanel> = map_gates(result_json);
+    let frontier: Option<FrontierCounters> = frontier_map.and_then(map_frontier);
+    let footer: FooterIntegrity = map_footer(result_json, run);
+
+    ReportModel { cover, gates, frontier, footer }
+}
+
+/* --------------------------- Presentation utilities ------------------------------ */
+
+/// Format a fraction `x` (0.0..=1.0) as a percentage with **one decimal place**,
+/// round-half-up, ASCII-only, locale-neutral. Returns `"—"` if `x` is NaN/∞/out of range.
+pub fn percent_1dp(x: f64) -> String {
+    if !x.is_finite() || x < 0.0 || x > 1.0 {
+        return "—".to_string();
+    }
+    // Round-half-up at one decimal place for percentage (×100).
+    // Add a tiny epsilon to emulate half-up rather than bankers rounding.
+    let v = x * 100.0;
+    let scaled = (v * 10.0 + 0.5_f64).floor() / 10.0;
+    format!("{scaled:.1}%")
+}
+
+/// Attempt to parse a JSON value into f64 robustly (number or numeric string).
+#[inline]
+pub fn json_number_to_f64(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Convenience: read a fraction at `ptr` from `obj` and format with `percent_1dp`.
+/// Returns `None` if the pointer is missing or not a number.
+pub fn percent_at(obj: &serde_json::Value, ptr: &str) -> Option<String> {
+    obj.pointer(ptr)
+        .and_then(json_number_to_f64)
+        .map(percent_1dp)
+}
+
+/* ------------------------------------- Tests -------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_formats_round_half_up() {
+        assert_eq!(percent_1dp(0.0), "0.0%");
+        assert_eq!(percent_1dp(1.0), "100.0%");
+        // 12.34% → 12.3%
+        assert_eq!(percent_1dp(0.1234), "12.3%");
+        // 12.35% → 12.4% (half-up)
+        assert_eq!(percent_1dp(0.1235), "12.4%");
+        // out-of-range / non-finite
+        assert_eq!(percent_1dp(f64::NAN), "—");
+        assert_eq!(percent_1dp(-0.01), "—");
+        assert_eq!(percent_1dp(1.01), "—");
+    }
+
+    #[test]
+    fn json_number_parsing() {
+        assert_eq!(json_number_to_f64(&serde_json::Value::from(0.25f64)).unwrap(), 0.25);
+        assert_eq!(json_number_to_f64(&serde_json::Value::from("0.25")).unwrap(), 0.25);
+        assert!(json_number_to_f64(&serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn assemble_minimal_report() {
+        // Minimal result.json with gates {}
+        let result = serde_json::json!({
+            "created_at": "2025-08-12T10:00:00Z",
+            "gates": {}
+        });
+        // Minimal RunRecord
+        let run = vm_io::RunRecord {
+            fid: "FID:deadbeef".into(),
+            engine_version: "VM-ENGINE v0".into(),
+            variant: None,
+            result_id: "RES:abc".into(),
+            run_id: "RUN:abc".into(),
+            frontier_id: None,
+            inputs: vm_io::InputDigests {
+                registry_sha256: "r".into(),
+                tally_sha256: "t".into(),
+                params_sha256: "p".into(),
+                frontier_inputs_sha256: None,
+            },
+            vars_effective: std::collections::BTreeMap::from([]),
+        };
+
+        let model = build_report_model(&result, &run, None);
+        assert_eq!(model.cover.created_at.as_deref(), Some("2025-08-12T10:00:00Z"));
+        assert!(model.frontier.is_none());
+        assert_eq!(model.footer.result_id, "RES:abc");
     }
 }

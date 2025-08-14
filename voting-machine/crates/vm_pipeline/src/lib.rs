@@ -1,296 +1,537 @@
-//! vm_pipeline — deterministic pipeline surface (load→validate→tabulate→allocate→aggregate→gates→frontier→label→build)
-//! This crate stays I/O-free and delegates JSON/Schema/Hashing to `vm_io` and math to `vm_algo`.
-//! The code below is a scaffolded pipeline skeleton with stable types and IDs; fill
-//! in the stage internals incrementally without changing these public signatures.
+//! VM Engine — core artifacts & canonicalization (Part 1/2)
+//! This file provides:
+//! - Canonical JSON utilities (stable key ordering, LF endings)
+//! - SHA-256 helpers and ID prefixes (RES:, RUN:, FR:)
+//! - Core data types (ResultDoc, RunRecordDoc, FrontierMapDoc)
+//! - “NoId → WithId” builders for canonical artifacts
+//!
+//! Part 2 adds orchestration (run functions, self-verify, file IO).
 
-use std::path::Path;
+use sha2::{Digest, Sha256};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{self as json, Value};
 
-use vm_core::{
-    ids::*,
-    entities::*,
-    variables::Params,
-};
-use vm_io::{
-    manifest,
-    loader::{self, LoadedContext},
-    canonical_json,
-    hasher,
-};
-
-/// Engine identifiers (baked by the build system in real deployments).
-#[derive(Debug, Clone)]
-pub struct EngineMeta {
-    pub vendor: String,
-    pub name: String,
-    pub version: String,
-    pub build: String,
+/// ----- Error type -----
+#[derive(thiserror::Error, Debug)]
+pub enum EngineError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] json::Error),
+    #[error("Timestamp must be RFC3339 with Z (UTC): {0}")]
+    BadTimestamp(String),
+    #[error("Spec violation: {0}")]
+    Spec(String),
+    #[error("Internal: {0}")]
+    Internal(String),
 }
 
-/// Pipeline context: inputs are already loaded and validated by vm_io;
-/// `nm_canonical` is the Normative Manifest JSON used to compute the Formula ID.
-#[derive(Debug)]
-pub struct PipelineCtx {
-    pub loaded: LoadedContext,
-    pub engine_meta: EngineMeta,
-    pub nm_canonical: serde_json::Value,
+/// ----- Tie policy (determinism contract) -----
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TiePolicy {
+    /// Deterministic based on the canonical order (e.g., unit_id then order_index).
+    #[serde(rename = "deterministic_order")]
+    DeterministicOrder,
+    /// Uses RNG only when a real tie occurs.
+    #[serde(rename = "random")]
+    Random,
 }
 
-/// Top-level pipeline outputs: Result, RunRecord, optional FrontierMap.
-#[derive(Debug)]
-pub struct PipelineOutputs {
-    pub result: ResultDoc,
-    pub run_record: RunRecordDoc,
-    pub frontier_map: Option<FrontierMapDoc>,
+/// Determinism echo in RunRecord (what policy was in effect and whether RNG took place).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Determinism {
+    pub tie_policy: TiePolicy,
+    /// Present only if the policy is random *and* at least one random tie occurred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rng_seed: Option<u64>,
 }
 
-/// Single error surface for the pipeline orchestration.
-#[derive(Debug)]
-pub enum PipelineError {
-    Io(String),
-    Schema(String),
-    Validate(String),
-    Tabulate(String),
-    Allocate(String),
-    Gates(String),
-    Frontier(String),
-    Tie(String),
-    Build(String),
-}
+/// ----- Canonical JSON helpers -----
 
-impl From<vm_io::IoError> for PipelineError {
-    fn from(e: vm_io::IoError) -> Self {
-        use PipelineError::*;
-        // Map all vm_io errors to Io/Schema/Hash/Path-ish buckets with stable text.
-        match e {
-            vm_io::IoError::Schema { pointer, msg } => Schema(format!("{pointer}: {msg}")),
-            vm_io::IoError::Json { pointer, msg } => Schema(format!("json {pointer}: {msg}")),
-            vm_io::IoError::Read(e) => Io(format!("read: {e}")),
-            vm_io::IoError::Write(e) => Io(format!("write: {e}")),
-            vm_io::IoError::Manifest(m) => Validate(format!("manifest: {m}")),
-            vm_io::IoError::Expect(m) => Validate(format!("expect: {m}")),
-            vm_io::IoError::Canon(m) => Build(format!("canon: {m}")),
-            vm_io::IoError::Hash(m) => Build(format!("hash: {m}")),
-            vm_io::IoError::Path(m) => Io(format!("path: {m}")),
-            vm_io::IoError::Limit(m) => Io(format!("limit: {m}")),
+/// Recursively sort object keys to guarantee deterministic serialization.
+/// Arrays retain order; numbers/strings/booleans are passed through.
+fn canonicalize_value(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = json::Map::new();
+            for k in keys {
+                out.insert(k.clone(), canonicalize_value(&map[k]));
+            }
+            Value::Object(out)
         }
+        Value::Array(a) => {
+            let mut out = Vec::with_capacity(a.len());
+            for item in a {
+                out.push(canonicalize_value(item));
+            }
+            Value::Array(out)
+        }
+        _ => v.clone(),
     }
 }
 
-// ---------------------------- Result / RunRecord / Frontier docs ----------------------------
-// These are minimal, typed mirrors of the external schemas with only the stable fields needed
-// for end-to-end ID computation. Extend in-place without changing field names or types.
+/// Convert any Serialize into canonical, LF-terminated UTF-8 bytes.
+fn to_canonical_bytes<T: Serialize>(t: &T) -> Result<Vec<u8>, EngineError> {
+    let v = json::to_value(t)?;
+    let c = canonicalize_value(&v);
+    let mut s = json::to_string(&c)?;
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    Ok(s.into_bytes())
+}
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    hex::encode(digest)
+}
+
+/// Validate and normalize an RFC3339 UTC timestamp (must end with 'Z').
+fn normalize_timestamp_utc(ts: &str) -> Result<String, EngineError> {
+    let dt: DateTime<Utc> = ts.parse::<DateTime<Utc>>()
+        .map_err(|_| EngineError::BadTimestamp(ts.to_string()))?;
+    Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+/// ----- Artifact IDs & wrappers -----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdOnly {
+    pub id: String,
+    pub sha256: String,
+}
+
+/// Result.json (canonical, outcome-carrying summary).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResultDoc {
-    pub id: String,             // "RES:<hex64>"
-    pub formula_id: String,     // 64-hex
-    pub label: LabelBlock,      // {value, reason?}
-    // In a fuller implementation you’d add: gates panel, per-unit blocks, aggregates, shares, etc.
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct LabelBlock {
-    pub value: String,             // "Decisive" | "Marginal" | "Invalid"
+    pub id: String,                // "RES:<sha256>"
+    pub formula_id: String,        // FID (sha256 of Normative Manifest)
+    pub engine_version: String,    // e.g., "VM-ENGINE v0"
+    pub created_at: String,        // RFC3339 UTC
+    pub summary: ResultSummary,
+    pub units: Vec<UnitResult>,    // ordered
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub label: Option<String>,     // presentation-only; computed post-allocation
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResultSummary {
+    pub unit_count: u64,
+    pub allocation_count: u64,
+    pub tie_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnitResult {
+    pub unit_id: String,
+    /// Example outcome payload (keep minimal here; align your model as needed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+}
+
+/// RunRecord (canonical trace of a run).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecordDoc {
-    pub id: String,                                // "RUN:<ts>-<hex64>"
-    pub timestamp_utc: String,                     // RFC3339 Z
-    pub engine: EngineMeta,                        // vendor/name/version/build
-    pub formula_id: String,                        // 64-hex
-    pub normative_manifest_sha256: String,         // nm_digest
-    pub inputs: RunInputs,                         // input IDs + digests
-    pub policy: TiePolicyEcho,                     // tie policy (+seed if random)
-    pub outputs: RunOutputs,                       // produced artifacts (+hashes)
+    pub run_id: String,            // "RUN:<timestamp>-<sha256>"
+    pub timestamp_utc: String,     // RFC3339 UTC
+    pub formula_id: String,        // same FID as in ResultDoc
+    pub determinism: Determinism,  // tie policy + rng echo (if any)
+    pub inputs: InputsEcho,        // hashes/digests of inputs used
+    pub vars_effective: json::Map<String, Value>, // Included vars actually used
+    pub outputs: RunOutputs,       // produced artifact IDs + hashes
+    #[serde(default)]
+    pub ties: Vec<TieEvent>,       // ordered by unit/time as produced
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RunInputs {
-    pub division_registry_id: String,
-    pub division_registry_sha256: String,
-    pub ballot_tally_id: String,
-    pub ballot_tally_sha256: String,
-    pub parameter_set_id: String,
-    pub parameter_set_sha256: String,
+/// Digest wrapper for the Normative Manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NmDigest {
+    pub nm_sha256: String,
+}
+
+/// Inputs echoed in the run record (digests only; no raw content).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputsEcho {
+    /// Nested digest object (canonical shape).
+    pub nm_digest: NmDigest,
+    /// Optional additional inputs (registries, tallies, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub adjacency_sha256: Option<String>,
+    pub extra: Option<json::Map<String, Value>>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TiePolicyEcho {
-    pub tie_policy: String,                 // "status_quo" | "deterministic" | "random"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rng_seed: Option<u64>,              // present iff policy == random
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Produced artifacts (+hashes) of the run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunOutputs {
-    pub result_id: String,                  // "RES:<hex64>"
+    pub result_id: String,
     pub result_sha256: String,
+    pub run_record_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub frontier_map_id: Option<String>,    // "FR:<hex64>"
+    pub frontier_map_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frontier_map_sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Canonical record of a random tie (only when RNG actually used).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TieEvent {
+    pub unit_id: String,
+    /// Optional extra detail (band, competing candidates, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Optional frontier map (presentation-supporting; separate canonical artifact).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontierEntry {
+    pub unit_id: String,
+    pub band_met: String, // token per spec glossary; keep minimal here
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontierMapDoc {
-    pub id: String,                         // "FR:<hex64>"
-    pub summary: FrontierMapSummary,
+    pub id: String,        // "FR:<sha256>"
+    pub created_at: String,
+    pub entries: Vec<FrontierEntry>, // ordered
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-pub struct FrontierMapSummary {
-    pub band_counts: std::collections::BTreeMap<String, u32>,
-    pub mediation_units: u32,
-    pub enclave_units: u32,
-    pub any_protected_override: bool,
+/// Internal “NoId” shapes used to compute canonical bytes and derive IDs.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResultNoId {
+    pub formula_id: String,
+    pub engine_version: String,
+    pub created_at: String,
+    pub summary: ResultSummary,
+    pub units: Vec<UnitResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
-// -------------------------------------- Public API --------------------------------------
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunRecordNoId {
+    pub timestamp_utc: String,
+    pub formula_id: String,
+    pub determinism: Determinism,
+    pub inputs: InputsEcho,
+    pub vars_effective: json::Map<String, Value>,
+    pub outputs: RunOutputsNoRunHash, // run_hash not yet known
+    #[serde(default)]
+    pub ties: Vec<TieEvent>,
+}
 
-/// Orchestrate the pipeline with a preloaded context.
-/// NOTE: This scaffold emits a minimal but canonical Result/RunRecord (and optional FrontierMap),
-/// computing IDs via vm_io::hasher. Fill in each stage (TABULATE/ALLOCATE/…) behind these fences.
-pub fn run_with_ctx(ctx: PipelineCtx) -> Result<PipelineOutputs, PipelineError> {
-    // --- Compute Formula ID from Normative Manifest (NM) ---
-    let fid = compute_formula_id(&ctx.nm_canonical);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunOutputsNoRunHash {
+    pub result_id: String,
+    pub result_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontier_map_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontier_map_sha256: Option<String>,
+}
 
-    // --- LABEL (placeholder) ---
-    // For the scaffold, consider any non-empty FID as "Decisive".
-    let label = LabelBlock { value: "Decisive".to_string(), reason: None };
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FrontierMapNoId {
+    pub created_at: String,
+    pub entries: Vec<FrontierEntry>,
+}
 
-    // --- BUILD_RESULT (without id) ---
-    #[derive(serde::Serialize)]
-    struct ResultNoId<'a> {
-        formula_id: &'a str,
-        label: &'a LabelBlock,
-    }
-    let res_no_id = ResultNoId { formula_id: &fid, label: &label };
-    let res_id = hasher::res_id_from_canonical(&res_no_id)
-        .map_err(PipelineError::from)?;
-    let res_bytes = canonical_json::to_canonical_bytes(&res_no_id).map_err(PipelineError::from)?;
-    let res_sha = hasher::sha256_hex(&res_bytes);
+/// Compute Formula ID (FID) from the **Normative Manifest** canonical bytes.
+pub fn compute_formula_id(normative_manifest: &Value) -> Result<String, EngineError> {
+    let nm_canon = to_canonical_bytes(normative_manifest)?;
+    Ok(sha256_hex(&nm_canon))
+}
 
-    let result = ResultDoc {
-        id: res_id.clone(),
-        formula_id: fid.clone(),
-        label,
+/// Build a canonical Result artifact from a fully-specified `ResultNoId`.
+fn finalize_result(noid: &ResultNoId) -> Result<(ResultDoc, String), EngineError> {
+    let bytes = to_canonical_bytes(noid)?;
+    let hash = sha256_hex(&bytes);
+    let id = format!("RES:{hash}");
+    let with_id = ResultDoc {
+        id: id.clone(),
+        formula_id: noid.formula_id.clone(),
+        engine_version: noid.engine_version.clone(),
+        created_at: noid.created_at.clone(),
+        summary: noid.summary.clone(),
+        units: noid.units.clone(),
+        label: noid.label.clone(),
+    };
+    Ok((with_id, hash))
+}
+
+/// Build a canonical FrontierMap artifact (if present).
+fn finalize_frontier(noid: &FrontierMapNoId) -> Result<(FrontierMapDoc, String), EngineError> {
+    let bytes = to_canonical_bytes(noid)?;
+    let hash = sha256_hex(&bytes);
+    let id = format!("FR:{hash}");
+    let with_id = FrontierMapDoc {
+        id,
+        created_at: noid.created_at.clone(),
+        entries: noid.entries.clone(),
+    };
+    Ok((with_id, hash))
+}
+
+/// Build a canonical RunRecord artifact.
+/// Note: `run_id` includes the timestamp and the hash of the canonical run record bytes.
+fn finalize_run_record(
+    timestamp_utc: &str,
+    formula_id: &str,
+    determinism: Determinism,
+    inputs: InputsEcho,
+    vars_effective: json::Map<String, Value>,
+    result_id: &str,
+    result_sha256: &str,
+    ties: Vec<TieEvent>,
+    frontier_map: Option<IdOnly>,
+) -> Result<(RunRecordDoc, String), EngineError> {
+    let ts = normalize_timestamp_utc(timestamp_utc)?;
+    let outputs_no_run = RunOutputsNoRunHash {
+        result_id: result_id.to_string(),
+        result_sha256: result_sha256.to_string(),
+        frontier_map_id: frontier_map.as_ref().map(|x| x.id.clone()),
+        frontier_map_sha256: frontier_map.as_ref().map(|x| x.sha256.clone()),
     };
 
-    // --- (Optional) FRONTIER MAP (skipped unless enabled and gates pass) ---
-    // This scaffold emits None; fill in by calling vm_algo::gates_frontier (apply_decision_gates → map_frontier)
-    // and then hashing a stable, typed map.
-    let frontier_map: Option<FrontierMapDoc> = None;
-
-    // --- BUILD_RUN_RECORD (without id) ---
-    let nm_digest = vm_io::hasher::nm_digest_from_value(&ctx.nm_canonical)
-        .map_err(PipelineError::from)?;
-
-    // Tie policy echo (policy string must align with wire naming in vm_io).
-    let policy_str = match ctx.loaded.params.v050_tie_policy {
-        vm_core::variables::TiePolicy::StatusQuo => "status_quo",
-        vm_core::variables::TiePolicy::DeterministicOrder => "deterministic",
-        vm_core::variables::TiePolicy::Random => "random",
-    }.to_string();
-
-    let policy = TiePolicyEcho {
-        tie_policy: policy_str,
-        rng_seed: ctx.loaded.params.v052_tie_seed,
+    let noid = RunRecordNoId {
+        timestamp_utc: ts.clone(),
+        formula_id: formula_id.to_string(),
+        determinism,
+        inputs,
+        vars_effective,
+        outputs: outputs_no_run,
+        ties, // now carried through
     };
 
-    // Inputs: NOTE these IDs are placeholders; in a full engine you would parse or assign canonical
-    // input IDs in vm_io, then echo them here. For the scaffold we place the sha256 hex only.
-    let inputs = RunInputs {
-        division_registry_id: "REG:local".to_string(),
-        division_registry_sha256: ctx.loaded.digests.division_registry_sha256.clone(),
-        ballot_tally_id: "TLY:local".to_string(),
-        ballot_tally_sha256: ctx.loaded.digests.ballot_tally_sha256.clone(),
-        parameter_set_id: "PS:local".to_string(),
-        parameter_set_sha256: ctx.loaded.digests.parameter_set_sha256.clone(),
-        adjacency_sha256: ctx.loaded.digests.adjacency_sha256.clone(),
-    };
+    // Hash the canonical RunRecord (without run_id) to derive run_id.
+    let run_bytes = to_canonical_bytes(&noid)?;
+    let run_hash = sha256_hex(&run_bytes);
+    let run_id = format!("RUN:{ts}-{run_hash}");
 
     let outputs = RunOutputs {
-        result_id: res_id.clone(),
-        result_sha256: res_sha.clone(),
-        frontier_map_id: frontier_map.as_ref().map(|fm| fm.id.clone()),
-        frontier_map_sha256: None, // filled if/when frontier_map is produced
+        result_id: result_id.to_string(),
+        result_sha256: result_sha256.to_string(),
+        run_record_sha256: run_hash.clone(),
+        frontier_map_id: frontier_map.as_ref().map(|x| x.id.clone()),
+        frontier_map_sha256: frontier_map.as_ref().map(|x| x.sha256.clone()),
     };
 
-    // RFC3339 UTC timestamp; deterministic placeholder here (fill with real clock in CLI/app).
-    let timestamp = "1970-01-01T00:00:00Z".to_string();
-
-    #[derive(serde::Serialize)]
-    struct RunNoId<'a> {
-        timestamp_utc: &'a str,
-        engine: &'a EngineMeta,
-        formula_id: &'a str,
-        normative_manifest_sha256: &'a str,
-        inputs: &'a RunInputs,
-        policy: &'a TiePolicyEcho,
-        outputs: &'a RunOutputs,
-    }
-    let run_no_id = RunNoId {
-        timestamp_utc: &timestamp,
-        engine: &ctx.engine_meta,
-        formula_id: &fid,
-        normative_manifest_sha256: &nm_digest,
-        inputs: &inputs,
-        policy: &policy,
-        outputs: &outputs,
-    };
-    let run_bytes = canonical_json::to_canonical_bytes(&run_no_id).map_err(PipelineError::from)?;
-    let run_id = hasher::run_id_from_bytes(&timestamp, &run_bytes).map_err(PipelineError::from)?;
-
-    let run_record = RunRecordDoc {
-        id: run_id,
-        timestamp_utc: timestamp,
-        engine: ctx.engine_meta,
-        formula_id: fid,
-        normative_manifest_sha256: nm_digest,
-        inputs,
-        policy,
+    let with_id = RunRecordDoc {
+        run_id,
+        timestamp_utc: ts,
+        formula_id: formula_id.to_string(),
+        determinism: noid.determinism,
+        inputs: noid.inputs,
+        vars_effective: noid.vars_effective,
         outputs,
+        ties: noid.ties,
     };
 
-    Ok(PipelineOutputs { result, run_record, frontier_map })
+    Ok((with_id, run_hash))
 }
 
-/// Convenience entry: parse/validate a manifest, load artifacts via vm_io, then run the pipeline.
-/// This helper constructs a trivial NM (empty object) for the Formula ID placeholder; callers
-/// integrating the full Annex-A “Normative Manifest” should pass a richer `nm_canonical` via `run_with_ctx`.
-pub fn run_from_manifest_path<P: AsRef<Path>>(path: P) -> Result<PipelineOutputs, PipelineError> {
-    let loaded = loader::load_all_from_manifest(path).map_err(PipelineError::from)?;
+/// Convenience helper to wrap an already-finalized artifact into IdOnly.
+fn id_only(id: &str, sha256: &str) -> IdOnly {
+    IdOnly { id: id.to_string(), sha256: sha256.to_string() }
+}
 
-    let ctx = PipelineCtx {
-        loaded,
-        engine_meta: engine_identifiers(),
-        nm_canonical: serde_json::json!({}), // placeholder NM (include only normative fields in a full build)
+/// ----- Public bundle for orchestration results (returned by part 2 functions) -----
+
+#[derive(Debug, Clone)]
+pub struct BuildOutputs {
+    pub result: ResultDoc,
+    pub result_sha256: String,
+    pub run_record: RunRecordDoc,
+    pub run_record_sha256: String,
+    pub frontier_map: Option<FrontierMapDoc>,
+    pub frontier_map_sha256: Option<String>,
+}
+// Part 2/2 — Orchestration, self-verify, and file I/O.
+// Depends on types & helpers from Part 1.
+
+use std::fs::{create_dir_all, File};
+use std::io::Write;
+use std::path::Path;
+use serde_json::{self as json, Value};
+
+/// Inputs to build all canonical artifacts for a run.
+#[derive(Debug, Clone)]
+pub struct OrchestrationInputs {
+    /// Full Normative Manifest (Included vars only), as JSON.
+    pub normative_manifest: Value,
+    /// Engine version token, e.g., "VM-ENGINE v0".
+    pub engine_version: String,
+    /// RFC3339 UTC. Also used as `Result.created_at`.
+    pub timestamp_utc: String,
+    /// Effective Included variables actually used by the run (echoed in RunRecord).
+    pub vars_effective: json::Map<String, Value>,
+    /// Already-computed per-unit results, in canonical order.
+    pub units: Vec<UnitResult>,
+    /// Presentation-only label (computed by the caller after allocations).
+    pub label: Option<String>,
+    /// Determinism echo (policy + optional rng seed; we’ll enforce rules below).
+    pub determinism: Determinism,
+    /// Random tie events (empty when none; required to echo rng_seed for random policy).
+    pub ties: Vec<TieEvent>,
+    /// Optional frontier entries (emitted only when Some and non-empty).
+    pub frontier_entries: Option<Vec<FrontierEntry>>,
+}
+
+/// Build artifacts (`result.json`, `run_record.json`, optional `frontier_map.json`)
+/// and return them with their sha256 digests. Performs spec self-verify checks.
+pub fn build_artifacts(inp: OrchestrationInputs) -> Result<BuildOutputs, EngineError> {
+    // --- Normalize and compute FID from the Normative Manifest ---
+    let fid = compute_formula_id(&inp.normative_manifest)?;
+    let nm_sha = {
+        let nm_bytes = to_canonical_bytes(&inp.normative_manifest)?;
+        sha256_hex(&nm_bytes)
     };
 
-    run_with_ctx(ctx)
-}
+    // --- Determinism & rng_seed echo rules ---
+    let tie_policy = inp.determinism.tie_policy;
+    let rng_seed = match tie_policy {
+        TiePolicy::DeterministicOrder => None, // never echo a seed in deterministic policy
+        TiePolicy::Random => {
+            if inp.ties.is_empty() { None } else { inp.determinism.rng_seed }
+        }
+    };
+    let determinism = Determinism { tie_policy, rng_seed };
 
-/// Engine identifiers for use in RunRecord and manifest “expect” checks.
-pub fn engine_identifiers() -> EngineMeta {
-    EngineMeta {
-        vendor: "vm".to_string(),
-        name: "vm_engine".to_string(),
-        version: "0.1.0".to_string(),
-        build: "dev".to_string(),
+    // --- Build Result (NoId → WithId) ---
+    let created_at = normalize_timestamp_utc(&inp.timestamp_utc)?; // also used in RUN prefix
+    let summary = ResultSummary {
+        unit_count: inp.units.len() as u64,
+        allocation_count: inp.units.iter().filter(|u| u.assigned_to.is_some()).count() as u64,
+        tie_count: inp.ties.len() as u64,
+    };
+    let result_noid = ResultNoId {
+        formula_id: fid.clone(),
+        engine_version: inp.engine_version.clone(),
+        created_at: created_at.clone(),
+        summary,
+        units: inp.units.clone(),
+        label: inp.label.clone(),
+    };
+    let (result_doc, result_sha256) = finalize_result(&result_noid)?;
+
+    // --- Optional Frontier Map ---
+    let (frontier_doc_opt, frontier_sha_opt, frontier_idonly_opt) = if let Some(entries) = inp.frontier_entries {
+        if entries.is_empty() {
+            (None, None, None)
+        } else {
+            let fm_noid = FrontierMapNoId {
+                created_at: created_at.clone(),
+                entries,
+            };
+            let (fm_doc, fm_sha) = finalize_frontier(&fm_noid)?;
+            let idonly = id_only(&fm_doc.id, &fm_sha);
+            (Some(fm_doc), Some(fm_sha), Some(idonly))
+        }
+    } else {
+        (None, None, None)
+    };
+
+    // --- Inputs echo for RunRecord (nested digest shape) ---
+    let inputs_echo = InputsEcho {
+        nm_digest: NmDigest { nm_sha256: nm_sha },
+        extra: None,
+    };
+
+    // --- Build RunRecord (NoId → WithId) ---
+    let vars_effective = inp.vars_effective;
+    let (run_record_doc, run_record_sha256) = finalize_run_record(
+        &created_at,
+        &fid,
+        determinism,
+        inputs_echo,
+        vars_effective,
+        &result_doc.id,
+        &result_sha256,
+        inp.ties.clone(),           // pass ties through
+        frontier_idonly_opt,
+    )?;
+
+    // --- Self-verify (spec S6): cross-check IDs and FID consistency ---
+    // 1) FID must match between Result and RunRecord.
+    if result_doc.formula_id != fid || run_record_doc.formula_id != fid {
+        return Err(EngineError::Spec("formula_id mismatch across artifacts".into()));
     }
+    // 2) RES: id must be "RES:<sha256_of_result_noid>"
+    if !result_doc.id.starts_with("RES:") || &result_doc.id[4..] != result_sha256 {
+        return Err(EngineError::Internal("Result ID does not match canonical bytes".into()));
+    }
+    // 3) RUN: id must be "RUN:<timestamp>-<sha256_of_runrecord_noid>"
+    if !run_record_doc.run_id.starts_with("RUN:") {
+        return Err(EngineError::Internal("RunRecord ID prefix missing".into()));
+    }
+    let expect_prefix = format!("RUN:{}-", created_at);
+    if !run_record_doc.run_id.starts_with(&expect_prefix) {
+        return Err(EngineError::Internal("RunRecord timestamp prefix mismatch".into()));
+    }
+    if run_record_doc.outputs.run_record_sha256 != run_record_sha256 {
+        return Err(EngineError::Internal("RunRecord SHA mismatch".into()));
+    }
+    // 4) RNG echo rule: if random policy and ties non-empty → rng_seed must be Some.
+    if tie_policy == TiePolicy::Random {
+        let has_rng = !inp.ties.is_empty();
+        match run_record_doc.determinism.rng_seed {
+            Some(_) if has_rng => {},                  // ok
+            None if !has_rng => {},                    // ok
+            Some(_) if !has_rng => {
+                return Err(EngineError::Spec("rng_seed echoed but no random tie occurred".into()))
+            }
+            None if has_rng => {
+                return Err(EngineError::Spec("random tie occurred but rng_seed was not echoed".into()))
+            }
+        }
+    }
+    // 5) Ties echo consistency
+    if run_record_doc.ties.len() != inp.ties.len() {
+        return Err(EngineError::Spec("RunRecord ties[] length mismatch".into()));
+    }
+
+    Ok(BuildOutputs {
+        result: result_doc,
+        result_sha256,
+        run_record: run_record_doc,
+        run_record_sha256,
+        frontier_map: frontier_doc_opt,
+        frontier_map_sha256: frontier_sha_opt,
+    })
 }
 
-/// Compute Formula ID (FID) from the Normative Manifest (NM) JSON.
-/// Current policy: FID == SHA-256 hex of NM’s canonical bytes.
-pub fn compute_formula_id(nm: &serde_json::Value) -> String {
-    hasher::formula_id_from_nm(nm).unwrap_or_else(|_| "0".repeat(64))
+/// Write artifacts to `out_dir` with canonical JSON (LF) encoding.
+/// Filenames: result.json, run_record.json, frontier_map.json (if present).
+pub fn write_artifacts(out_dir: &Path, outs: &BuildOutputs) -> Result<(), EngineError> {
+    create_dir_all(out_dir)?;
+
+    // result.json
+    {
+        let bytes = to_canonical_bytes(&outs.result)?;
+        write_file(out_dir.join("result.json"), &bytes)?;
+    }
+    // run_record.json
+    {
+        let bytes = to_canonical_bytes(&outs.run_record)?;
+        write_file(out_dir.join("run_record.json"), &bytes)?;
+    }
+    // frontier_map.json (optional)
+    if let Some(ref fm) = outs.frontier_map {
+        let bytes = to_canonical_bytes(fm)?;
+        write_file(out_dir.join("frontier_map.json"), &bytes)?;
+    }
+    Ok(())
 }
 
-// -------------------------------------- (internal helpers) --------------------------------------
-// As you flesh out the pipeline, add private stage functions here that take typed inputs and
-// return typed outputs. Keep all I/O, JSON shape, and hashing calls routed through vm_io.
+fn write_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> Result<(), EngineError> {
+    let mut f = File::create(path)?;
+    f.write_all(bytes)?;
+    Ok(())
+}

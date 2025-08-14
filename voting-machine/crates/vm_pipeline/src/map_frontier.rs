@@ -1,257 +1,293 @@
-//! Resolve blocking ties with a fixed policy chain and produce audit logs.
+//! crates/vm_pipeline/src/map_frontier.rs
+//! NOTE: This module implements *allocation-affecting tie resolution* per VM-VAR-050 (tie_policy)
+//! and VM-VAR-052 (tie_seed). RNG is used **only** when policy = "random" and a real tie occurs.
 //!
-//! Policy order:
-//!   1) StatusQuo → if exactly one SQ candidate, pick it
-//!   2) Deterministic → min by (order_index, OptionId)
-//!   3) Random → seeded ChaCha20 via vm_core::rng, uniform among candidates
+//! Log vocabulary (Doc 6 / Annex A):
+//!   policy ∈ {"status_quo","deterministic_order","random"}
+//!   context is a stable code (e.g., "WTA U:<unit>", "LAST_SEAT U:<unit>", "IRV_ELIM U:<unit>").
 //!
-//! Notes:
-//! * Logs go to RunRecord later; Result never carries tie logs.
-//! * RNG path is fully reproducible from the provided 64-hex seed.
-//! * All ordering uses canonical (order_index, OptionId).
+//! This file is delivered in two parts; this is Part 1 (types, policy surface, and models).
+
+#![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use vm_core::{
-    ids::{OptionId, UnitId},
     entities::OptionItem,
-    rng::{tie_rng_from_seed, TieRng},
+    ids::{OptionId, UnitId},
+    variables::Params,
 };
+use vm_core::rng::{tie_rng_from_seed, TieRng}; // seed: u64 → deterministic RNG
 
-// ---------- Public types used across the pipeline ----------
+/* ------------------------------ Public policy surface ------------------------------ */
 
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
-pub enum TieKind {
-    WtaWinner,
-    LastSeat,
-    IrvElimination,
-}
-
-#[derive(Clone, Debug)]
-pub struct TieContext {
-    pub kind: TieKind,
-    pub unit: UnitId,
-    /// Candidate OptionIds that are tied and valid for the decision.
-    /// Upstream guarantees these are real option IDs; we remain defensive in helpers.
-    pub candidates: Vec<OptionId>,
-}
-
+/// Effective tie policy derived from `Params` (VM-VAR-050,052).
 #[derive(Clone, Debug)]
 pub enum TiePolicy {
-    StatusQuo,
-    Deterministic,                 // by (order_index, OptionId)
-    Random { seed_hex64: String }, // VM-VAR-033, lowercase/uppercase accepted
+    /// Prefer the status-quo option if (and only if) exactly one candidate matches it.
+    StatusQuo { status_quo: OptionId },
+    /// Deterministic by registry order (order_index, then OptionId).
+    DeterministicOrder,
+    /// Random among candidates, seeded by VM-VAR-052.
+    Random { seed: u64 }, // VM-VAR-052
 }
 
+impl TiePolicy {
+    /// Build the effective policy from `Params` and an optional status-quo option id for this context.
+    pub fn from_params(p: &Params, status_quo: OptionId) -> Self {
+        match p.v050_tie_policy.as_str() {
+            // Allowed spellings; align to canonical tokens upstream if needed.
+            "status_quo" | "status-quo" | "sq" => TiePolicy::StatusQuo { status_quo },
+            "deterministic_order" | "deterministic" | "order" => TiePolicy::DeterministicOrder,
+            "random" => TiePolicy::Random { seed: p.v052_tie_seed },
+            other => {
+                // Unknown → fall back to deterministic (spec-safe default).
+                tracing::warn!("unknown tie_policy '{}', falling back to deterministic_order", other);
+                TiePolicy::DeterministicOrder
+            }
+        }
+    }
+}
+
+/* ----------------------------------- Input model ----------------------------------- */
+
+/// What kind of tie is being resolved (stable code used in logging).
+#[derive(Clone, Debug)]
+pub enum TieKind {
+    Wta,          // winner-take-all
+    LastSeat,     // last seat fill
+    IrvElim,      // IRV elimination
+    Custom(&'static str),
+}
+
+impl TieKind {
+    #[inline]
+    pub fn code(&self) -> &'static str {
+        match self {
+            TieKind::Wta => "WTA",
+            TieKind::LastSeat => "LAST_SEAT",
+            TieKind::IrvElim => "IRV_ELIM",
+            TieKind::Custom(s) => s,
+        }
+    }
+}
+
+/// One tie to resolve.
+#[derive(Clone, Debug)]
+pub struct TieContext {
+    pub unit_id: UnitId,
+    pub kind: TieKind,
+    /// Candidates among which to pick a winner.
+    pub candidates: Vec<OptionId>,
+    /// Optional status-quo candidate for this context (used only if policy = StatusQuo).
+    pub status_quo: Option<OptionId>,
+    /// Canonical options for this unit (ordered by (order_index, OptionId)).
+    pub options: Vec<OptionItem>,
+}
+
+/* ------------------------------------ Outputs -------------------------------------- */
+
+#[derive(Clone, Debug)]
+pub struct TieOutcome {
+    pub unit_id: UnitId,
+    pub winner: OptionId,
+    pub log: TieLogEntry,
+}
+
+/// Log entry for one tie resolution (Doc 6 acceptance).
 #[derive(Clone, Debug)]
 pub struct TieLogEntry {
-    /// Human-readable, stable context like "WTA U:<unit>" or "LastSeat U:<unit>"
-    pub context: String,
-    /// Canonicalized candidate list snapshot (order_index, then OptionId)
-    pub candidates: Vec<OptionId>,
-    /// "status_quo" | "deterministic" | "random"
-    pub policy: &'static str,
-    /// Extra details (ordering rule used or RNG crumb)
-    pub detail: Option<TieDetail>,
-    /// Chosen winner
-    pub winner: OptionId,
+    pub context: String,       // e.g., "WTA U:<unit>"
+    pub policy: &'static str,  // "status_quo" | "deterministic_order" | "random"
+    pub detail: TieDetail,
+    pub candidates: Vec<OptionId>, // canonicalized candidates (stable order)
 }
 
 #[derive(Clone, Debug)]
 pub enum TieDetail {
-    /// Deterministic rule: min by (order_index, OptionId)
-    OrderIndex,
-    /// Random rule details: seed used and the index of the RNG word consumed
-    Rng { seed_hex64: String, word_index: u128 },
+    /// Winner is the status-quo option (must be uniquely present among candidates).
+    StatusQuo { option: OptionId },
+    /// Winner is the lowest (order_index, OptionId) among candidates.
+    OrderIndex { order_index: u32 },
+    /// Winner chosen uniformly at random among candidates using VM-VAR-052.
+    Rng { seed: u64 /*, word_index: u128 (optional if available)*/ },
 }
 
-// ---------- Errors (internal to this module) ----------
+/// Result for a batch of ties.
+#[derive(Clone, Debug, Default)]
+pub struct ResolveResult {
+    pub outcomes: Vec<TieOutcome>,
+    /// True iff at least one tie used the "random" policy (callers should echo rng_seed in RunRecord).
+    pub used_random: bool,
+}
 
-#[derive(Debug)]
+/* ------------------------------------ Errors --------------------------------------- */
+
+#[derive(thiserror::Error, Debug)]
 pub enum ResolveError {
-    Empty,
-    BadSeed,
-    UnknownOption(String),
+    #[error("empty candidate set")]
+    EmptyCandidates,
+    #[error("unknown candidate id: {0}")]
+    UnknownCandidate(String),
+    #[error("status_quo not present among candidates")]
+    StatusQuoNotInCandidates,
 }
 
-// ---------- Entry point ----------
+/* ------------- Part 2 (functions & helpers) continues in the next chunk ------------ */
+/* --------------------------------- Entry points ------------------------------------ */
 
-pub fn resolve_ties(
-    contexts: &[TieContext],
-    options_index: &BTreeMap<OptionId, OptionItem>,
+/// Resolve a batch of ties. Returns outcomes and whether any random policy fired.
+pub fn resolve_many(
+    ties: &[TieContext],
     policy: &TiePolicy,
-) -> (Vec<TieLogEntry>, BTreeMap<(TieKind, UnitId), OptionId>) {
-    let mut logs: Vec<TieLogEntry> = Vec::with_capacity(contexts.len());
-    let mut winners: BTreeMap<(TieKind, UnitId), OptionId> = BTreeMap::new();
-
-    for ctx in contexts {
-        // Canonicalize and defensively filter to known options (should already be valid).
-        let cands = canonicalize_candidates(&ctx.candidates, options_index);
-
-        // Empty candidate list should never happen; skip with a debug log style entry if it does.
-        if cands.is_empty() {
-            // fabricate a log-like entry for traceability; do not insert a winner
-            let context_str = format!("{:?} U:{:?}", ctx.kind, ctx.unit);
-            logs.push(TieLogEntry {
-                context: context_str,
-                candidates: vec![],
-                policy: match policy {
-                    TiePolicy::StatusQuo => "status_quo",
-                    TiePolicy::Deterministic => "deterministic",
-                    TiePolicy::Random { .. } => "random",
-                },
-                detail: None,
-                // winner is meaningless here; use a dummy OptionId if the type allowed; instead, skip insertion.
-                winner: OptionId::from_static("OPT:INVALID"),
-            });
-            continue;
+) -> Result<ResolveResult, ResolveError> {
+    let mut out = ResolveResult::default();
+    for t in ties {
+        let outcome = resolve_one(t, policy)?;
+        if matches!(outcome.log.policy, "random") {
+            out.used_random = true;
         }
+        out.outcomes.push(outcome);
+    }
+    Ok(out)
+}
 
-        // Apply policy chain
-        let (used_policy, detail, winner) = match policy {
-            TiePolicy::StatusQuo => {
-                if let Some(sq) = pick_status_quo(&cands, options_index) {
-                    ("status_quo", None, sq)
+/// Resolve a single tie.
+pub fn resolve_one(t: &TieContext, policy: &TiePolicy) -> Result<TieOutcome, ResolveError> {
+    // Canonicalize candidates: check existence and sort by (order_index, OptionId)
+    let index = index_options(&t.options);
+    let cands = canonicalize_candidates(&t.candidates, &index)?;
+
+    // Build stable context string for logs
+    let ctx_str = format!("{} U:{}", t.kind.code(), t.unit_id);
+
+    // Apply policy
+    let (winner, log) = match policy {
+        TiePolicy::StatusQuo { status_quo: _ } => {
+            if let Some(sq) = &t.status_quo {
+                // Status-quo applies only if the SQ candidate is in the tie set; else deterministic fallback.
+                if !cands.iter().any(|id| id == sq) {
+                    let (w, oi) = pick_by_order(&cands, &index);
+                    let log = TieLogEntry {
+                        context: ctx_str,
+                        policy: "deterministic_order",
+                        detail: TieDetail::OrderIndex { order_index: oi },
+                        candidates: cands.clone(),
+                    };
+                    (w, log)
                 } else {
-                    // fall back to deterministic
-                    ("deterministic", Some(TieDetail::OrderIndex), pick_by_order_index(&cands, options_index))
+                    let log = TieLogEntry {
+                        context: ctx_str,
+                        policy: "status_quo",
+                        detail: TieDetail::StatusQuo { option: sq.clone() },
+                        candidates: cands.clone(),
+                    };
+                    (sq.clone(), log)
                 }
-            }
-            TiePolicy::Deterministic => {
-                ("deterministic", Some(TieDetail::OrderIndex), pick_by_order_index(&cands, options_index))
-            }
-            TiePolicy::Random { seed_hex64 } => match pick_by_rng(&cands, seed_hex64) {
-                Ok((w, word_idx)) => (
-                    "random",
-                    Some(TieDetail::Rng {
-                        seed_hex64: seed_hex64.clone(),
-                        word_index: word_idx,
-                    }),
-                    w,
-                ),
-                // If RNG init fails (bad seed), fall back deterministically; keep surface stable.
-                Err(_e) => ("deterministic", Some(TieDetail::OrderIndex), pick_by_order_index(&cands, options_index)),
-            },
-        };
-
-        // Build stable context string
-        let context_str = match ctx.kind {
-            TieKind::WtaWinner => format!("WTA U:{:?}", ctx.unit),
-            TieKind::LastSeat => format!("LastSeat U:{:?}", ctx.unit),
-            TieKind::IrvElimination => format!("IRV U:{:?}", ctx.unit),
-        };
-
-        logs.push(TieLogEntry {
-            context: context_str,
-            candidates: cands.clone(),
-            policy: used_policy,
-            detail,
-            winner,
-        });
-
-        winners.insert((ctx.kind, ctx.unit.clone()), winner);
-    }
-
-    (logs, winners)
-}
-
-// ---------- Helpers ----------
-
-/// Prefer Status Quo if and only if exactly one candidate is SQ.
-/// Returns None if none or multiple are SQ (caller will fall back).
-pub fn pick_status_quo(
-    cands: &[OptionId],
-    options_index: &BTreeMap<OptionId, OptionItem>,
-) -> Option<OptionId> {
-    let mut found: Vec<OptionId> = Vec::new();
-    for id in cands {
-        if let Some(opt) = options_index.get(id) {
-            if opt.is_status_quo {
-                found.push(id.clone());
-                if found.len() > 1 {
-                    // Multiple SQ -> do not resolve here
-                    return None;
-                }
+            } else {
+                // No SQ provided → deterministic fallback
+                let (w, oi) = pick_by_order(&cands, &index);
+                let log = TieLogEntry {
+                    context: ctx_str,
+                    policy: "deterministic_order",
+                    detail: TieDetail::OrderIndex { order_index: oi },
+                    candidates: cands.clone(),
+                };
+                (w, log)
             }
         }
-    }
-    found.pop()
-}
 
-/// Deterministic pick: min by (order_index, OptionId)
-pub fn pick_by_order_index(
-    cands: &[OptionId],
-    options_index: &BTreeMap<OptionId, OptionItem>,
-) -> OptionId {
-    // Build (order_index, id) tuples; unknown IDs are ranked last by using a large sentinel.
-    const BIG: u32 = u32::MAX;
-    let mut best: Option<(u32, &OptionId)> = None;
-    for id in cands {
-        let key = options_index
-            .get(id)
-            .map(|o| o.order_index)
-            .unwrap_or(BIG);
-        match best {
-            None => best = Some((key, id)),
-            Some((bk, bid)) => {
-                if key < bk || (key == bk && id < bid) {
-                    best = Some((key, id));
-                }
-            }
+        TiePolicy::DeterministicOrder => {
+            let (w, oi) = pick_by_order(&cands, &index);
+            let log = TieLogEntry {
+                context: ctx_str,
+                policy: "deterministic_order",
+                detail: TieDetail::OrderIndex { order_index: oi },
+                candidates: cands.clone(),
+            };
+            (w, log)
         }
-    }
-    best.expect("non-empty cands").1.clone()
+
+        TiePolicy::Random { seed } => {
+            let (w, _idx) = pick_by_rng(&cands, *seed)?; // unbiased, deterministic
+            let log = TieLogEntry {
+                context: ctx_str,
+                policy: "random",
+                detail: TieDetail::Rng { seed: *seed },
+                candidates: cands.clone(),
+            };
+            (w, log)
+        }
+    };
+
+    Ok(TieOutcome {
+        unit_id: t.unit_id.clone(),
+        winner,
+        log,
+    })
 }
 
-/// Seeded random pick (ChaCha20 via vm_core::rng). Uniform among candidates.
-/// Returns the chosen OptionId and the RNG word index consumed for this pick.
-///
-/// NOTE: This implementation draws a single 64-bit word and reduces modulo len.
-/// The reported `word_index` is 0 for this pick; if you extend this to reuse a
-/// single RNG instance across multiple picks, increment the index accordingly.
-pub fn pick_by_rng(cands: &[OptionId], seed_hex64: &str) -> Result<(OptionId, u128), ResolveError> {
-    if !is_hex64(seed_hex64) {
-        return Err(ResolveError::BadSeed);
+/* --------------------------------- Helpers ----------------------------------------- */
+
+/// Build a quick lookup from OptionId → (order_index, OptionItem)
+fn index_options(options: &[OptionItem]) -> BTreeMap<OptionId, (&OptionItem, u32)> {
+    let mut m = BTreeMap::new();
+    for o in options {
+        m.insert(o.option_id.clone(), (o, o.order_index));
     }
-    let mut rng: TieRng = tie_rng_from_seed(seed_hex64).map_err(|_| ResolveError::BadSeed)?;
-    let n = cands.len();
-    if n == 0 {
-        return Err(ResolveError::Empty);
-    }
-    // Draw one 64-bit word and reduce; rejection sampling is unnecessary for modulo here.
-    let r = rng.next_u64();
-    let idx = (r as usize) % n;
-    Ok((cands[idx].clone(), 0u128))
+    m
 }
 
-/// Sort candidates by (order_index, OptionId) and drop unknown IDs defensively.
-/// Unknowns should never appear (validated upstream), but we keep stability.
-pub fn canonicalize_candidates(
-    cands: &[OptionId],
-    options_index: &BTreeMap<OptionId, OptionItem>,
-) -> Vec<OptionId> {
+/// Verify that every candidate exists in the unit's options and return them sorted canonically.
+fn canonicalize_candidates(
+    candidates: &[OptionId],
+    index: &BTreeMap<OptionId, (&OptionItem, u32)>,
+) -> Result<Vec<OptionId>, ResolveError> {
+    if candidates.is_empty() {
+        return Err(ResolveError::EmptyCandidates);
+    }
+    // Use a set to deduplicate while preserving canonical sort via (order_index, OptionId).
     let mut set: BTreeSet<(u32, OptionId)> = BTreeSet::new();
-    for id in cands {
-        if let Some(opt) = options_index.get(id) {
-            set.insert((opt.order_index, id.clone()));
+    for id in candidates {
+        if let Some((_, oi)) = index.get(id) {
+            set.insert((*oi, id.clone()));
+        } else {
+            return Err(ResolveError::UnknownCandidate(id.to_string()));
         }
     }
-    set.into_iter().map(|(_, id)| id).collect()
+    Ok(set.into_iter().map(|(_, id)| id).collect())
 }
 
-// ---------- Small local helpers ----------
-
-fn is_hex64(s: &str) -> bool {
-    if s.len() != 64 {
-        return false;
+/// Deterministic pick by lowest (order_index, OptionId).
+fn pick_by_order(
+    cands: &[OptionId],
+    index: &BTreeMap<OptionId, (&OptionItem, u32)>,
+) -> (OptionId, u32) {
+    let mut best: Option<(&OptionId, u32)> = None;
+    for id in cands {
+        let (_, oi) = index.get(id).expect("candidate must exist in index");
+        match best {
+            None => best = Some((id, *oi)),
+            Some((_, cur)) if *oi < cur => best = Some((id, *oi)),
+            _ => {}
+        }
     }
-    s.chars().all(|c| c.is_ascii_hexdigit())
+    let (id, oi) = best.expect("non-empty candidates");
+    (id.clone(), oi)
 }
 
-// ---------- Convenience re-exports (optional) ----------
+/// Unbiased random pick using engine RNG (seeded with VM-VAR-052).
+fn pick_by_rng(cands: &[OptionId], seed: u64) -> Result<(OptionId, usize), ResolveError> {
+    if cands.is_empty() {
+        return Err(ResolveError::EmptyCandidates);
+    }
+    let mut rng: TieRng = tie_rng_from_seed(seed);
+    // Prefer engine helper to avoid modulo bias and to keep determinism stable.
+    let idx = rng
+        .gen_range(cands.len())
+        .expect("engine gen_range must handle non-zero upper bound");
+    Ok((cands[idx].clone(), idx))
+}
 
-pub use TieDetail as _TieDetailForExport;
-pub use TieKind as _TieKindForExport;
-pub use TieLogEntry as _TieLogEntryForExport;
-pub use TiePolicy as _TiePolicyForExport;
-pub use TieContext as _TieContextForExport;
+/* --------------------------------- Tests (optional) -------------------------------- */
+// See Part 1 for commented tests scaffolding; enable once fixtures are available.

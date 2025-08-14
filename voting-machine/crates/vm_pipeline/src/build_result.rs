@@ -1,274 +1,194 @@
-//! build_run_record.rs — Compose the RunRecord artifact (deterministic).
-//!
-//! Responsibilities:
-//! - Validate UTCs, hex64 digests, one-of inputs (ballots vs tally), RNG policy rules
-//! - Build an *idless* record and canonicalize it (vm_io::canonical_json)
-//! - Hash (SHA-256) the idless bytes and form `RUN:<started_utc>-<short-hash>`
-//! - Return a fully-populated `RunRecordDoc` including ties (Result never carries tie logs)
+//! build_result.rs — Part 1/2
+//! Types, inputs, and validators to build a canonical Result artifact.
+//! Part 2 will assemble the idless payload, compute sha256 → RES:<sha>,
+//! and return (ResultDoc, result_sha256).
 
-use std::collections::BTreeMap;
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{self as json};
 
-use vm_core::ids::{ParamSetId, RegId, ResultId, TallyId};
+use crate::{ResultDoc, ResultSummary, UnitResult};
+
+/// ---------- Errors specific to building a Result ----------
+#[derive(Debug)]
+pub enum BuildResultError {
+    BadUtc(&'static str, String),
+    BadHex64(&'static str, String),
+    UnitsOrder(String),
+    Spec(String),
+}
+
+/// ---------- Inputs for building a Result (caller provides units + tie count) ----------
+#[derive(Debug, Clone)]
+pub struct ResultInputs {
+    /// FID (sha256 of the Normative Manifest) — hex64 lowercase.
+    pub formula_id: String,
+    /// Engine version token, e.g., "VM-ENGINE v0".
+    pub engine_version: String,
+    /// RFC3339 UTC; will be normalized and echoed as `created_at`.
+    pub created_at_utc: String,
+    /// Ordered per-unit outcomes (must already be in canonical order).
+    pub units: Vec<UnitResult>,
+    /// Presentation-only label (already computed by caller per Doc 7 rules).
+    pub label: Option<String>,
+    /// Total number of tie events encountered during allocation (for summary).
+    pub tie_count: u64,
+}
+
+/// ---------- Internal: idless Result shape used for canonical hashing ----------
+#[derive(Debug, Clone, Serialize)]
+struct ResultNoId {
+    pub formula_id: String,
+    pub engine_version: String,
+    pub created_at: String,        // normalized RFC3339 Z
+    pub summary: ResultSummary,
+    pub units: Vec<UnitResult>,    // ordered
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,     // presentation-only
+}
+
+/// ---------- Validators & helpers (pure, deterministic) ----------
+
+/// Parse+normalize an RFC3339 UTC (must end with 'Z'); returns normalized string.
+pub fn normalize_rfc3339_utc(name: &'static str, ts: &str) -> Result<String, BuildResultError> {
+    let dt: DateTime<Utc> = ts
+        .parse::<DateTime<Utc>>()
+        .map_err(|_| BuildResultError::BadUtc(name, ts.to_string()))?;
+    Ok(dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+/// Lowercase hex64 check.
+pub fn is_hex64(s: &str) -> bool {
+    if s.len() != 64 {
+        return false;
+    }
+    s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+pub fn validate_hex64(name: &'static str, s: &str) -> Result<(), BuildResultError> {
+    if is_hex64(s) {
+        Ok(())
+    } else {
+        Err(BuildResultError::BadHex64(name, s.to_string()))
+    }
+}
+
+/// Ensure units are in canonical order (lexicographic by unit_id).
+/// We do not reorder here; we fail fast to keep the pipeline explicit.
+pub fn check_units_canonical_order(units: &[UnitResult]) -> Result<(), BuildResultError> {
+    for i in 1..units.len() {
+        if units[i - 1].unit_id > units[i].unit_id {
+            return Err(BuildResultError::UnitsOrder(format!(
+                "units not sorted: {} > {} at index {}",
+                units[i - 1].unit_id, units[i].unit_id, i
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Compute the summary block deterministically.
+pub fn compute_summary(units: &[UnitResult], tie_count: u64) -> ResultSummary {
+    let unit_count = units.len() as u64;
+    let allocation_count = units
+        .iter()
+        .filter(|u| u.assigned_to.is_some())
+        .count() as u64;
+    ResultSummary {
+        unit_count,
+        allocation_count,
+        tie_count,
+    }
+}
+
+/// Validate high-level inputs and return normalized fields ready for assembly.
+pub fn validate_result_inputs(inp: &ResultInputs) -> Result<(String, String), BuildResultError> {
+    // FID sanity
+    validate_hex64("formula_id (sha256)", &inp.formula_id)?;
+    // Engine version must not be empty
+    if inp.engine_version.trim().is_empty() {
+        return Err(BuildResultError::Spec("engine_version is empty".into()));
+    }
+    // Normalize timestamp
+    let created_at_norm = normalize_rfc3339_utc("created_at_utc", &inp.created_at_utc)?;
+    // Units canonical order
+    check_units_canonical_order(&inp.units)?;
+    Ok((inp.formula_id.clone(), created_at_norm))
+}
+//! build_result.rs — Part 2/2
+//! Assemble idless payload → canonical bytes → sha256,
+//! form "RES:<sha256>", self-verify, and return (ResultDoc, result_sha256).
+
+use std::path::Path;
+use std::fs::File;
+use std::io::Write;
+
 use vm_io::{
     canonical_json::to_canonical_bytes,
     hasher::sha256_hex,
 };
 
-/// Engine identifiers (mirrors pipeline-wide metadata).
-#[derive(Clone, Debug)]
-pub struct EngineMeta {
-    pub vendor: String,
-    pub name: String,
-    pub version: String,
-    pub build: String,
-}
+use crate::{ResultDoc, ResultSummary, UnitResult};
 
-/// Tie policy recorded in RunRecord. RNG seed is only included when `Random`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TiePolicy {
-    StatusQuo,
-    Deterministic,
-    Random,
-}
+use super::{
+    BuildResultError,
+    ResultInputs,
+    ResultNoId,
+    compute_summary,
+    validate_result_inputs,
+};
 
-impl TiePolicy {
-    fn as_str(&self) -> &'static str {
-        match self {
-            TiePolicy::StatusQuo => "status_quo",
-            TiePolicy::Deterministic => "deterministic",
-            TiePolicy::Random => "random",
-        }
-    }
-}
+/// Build the canonical Result artifact and return `(ResultDoc, result_sha256)`.
+pub fn build_result(inp: ResultInputs) -> Result<(ResultDoc, String), BuildResultError> {
+    // ---- Validate & normalize inputs ----
+    let (_fid_ok, created_at_norm) = validate_result_inputs(&inp)?;
+    let summary: ResultSummary = compute_summary(&inp.units, inp.tie_count);
 
-/// References to inputs and their canonical digests.
-#[derive(Clone, Debug)]
-pub struct InputRefs {
-    pub manifest_id: Option<String>,
-    pub reg_id: RegId,
-    pub parameter_set_id: ParamSetId,
-    pub ballots_id: Option<String>,
-    pub ballot_tally_id: Option<TallyId>,
-    /// path (or logical key) → sha256 hex64
-    pub digests: BTreeMap<String, String>,
-}
-
-/// References to outputs (Result + optional Frontier) and their digests.
-#[derive(Clone, Debug)]
-pub struct OutputRefs {
-    pub result_id: ResultId,
-    pub result_sha256: String,                 // hex64
-    pub frontier_map_id: Option<String>,       // FrontierId
-    pub frontier_map_sha256: Option<String>,   // hex64; required iff frontier_map_id
-}
-
-/// Determinism block written to RunRecord.
-#[derive(Clone, Debug)]
-pub struct Determinism {
-    pub tie_policy: TiePolicy,
-    /// 64-hex string, present only when tie_policy == Random
-    pub rng_seed_hex64: Option<String>,
-}
-
-/// One tie event; kept flexible for audit. Stored verbatim in RunRecord.
-#[derive(Clone, Debug)]
-pub struct TieEvent {
-    pub context: String,             // e.g., "WTA U:…"
-    pub candidates: Vec<String>,     // OptionId strings
-    pub policy: String,              // "status_quo" | "deterministic" | "random"
-    pub detail: Option<String>,      // e.g., "order_index" or "rng:seed=<…>,word=<…>"
-    pub winner: String,              // OptionId
-}
-
-/// The final RunRecord document (schema-shaped; serialization happens upstream).
-#[derive(Clone, Debug)]
-pub struct RunRecordDoc {
-    pub id: String, // RUN:<ts>-<short>
-    pub started_utc: String,
-    pub finished_utc: String,
-    pub engine: EngineMeta,
-    pub formula_id: String,
-    pub formula_manifest_sha256: String,
-    pub inputs: InputRefs,
-    pub determinism: Determinism,
-    pub outputs: OutputRefs,
-    pub ties: Vec<TieEvent>,
-}
-
-/// Builder errors (deterministic and concise).
-#[derive(Debug)]
-pub enum BuildRunRecordError {
-    BadUtc(&'static str, String),
-    BadHex64(&'static str, String),
-    InputsContract(String),
-    OutputsContract(String),
-    DeterminismContract(String),
-}
-
-/// Build the RunRecord content; ID is computed from canonical bytes (without `id`) + started_utc.
-pub fn build_run_record(
-    engine: &EngineMeta,
-    formula_id: &str,
-    formula_manifest_sha256: &str,
-    inputs: &InputRefs,
-    determinism: &Determinism,
-    outputs: &OutputRefs,
-    ties: &[TieEvent],
-    started_utc: &str,
-    finished_utc: &str,
-) -> Result<RunRecordDoc, BuildRunRecordError> {
-    // ---- validations (pure, deterministic) ----
-    validate_utc(started_utc).map_err(|_| BuildRunRecordError::BadUtc("started_utc", started_utc.to_string()))?;
-    validate_utc(finished_utc).map_err(|_| BuildRunRecordError::BadUtc("finished_utc", finished_utc.to_string()))?;
-
-    validate_hex64(formula_manifest_sha256)
-        .map_err(|_| BuildRunRecordError::BadHex64("formula_manifest_sha256", formula_manifest_sha256.to_string()))?;
-
-    // Input digests must be hex64
-    for (k, v) in &inputs.digests {
-        validate_hex64(v).map_err(|_| BuildRunRecordError::BadHex64("inputs.digests", format!("{k}={v}")))?;
-    }
-
-    check_inputs_coherence(inputs)?;
-    check_outputs_coherence(outputs)?;
-    check_determinism(determinism)?;
-
-    // ---- Build the *idless* structure for canonical hashing ----
-    // We exclude the "id" field itself from the canonicalization.
-    let idless = IdlessRunRecord {
-        started_utc: started_utc.to_string(),
-        finished_utc: finished_utc.to_string(),
-        engine: engine.clone(),
-        formula_id: formula_id.to_string(),
-        formula_manifest_sha256: formula_manifest_sha256.to_string(),
-        inputs: inputs.clone(),
-        determinism: determinism.clone(),
-        outputs: outputs.clone(),
-        ties: ties.to_vec(),
+    // ---- Idless payload (used for canonical hashing) ----
+    let noid = ResultNoId {
+        formula_id: inp.formula_id.clone(),
+        engine_version: inp.engine_version.clone(),
+        created_at: created_at_norm.clone(),
+        summary,
+        units: inp.units.clone(),
+        label: inp.label.clone(),
     };
 
-    // Canonical bytes (stable across OS/arch) then SHA-256 → hex64
-    let canon_bytes = to_canonical_bytes(&idless)
-        .expect("canonicalization should not fail for well-formed idless record");
-    let canon_sha256 = sha256_hex(&canon_bytes);
+    // ---- Canonical bytes → sha256 ----
+    let canon_bytes = to_canonical_bytes(&noid)
+        .map_err(|_| BuildResultError::Spec("canonicalization failed".into()))?;
+    let res_sha = sha256_hex(&canon_bytes);
+    let res_id = format!("RES:{res_sha}");
 
-    // RUN ID format: RUN:<YYYY-MM-DDTHH-MM-SSZ>-<short>
-    let started_friendly = id_friendly_timestamp(started_utc);
-    let short = compute_id_short_hash(&canon_sha256, 16);
-    let run_id = format!("RUN:{}-{}", started_friendly, short);
+    // ---- Assemble final document ----
+    let doc = ResultDoc {
+        id: res_id.clone(),
+        formula_id: noid.formula_id,
+        engine_version: noid.engine_version,
+        created_at: created_at_norm,
+        summary: noid.summary,
+        units: noid.units,
+        label: noid.label,
+    };
 
-    // ---- Assemble final doc (with id) ----
-    Ok(RunRecordDoc {
-        id: run_id,
-        started_utc: started_utc.to_string(),
-        finished_utc: finished_utc.to_string(),
-        engine: engine.clone(),
-        formula_id: formula_id.to_string(),
-        formula_manifest_sha256: formula_manifest_sha256.to_string(),
-        inputs: inputs.clone(),
-        determinism: determinism.clone(),
-        outputs: outputs.clone(),
-        ties: ties.to_vec(),
-    })
-}
+    // ---- Self-verify (light) ----
+    if !doc.id.starts_with("RES:") || &doc.id[4..] != res_sha {
+        return Err(BuildResultError::Spec("Result ID does not match canonical bytes".into()));
+    }
 
-// ---------- Internal: idless shape (Serialize only here) ----------
-#[derive(serde::Serialize)]
-struct IdlessRunRecord {
-    started_utc: String,
-    finished_utc: String,
-    engine: EngineMeta,
-    formula_id: String,
-    formula_manifest_sha256: String,
-    inputs: InputRefs,
-    determinism: Determinism,
-    outputs: OutputRefs,
-    ties: Vec<TieEvent>,
+    Ok((doc, res_sha))
 }
 
-// Derives for canonicalization (Serialize only)
-impl serde::Serialize for EngineMeta {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("EngineMeta", 4)?;
-        st.serialize_field("vendor", &self.vendor)?;
-        st.serialize_field("name", &self.name)?;
-        st.serialize_field("version", &self.version)?;
-        st.serialize_field("build", &self.build)?;
-        st.end()
-    }
-}
-impl serde::Serialize for InputRefs {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("InputRefs", 5)?;
-        st.serialize_field("manifest_id", &self.manifest_id)?;
-        st.serialize_field("reg_id", &self.reg_id)?;
-        st.serialize_field("parameter_set_id", &self.parameter_set_id)?;
-        st.serialize_field("ballots_id", &self.ballots_id)?;
-        st.serialize_field("ballot_tally_id", &self.ballot_tally_id)?;
-        // digests serialized separately to keep BTreeMap ordering stable
-        st.end()?;
-        // Serialize `digests` alongside (outer map stability is guaranteed by BTreeMap)
-        let mut map = s.serialize_map(Some(self.digests.len()))?;
-        for (k, v) in &self.digests {
-            map.serialize_entry(k, v)?;
-        }
-        map.end()
-    }
-}
-impl serde::Serialize for OutputRefs {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("OutputRefs", 4)?;
-        st.serialize_field("result_id", &self.result_id)?;
-        st.serialize_field("result_sha256", &self.result_sha256)?;
-        st.serialize_field("frontier_map_id", &self.frontier_map_id)?;
-        st.serialize_field("frontier_map_sha256", &self.frontier_map_sha256)?;
-        st.end()
-    }
-}
-impl serde::Serialize for Determinism {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("Determinism", 2)?;
-        st.serialize_field("tie_policy", &self.tie_policy.as_str())?;
-        // seed only when Random (otherwise None)
-        let seed = match (self.tie_policy, &self.rng_seed_hex64) {
-            (TiePolicy::Random, Some(v)) => Some(v),
-            _ => None,
-        };
-        st.serialize_field("rng_seed", &seed)?;
-        st.end()
-    }
-}
-impl serde::Serialize for TieEvent {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("TieEvent", 5)?;
-        st.serialize_field("context", &self.context)?;
-        st.serialize_field("candidates", &self.candidates)?;
-        st.serialize_field("policy", &self.policy)?;
-        st.serialize_field("detail", &self.detail)?;
-        st.serialize_field("winner", &self.winner)?;
-        st.end()
-    }
+/// Convenience: get canonical bytes of a finalized Result (useful for writing/tests).
+pub fn result_canonical_bytes(doc: &ResultDoc) -> Result<Vec<u8>, BuildResultError> {
+    to_canonical_bytes(doc)
+        .map_err(|_| BuildResultError::Spec("canonicalization failed".into()))
 }
 
-// ---------- Validation helpers ----------
-
-/// Validate "YYYY-MM-DDTHH:MM:SSZ" (basic structural check; semantics enforced upstream).
-pub fn validate_utc(ts: &str) -> Result<(), BuildRunRecordError> {
-    // Minimal fixed-length + character-position validation.
-    if ts.len() != 20 {
-        return Err(BuildRunRecordError::BadUtc("format", ts.to_string()));
-    }
-    let b = ts.as_bytes();
-    let ok = b[4] == b'-'
-        && b[7] == b'-'
-        && b[10] == b'T'
-        && b[13] == b':'
-        && b[16] == b':'
-        && b[19] == b'Z'
-        && b.iter().enumerate().all(|(i, &c)| match i {
-            4
+/// Optional helper to write a finalized Result to disk as canonical JSON (LF).
+pub fn write_result(path: &Path, doc: &ResultDoc) -> Result<(), BuildResultError> {
+    let bytes = result_canonical_bytes(doc)?;
+    let mut f = File::create(path).map_err(|e| BuildResultError::Spec(format!("io: {e}")))?;
+    f.write_all(&bytes).map_err(|e| BuildResultError::Spec(format!("io: {e}")))?;
+    Ok(())
+}

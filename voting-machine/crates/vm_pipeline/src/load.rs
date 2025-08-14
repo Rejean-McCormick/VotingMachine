@@ -3,18 +3,19 @@
 //! - Delegates schema/ID parsing & canonicalization to vm_io.
 //! - Aggregates canonical digests and (if manifest) computes nm_digest + formula_id.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+#![forbid(unsafe_code)]
+
+use std::collections::BTreeMap;
+use std::path::Path;
 
 use vm_core::{
     entities::{DivisionRegistry, OptionItem},
-    ids::*,
     variables::Params,
 };
 use vm_io::{
     hasher,
     loader,
-    manifest::{self, Manifest, ResolvedPaths},
+    manifest::{self, Manifest},
 };
 
 /// Errors surfaced by the LOAD stage.
@@ -79,7 +80,7 @@ pub struct InputDigests {
 pub struct LoadedStage {
     pub norm_ctx: NormContext,
     pub digests: InputDigests,
-    /// Present when a manifest was used (nm_digest over the Normative Manifest JSON).
+    /// Present when a manifest was used (nm_digest over the Normative Manifest JSON built from Included variables).
     pub nm_digest: Option<String>,
     /// Present when a manifest was used; equals nm_digest under current policy.
     pub formula_id: Option<String>,
@@ -95,66 +96,82 @@ pub fn load_normative_from_manifest<P: AsRef<Path>>(path: P) -> Result<LoadedSta
     let man = manifest::load_manifest(&path)?;
     ensure_manifest_contract(&man)?;
 
-    // 2) Resolve paths relative to the manifest directory.
-    //    The function expects a base; pass the manifest file path (vm_io resolves parent).
-    let resolved = manifest::resolve_paths(path.as_ref(), &man)?;
+    // 2) Load artifacts (vm_io handles schema + canonicalization + cross-refs & reordering).
+    let io_loaded = loader::load_all_from_manifest(path.as_ref())?;
 
-    // 3) Load artifacts (vm_io handles schema + canonicalization + basic cross-refs).
-    let io_loaded = loader::load_all_from_manifest(&path)?;
+    // 3) Lift into NormContext.
+    let options = collect_registry_options(&io_loaded.registry);
+    let norm_ctx = NormContext {
+        reg: io_loaded.registry,
+        options,
+        params: io_loaded.params,
+        tallies: io_loaded.tally,
+        ids: LoadedIds {
+            reg_id: "REG:local".into(),
+            tally_id: "TLY:local".into(),
+            param_set_id: "PS:local".into(),
+        },
+    };
 
-    // 4) Lift into NormContext (re-assert core invariants if desired).
-    let norm_ctx = to_norm_context(io_loaded)?;
+    // 4) Map canonical digests out of vm_io (these are digests of canonical bytes).
+    let digests = InputDigests {
+        reg_sha256: io_loaded.digests.division_registry_sha256,
+        tally_sha256: io_loaded.digests.ballot_tally_sha256,
+        params_sha256: io_loaded.digests.parameter_set_sha256,
+        adjacency_sha256: io_loaded.digests.adjacency_sha256,
+    };
 
-    // 5) Collect input digests (file bytes for visibility; vm_io already computed canonical digests).
-    let digests = collect_input_digests(&resolved)?;
-
-    // 6) Compute Normative Manifest digest + Formula ID from a compact NM view
-    //    built from the canonical input digests (deterministic and offline).
-    let (nm_digest, formula_id) = compute_nm_fid_if_present_from_digests(&digests)?;
+    // 5) Compute Normative Manifest (NM) from **Included VM-VARs** and derive FID.
+    let (nm_digest, fid) = compute_nm_and_fid_from_params(&norm_ctx.params)?;
 
     Ok(LoadedStage {
         norm_ctx,
         digests,
         nm_digest: Some(nm_digest),
-        formula_id: Some(formula_id),
+        formula_id: Some(fid),
     })
 }
 
-/// Alternate: load directly from explicit file paths (no manifest); nm_digest/FID omitted.
+/// Alternate entry: direct file paths (no manifest). Does not compute FID/NM.
 pub fn load_normative_from_paths<P: AsRef<Path>>(
-    reg_path: P,
+    registry_path: P,
     tally_path: P,
     params_path: P,
     adjacency_path: Option<P>,
 ) -> Result<LoadedStage, LoadError> {
-    // 1) Targeted loads (vm_io validates + canonicalizes).
-    let registry = loader::load_registry(&reg_path)?;
-    let params = loader::load_params(&params_path)?;
-    let tallies = loader::load_ballot_tally(&tally_path)?;
-    // Optional adjacency is handled by the loader when called from manifest; we just hash if present.
+    // Load individually via vm_io targeted loaders.
+    let reg = loader::load_registry(registry_path.as_ref())?;
+    let params = loader::load_params(params_path.as_ref())?;
+    let mut tallies = loader::load_ballot_tally(tally_path.as_ref())?;
 
-    // 2) Build NormContext.
-    let ids = LoadedIds {
-        reg_id: "REG:local".into(),
-        tally_id: "TLY:local".into(),
-        param_set_id: "PS:local".into(),
-    };
-    let options = collect_registry_options(&registry);
+    // Reuse registry-deduced options; consumers sort per-registry anyway.
+    // (vm_io::load_all_from_manifest performs per-unit reorder; path mode keeps tallies as loaded.)
+    let options = collect_registry_options(&reg);
+
     let norm_ctx = NormContext {
-        reg: registry,
+        reg,
         options,
         params,
-        tallies,
-        ids,
+        tallies: {
+            // Keep as loaded; callers relying on manifest-mode canonicalization should prefer it.
+            // We still ensure stable unit ordering if present.
+            tallies.units.sort_by(|a, b| a.unit_id.cmp(&b.unit_id));
+            tallies
+        },
+        ids: LoadedIds {
+            reg_id: "REG:local".into(),
+            tally_id: "TLY:local".into(),
+            param_set_id: "PS:local".into(),
+        },
     };
 
-    // 3) Digests over files (streamed).
+    // Stream-hash file bytes for transparency in path mode.
     let digests = InputDigests {
-        reg_sha256: hasher::sha256_file(&reg_path)?,
-        tally_sha256: hasher::sha256_file(&tally_path)?,
-        params_sha256: hasher::sha256_file(&params_path)?,
+        reg_sha256: hasher::sha256_file(registry_path.as_ref())?,
+        tally_sha256: hasher::sha256_file(tally_path.as_ref())?,
+        params_sha256: hasher::sha256_file(params_path.as_ref())?,
         adjacency_sha256: match adjacency_path {
-            Some(p) => Some(hasher::sha256_file(p)?),
+            Some(p) => Some(hasher::sha256_file(p.as_ref())?),
             None => None,
         },
     };
@@ -180,67 +197,67 @@ fn ensure_manifest_contract(man: &Manifest) -> Result<(), LoadError> {
             "manifest must specify `ballot_tally_path` for normative runs".into(),
         ));
     }
-    // Defensive: if a legacy field slipped through (not present in typed Manifest), reject.
-    // We can't see unknown fields here, so this is best-effort; schema in vm_io should enforce it.
+    // Defensive note: if a legacy field “ballots_path” existed, schema should reject it.
+    // We can only sanity-check the typed struct here.
     Ok(())
 }
 
-/// Convert vm_io's LoadedContext into our NormContext, re-asserting canonical option order.
-fn to_norm_context(io: loader::LoadedContext) -> Result<NormContext, LoadError> {
-    // Build a registry-wide canonical option list (dedupe by OptionId; keep min (order_index, id)).
-    let options = collect_registry_options(&io.registry);
+/// Compute NM and FID from the **Included VM-VARs** only (Annex A / Doc 2..5).
+fn compute_nm_and_fid_from_params(params: &Params) -> Result<(String, String), LoadError> {
+    use serde_json::{Map, Value};
 
-    // IDs are opaque in this stage; downstream RunRecord echoes them or uses placeholders.
-    let ids = LoadedIds {
-        reg_id: "REG:local".into(),
-        tally_id: "TLY:local".into(),
-        param_set_id: "PS:local".into(),
-    };
+    // Convert Params → Value, then filter keys by Included set.
+    let full = serde_json::to_value(params)
+        .map_err(|e| LoadError::Schema(format!("serialize Params: {e}")))?;
 
-    // (Optional) re-assertions could go here (e.g., non-empty units/options). vm_io guarantees canonical sort.
-    Ok(NormContext {
-        reg: io.registry,
-        options,
-        params: io.params,
-        tallies: io.tally,
-        ids,
-    })
-}
+    let obj = full.as_object().ok_or_else(|| {
+        LoadError::Schema("Params serialization did not yield an object".into())
+    })?;
 
-/// Compute nm_digest and formula_id (equal under current policy) from a compact NM JSON
-/// derived from canonical input digests. Kept local to the LOAD stage when a manifest is used.
-fn compute_nm_fid_if_present_from_digests(d: &InputDigests) -> Result<(String, String), LoadError> {
-    // Compact NM view limited to deterministic, normative inputs (digests only).
-    let nm = serde_json::json!({
-        "normative_inputs": {
-            "division_registry_sha256": d.reg_sha256,
-            "ballot_tally_sha256": d.tally_sha256,
-            "parameter_set_sha256": d.params_sha256,
-            "adjacency_sha256": d.adjacency_sha256
+    let mut included: Map<String, Value> = Map::new();
+    for (k, v) in obj {
+        if is_included_var_key(k) {
+            included.insert(k.clone(), v.clone());
         }
+    }
+
+    // Shape the NM with a stable top-level key to keep room for future fields.
+    let nm = Value::Object({
+        let mut m = Map::new();
+        m.insert("vars_included".to_string(), Value::Object(included));
+        m
     });
+
     let nm_digest = hasher::nm_digest_from_value(&nm).map_err(LoadError::from)?;
     let fid = hasher::formula_id_from_nm(&nm).map_err(LoadError::from)?;
     Ok((nm_digest, fid))
 }
 
-/// Resolve + stream-hash the normative inputs referenced by the manifest.
-/// (This is used by the manifest entry path; vm_io already computes canonical digests internally,
-/// but we surface file digests here for transparency.)
-fn collect_input_digests(paths: &ResolvedPaths) -> Result<InputDigests, LoadError> {
-    let reg_sha256 = hasher::sha256_file(&paths.reg)?;
-    let tally_sha256 = hasher::sha256_file(&paths.tally)?;
-    let params_sha256 = hasher::sha256_file(&paths.params)?;
-    let adjacency_sha256 = match &paths.adjacency {
-        Some(p) => Some(hasher::sha256_file(p)?),
-        None => None,
-    };
-    Ok(InputDigests {
-        reg_sha256,
-        tally_sha256,
-        params_sha256,
-        adjacency_sha256,
-    })
+/// Inclusion predicate per Annex A:
+/// IN: 001–007, 010–017, 020–031, 040–049, 050, 073
+/// OUT: 032–035, 052, 060–062 (and any other non-listed).
+fn is_included_var_key(key: &str) -> bool {
+    // Expect keys like "v001_algorithm_family", "v014", "v050_tie_policy", etc.
+    if !key.starts_with('v') { return false; }
+    let digits = key.as_bytes().get(1..4);
+    let Ok(n) = digits
+        .and_then(|s| std::str::from_utf8(s).ok())
+        .and_then(|s| s.parse::<u16>().ok())
+    else { return false; };
+
+    match n {
+        1..=7 => true,        // 001..007
+        10..=17 => true,      // 010..017
+        20..=31 => true,      // 020..031
+        40..=49 => true,      // 040..049
+        50 => true,           // 050
+        73 => true,           // 073
+        // Explicit exclusions (for clarity; already excluded by ranges above except 052/060..062)
+        32..=35 => false,
+        52 => false,
+        60..=62 => false,
+        _ => false,
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -271,4 +288,9 @@ fn collect_registry_options(reg: &DivisionRegistry) -> Vec<OptionItem> {
     }
     let mut options: Vec<OptionItem> = seen.into_values().collect();
     options.sort_by(|a, b| {
-        (a
+        let ka = (a.order_index, &a.option_id);
+        let kb = (b.order_index, &b.option_id);
+        ka.cmp(&kb)
+    });
+    options
+}

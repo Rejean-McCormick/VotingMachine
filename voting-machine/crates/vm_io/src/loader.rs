@@ -1,274 +1,306 @@
-//! Loader: read local JSON artifacts (manifest → registry → params → ballot_tally),
-//! validate via Draft 2020-12 schemas, normalize ordering, and return a typed
-//! `LoadedContext` for the pipeline. No network I/O.
+//! crates/vm_io/src/loader.rs — Part 1/2 (fixed)
+//! High-level, **offline** JSON loaders with schema checks, size limits, and raw-byte digests.
+//!
+//! Alignment with Docs 1–7 + Annex A/B/C:
+//! - Resolve manifest-relative paths from the **manifest file’s directory**
+//! - Reject any URL-like path (any `<scheme>://`, plus `file:`/`data:` forms) for strict offline posture
+//! - Apply JSON Schema (Draft 2020-12) when the `schemaval` feature is enabled
+//! - Enforce bounded reads on untrusted files
+//! - Compute SHA-256 over **raw file bytes** for input digests (no JSON reformatting)
+//!
+//! Part 2 adds composition (`load_all`), expectation checks, and the bundle types.
 
 #![forbid(unsafe_code)]
 
-use crate::{IoError, canonical_json, hasher, manifest as man, schema};
-use serde::{Deserialize, Serialize};
-use std::{collections::{BTreeMap, BTreeSet}, fs::File, io::Read, path::{Path, PathBuf}};
-use vm_core::{
-    determinism::StableOrd,
-    entities::{DivisionRegistry, OptionItem, Unit},
-    ids::{OptionId, UnitId},
-    variables::{self, Params},
-};
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
-// ----------------------------- Public wire-facing types -----------------------------
+use crate::{IoError, IoResult};
+use crate::manifest::{Manifest, ResolvedPaths};
 
-/// Per-unit totals (mirrors `schemas/ballot_tally.schema.json`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Totals {
-    pub valid_ballots: u64,
-    pub invalid_ballots: u64,
+use vm_core::{DivisionRegistry, Params};
+
+#[cfg(feature = "serde")]
+use serde_json::Value;
+
+/* ---------- constants ---------- */
+
+/// Maximum bytes allowed for any single JSON input (registry/params/tally).
+const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024; // 8 MiB
+
+/* ---------- helpers: strict offline, size-bounded reads, schema ---------- */
+
+/// Return true if `s` looks like a URL in a way we must reject for strict offline posture.
+/// - Matches `<scheme>://...` where scheme = `[A-Za-z][A-Za-z0-9+.-]*`
+/// - Also rejects `file:` and `data:` even without `//`
+/// - Intentionally does **not** match Windows drive letters like `C:\...`
+#[inline]
+fn looks_like_url_strict(s: &str) -> bool {
+    let t = s.trim();
+    if t.starts_with("file:") || t.starts_with("data:") {
+        return true;
+    }
+    if let Some(pos) = t.find("://") {
+        let scheme = &t[..pos];
+        if !scheme.is_empty()
+            && scheme.chars().next().unwrap().is_ascii_alphabetic()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
-/// One option’s count within a unit. JSON field is `votes`; we map into `count`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OptionCount {
-    pub option_id: OptionId,
-    #[serde(rename = "votes")]
-    pub count: u64,
+#[inline]
+fn ensure_offline_path(path: &Path) -> IoResult<()> {
+    let s = path.to_string_lossy();
+    if looks_like_url_strict(&s) {
+        return Err(IoError::Invalid(format!("URL-like path is not allowed: {s}")));
+    }
+    Ok(())
 }
 
-/// Tally for a single unit (array-based options, ordered by registry `order_index`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnitTotals {
-    pub unit_id: UnitId,
-    pub totals: Totals,
-    pub options: Vec<OptionCount>,
+/// Read a JSON file to `serde_json::Value` with a size cap and basic UTF-8 enforcement.
+#[cfg(feature = "serde")]
+fn read_json_value_bounded(path: &Path) -> IoResult<Value> {
+    let meta = fs::metadata(path)?;
+    if meta.len() > MAX_JSON_BYTES {
+        return Err(IoError::Invalid("file too large".into()));
+    }
+    let mut f = fs::File::open(path)?;
+    let mut s = String::with_capacity(meta.len().min(1_000_000) as usize);
+    f.read_to_string(&mut s)?;
+    let v: Value = serde_json::from_str(&s)?;
+    Ok(v)
 }
 
-/// Ballot type (informative; not present in canonical input). Defaults to `Plurality`.
-#[derive(Debug, Clone, Copy)]
-pub enum BallotType {
-    Plurality,
-    Approval,
-    Score,
-    RankedIrv,
-    RankedCondorcet,
+#[cfg(not(feature = "serde"))]
+#[allow(unused_variables)]
+fn read_json_value_bounded(_path: &Path) -> IoResult<()> {
+    Err(IoError::Canon("serde feature disabled".into()))
 }
 
-/// Aggregated unit tallies (normative, array-based).
+#[cfg(feature = "schemaval")]
+#[inline]
+fn validate_schema(kind: crate::schema::SchemaKind, v: &serde_json::Value) -> IoResult<()> {
+    crate::schema::validate_value(kind, v)
+}
+
+#[cfg(not(feature = "schemaval"))]
+#[inline]
+fn validate_schema(_: crate::schema::SchemaKind, _: &serde_json::Value) -> IoResult<()> {
+    Ok(())
+}
+
+/* ---------- digests (raw bytes) ---------- */
+
+/// Compute SHA-256 hex of a file’s **raw bytes** (preferred for input digests).
+fn sha256_of_file(path: &Path) -> IoResult<String> {
+    #[cfg(feature = "hash")]
+    {
+        crate::hasher::sha256_file(path)
+    }
+    #[cfg(not(feature = "hash"))]
+    {
+        Err(IoError::Hash("hash feature disabled".into()))
+    }
+}
+
+/* ---------- manifest: load + resolve (from manifest file path) ---------- */
+
+/// Load a manifest JSON and resolve all relative paths from the **manifest file’s directory**.
+pub fn load_manifest_and_resolve(manifest_path: &Path) -> IoResult<(Manifest, ResolvedPaths)> {
+    let manifest = crate::manifest::load_manifest(manifest_path)?;
+    let base = manifest_path
+        .parent()
+        .ok_or_else(|| IoError::Path(format!("manifest has no parent directory: {}", manifest_path.display())))?;
+
+    let resolved = crate::manifest::resolve_paths(base, &manifest)?;
+    // Strict offline posture (defense-in-depth; manifest loader already rejects common schemes)
+    ensure_offline_path(&resolved.reg)?;
+    ensure_offline_path(&resolved.params)?;
+    ensure_offline_path(&resolved.tally)?;
+    if let Some(adj) = &resolved.adjacency {
+        ensure_offline_path(adj)?;
+    }
+    Ok((manifest, resolved))
+}
+
+/* ---------- typed loaders (individual) ---------- */
+
+/// Load a DivisionRegistry from disk (schema-checked when enabled).
+#[cfg(feature = "serde")]
+pub fn load_registry(path: &Path) -> IoResult<DivisionRegistry> {
+    let v = read_json_value_bounded(path)?;
+    validate_schema(crate::schema::SchemaKind::DivisionRegistry, &v)?;
+    let reg: DivisionRegistry = serde_json::from_value(v)?;
+    Ok(reg)
+}
+
+#[cfg(not(feature = "serde"))]
+#[allow(unused_variables)]
+pub fn load_registry(_path: &Path) -> IoResult<DivisionRegistry> {
+    Err(IoError::Canon("serde feature disabled".into()))
+}
+
+/// Load a Params set from disk (schema-checked when enabled).
+#[cfg(feature = "serde")]
+pub fn load_params(path: &Path) -> IoResult<Params> {
+    let v = read_json_value_bounded(path)?;
+    validate_schema(crate::schema::SchemaKind::ParameterSet, &v)?;
+    let params: Params = serde_json::from_value(v)?;
+    Ok(params)
+}
+
+#[cfg(not(feature = "serde"))]
+#[allow(unused_variables)]
+pub fn load_params(_path: &Path) -> IoResult<Params> {
+    Err(IoError::Canon("serde feature disabled".into()))
+}
+
+/// Load a ballot tally from disk as raw JSON (schema-checked when enabled).
+/// NOTE: `vm_core` does not currently expose a `BallotTally` struct; callers may
+///       adapt the value or map it into their domain type later in the pipeline.
+#[cfg(feature = "serde")]
+pub fn load_tally_raw(path: &Path) -> IoResult<Value> {
+    let v = read_json_value_bounded(path)?;
+    validate_schema(crate::schema::SchemaKind::BallotTally, &v)?;
+    Ok(v)
+}
+
+#[cfg(not(feature = "serde"))]
+#[allow(unused_variables)]
+pub fn load_tally_raw(_path: &Path) -> IoResult<()> {
+    Err(IoError::Canon("serde feature disabled".into()))
+}
+
+/* ---------- digests for inputs (registry/params/tally[/adjacency]) ---------- */
+
 #[derive(Debug, Clone)]
-pub struct UnitTallies {
-    pub ballot_type: BallotType, // not from JSON; set by loader (default: Plurality)
-    pub units: Vec<UnitTotals>,
-}
-
-/// Input digests (sha256 hex) of the three canonical inputs (+adjacency if present).
-#[derive(Debug)]
 pub struct InputDigests {
-    pub division_registry_sha256: String,
-    pub ballot_tally_sha256:      String,
-    pub parameter_set_sha256:     String,
-    pub adjacency_sha256:         Option<String>,
+    pub reg_sha256: String,
+    pub params_sha256: String,
+    pub tally_sha256: String,
+    pub adjacency_sha256: Option<String>,
 }
 
-/// Loaded, validated, normalized context for the pipeline.
-#[derive(Debug)]
-pub struct LoadedContext {
-    pub registry: DivisionRegistry,
-    pub params:   Params,
-    pub tally:    UnitTallies,
-    pub adjacency_inline: Option<Vec<Adjacency>>,
-    pub digests:  InputDigests,
-}
-
-// --- Adjacency placeholder import (domain lives in vm_core if/when defined) ---
-#[allow(unused_imports)]
-use vm_core::entities::Adjacency; // Keep aligned with repo plan; optional in this revision.
-
-// ----------------------------- Orchestration -----------------------------
-
-/// Load everything from a **manifest file path**: manifest → registry → params → tally (+adjacency).
-pub fn load_all_from_manifest(path: &Path) -> Result<LoadedContext, IoError> {
-    // 1) Manifest
-    let man = man::load_manifest(path)?;
-    let resolved = man::resolve_paths(path, &man)?;
-
-    // 2) Registry
-    let mut registry = load_registry(&resolved.reg)?;
-    // normalize registry (units ↑ unit_id; each unit.options ↑ (order_index, option_id))
-    for u in &mut registry.units {
-        u.options = normalize_options(std::mem::take(&mut u.options));
-    }
-    registry.units = normalize_units(std::mem::take(&mut registry.units));
-
-    // quick uniqueness check for order_index within each unit
-    for u in &registry.units {
-        let mut seen = BTreeSet::new();
-        for opt in &u.options {
-            if !seen.insert(opt.order_index) {
-                return Err(IoError::Manifest(format!(
-                    "duplicate order_index {} in unit {}", opt.order_index, u.unit_id
-                )));
-            }
-        }
-    }
-
-    // 3) Params
-    let params = load_params(&resolved.params)?;
-    variables::validate_domains(&params)
-        .map_err(|e| IoError::Manifest(format!("parameter domain error: {:?}", e)))?;
-
-    // 4) Ballot Tally
-    let mut tally = load_ballot_tally(&resolved.tally)?;
-    // 5) Optional adjacency
-    let adjacency_inline = match &resolved.adjacency {
-        Some(p) => Some(load_adjacency(p)?),
-        None => None,
-    };
-
-    // 6) Cross-refs & normalization of tally option order to registry order
-    check_cross_refs(&registry, &[], &tally, adjacency_inline.as_deref())?;
-    // Build per-unit canonical order from registry and re-order each tally.options list accordingly.
-    let reg_unit_map: BTreeMap<&UnitId, &Unit> = registry.units.iter().map(|u| (&u.unit_id, u)).collect();
-    for u in &mut tally.units {
-        if let Some(reg_u) = reg_unit_map.get(&u.unit_id) {
-            normalize_tally_options_unit(u, &reg_u.options);
-        }
-    }
-    // And sort units ↑ unit_id
-    tally.units.sort_by(|a, b| a.unit_id.cmp(&b.unit_id));
-
-    // 7) Digests of canonical bytes (normative inputs only)
-    let division_registry_sha256 = hasher::sha256_canonical(&registry)?;
-    let ballot_tally_sha256      = {
-        // For hashing, serialize back to the canonical on-wire shape (votes, not count).
-        #[derive(Serialize)]
-        struct OnWireUnit<'a> {
-            unit_id: &'a UnitId,
-            totals:  &'a Totals,
-            options: Vec<OnWireOpt<'a>>,
-        }
-        #[derive(Serialize)]
-        struct OnWireOpt<'a> { option_id: &'a OptionId, votes: u64 }
-        #[derive(Serialize)]
-        struct OnWire<'a> { schema_version: &'a str, units: Vec<OnWireUnit<'a>> }
-
-        // By contract, schema_version is an opaque string; we pass through "1.x" here
-        // to maintain a stable shape for canonical hashing when the source omitted it.
-        let onwire = OnWire {
-            schema_version: "1.x",
-            units: tally.units.iter().map(|u| OnWireUnit {
-                unit_id: &u.unit_id,
-                totals:  &u.totals,
-                options: u.options.iter().map(|o| OnWireOpt { option_id: &o.option_id, votes: o.count }).collect(),
-            }).collect(),
-        };
-        hasher::sha256_canonical(&onwire)?
-    };
-    let parameter_set_sha256     = hasher::sha256_canonical(&params)?;
-    let adjacency_sha256         = match &adjacency_inline {
-        Some(adj) => Some(hasher::sha256_canonical(adj)?),
-        None => None,
-    };
-
-    Ok(LoadedContext {
-        registry,
-        params,
-        tally,
-        adjacency_inline,
-        digests: InputDigests {
-            division_registry_sha256,
-            ballot_tally_sha256,
-            parameter_set_sha256,
-            adjacency_sha256,
+pub fn compute_input_digests(paths: &ResolvedPaths) -> IoResult<InputDigests> {
+    Ok(InputDigests {
+        reg_sha256: sha256_of_file(&paths.reg)?,
+        params_sha256: sha256_of_file(&paths.params)?,
+        tally_sha256: sha256_of_file(&paths.tally)?,
+        adjacency_sha256: match &paths.adjacency {
+            Some(p) => Some(sha256_of_file(p)?),
+            None => None,
         },
     })
 }
 
-// ----------------------------- Targeted loaders -----------------------------
+//! crates/vm_io/src/loader.rs — Part 2/2 (fixed)
+//! Composition helpers (load_all), expectation checks, and bundle types.
+//!
+//! NOTE: Functions and types that carry raw JSON values are gated on `serde`.
 
-pub fn load_registry(path: &Path) -> Result<DivisionRegistry, IoError> {
-    let v = read_json_value_with_limits(path)?;
-    schema::validate_value(schema::SchemaKind::DivisionRegistry, &v)?;
-    let reg: DivisionRegistry = serde_json::from_value(v)
-        .map_err(|e| IoError::Json { pointer: "/".into(), msg: e.to_string() })?;
-    Ok(reg)
+#![forbid(unsafe_code)]
+
+use std::path::Path;
+
+use crate::{IoError, IoResult};
+use crate::manifest::{Manifest, ResolvedPaths, verify_expectations};
+use super::{load_manifest_and_resolve, load_registry, load_params, load_tally_raw, compute_input_digests, InputDigests};
+
+use vm_core::{DivisionRegistry, Params};
+
+#[cfg(feature = "serde")]
+use serde_json::Value;
+
+/* ---------- loaded bundle types ---------- */
+
+#[cfg(feature = "serde")]
+#[derive(Debug)]
+pub struct LoadedInputs {
+    pub registry: DivisionRegistry,
+    pub params: Params,
+    /// Raw ballot tally JSON (typed mapping is pipeline-dependent)
+    pub tally: Value,
 }
 
-pub fn load_params(path: &Path) -> Result<Params, IoError> {
-    let v = read_json_value_with_limits(path)?;
-    schema::validate_value(schema::SchemaKind::ParameterSet, &v)?;
-    let ps: Params = serde_json::from_value(v)
-        .map_err(|e| IoError::Json { pointer: "/".into(), msg: e.to_string() })?;
-    Ok(ps)
+#[cfg(feature = "serde")]
+#[derive(Debug)]
+pub struct LoadedBundle {
+    pub manifest: Manifest,
+    pub paths: ResolvedPaths,
+    pub inputs: LoadedInputs,
+    pub digests: InputDigests,
 }
 
-pub fn load_ballot_tally(path: &Path) -> Result<UnitTallies, IoError> {
-    // Raw, as per schema (options[].votes).
-    #[derive(Deserialize)]
-    struct RawOpt { option_id: OptionId, votes: u64 }
-    #[derive(Deserialize)]
-    struct RawUnit { unit_id: UnitId, totals: Totals, options: Vec<RawOpt> }
-    #[derive(Deserialize)]
-    struct RawTally { /* schema_version: String (ignored), */ units: Vec<RawUnit> }
+/* ---------- composition ---------- */
 
-    let v = read_json_value_with_limits(path)?;
-    schema::validate_value(schema::SchemaKind::BallotTally, &v)?;
-    let raw: RawTally = serde_json::from_value(v)
-        .map_err(|e| IoError::Json { pointer: "/".into(), msg: e.to_string() })?;
+/// Load everything referenced by a manifest file:
+/// - parse + basic validation of the manifest
+/// - resolve relative paths from the manifest file's directory
+/// - strict offline checks on all resolved paths
+/// - schema-checked loads of registry/params/tally (when `schemaval` is on)
+/// - raw-byte SHA-256 digests for each input (and adjacency when present)
+/// - normalization of `Params` to stabilize FID (dedup/sort of order-sensitive lists)
+#[cfg(feature = "serde")]
+pub fn load_all(manifest_path: &Path) -> IoResult<LoadedBundle> {
+    let (manifest, paths) = load_manifest_and_resolve(manifest_path)?;
 
-    let units = raw.units.into_iter().map(|ru| UnitTotals {
-        unit_id: ru.unit_id,
-        totals: ru.totals,
-        options: ru.options.into_iter().map(|ro| OptionCount { option_id: ro.option_id, count: ro.votes }).collect(),
-    }).collect();
+    // Load each artifact with schema checks (feature-gated inside)
+    let registry = load_registry(&paths.reg)?;
+    let mut params = load_params(&paths.params)?;
+    let tally = load_tally_raw(&paths.tally)?;
 
-    Ok(UnitTallies { ballot_type: BallotType::Plurality, units })
+    // Normalize Params for FID stability (no-ops if already canonical)
+    params.normalize_for_fid();
+
+    // Raw-byte digests (match test-pack & Annex B)
+    let digests: InputDigests = compute_input_digests(&paths)?;
+
+    Ok(LoadedBundle {
+        manifest,
+        paths,
+        inputs: LoadedInputs { registry, params, tally },
+        digests,
+    })
 }
 
-pub fn load_adjacency(_path: &Path) -> Result<Vec<Adjacency>, IoError> {
-    // Adjacency is optional and its schema/type are defined elsewhere in the project.
-    // Wire it up here when the schema & vm_core::entities::Adjacency are finalized.
-    Err(IoError::Manifest("adjacency loader not implemented in this revision".into()))
+#[cfg(not(feature = "serde"))]
+#[allow(unused_variables)]
+pub fn load_all(_manifest_path: &Path) -> IoResult<()> {
+    Err(IoError::Canon("serde feature disabled".into()))
 }
 
-// ----------------------------- Canonicalization & checks -----------------------------
+/* ---------- expectations ---------- */
 
-/// Sort units ↑ UnitId (lexicographic).
-pub fn normalize_units(mut units: Vec<Unit>) -> Vec<Unit> {
-    units.sort_by(|a, b| a.unit_id.cmp(&b.unit_id));
-    units
+/// Verify the optional `expect { formula_id, engine_version }` block from the manifest
+/// against the **actual** values computed/known by the caller (e.g., after FID calc).
+///
+/// Callers that don't have one or both values yet may pass `None` for that field.
+/// This function returns `Ok(()))` when there is no `expect` block.
+pub fn check_manifest_expectations(
+    manifest: &Manifest,
+    actual_formula_id: Option<&str>,
+    actual_engine_version: Option<&str>,
+) -> IoResult<()> {
+    verify_expectations(manifest, actual_formula_id, actual_engine_version)
 }
 
-/// Sort options ↑ (order_index, OptionId).
-pub fn normalize_options(mut opts: Vec<OptionItem>) -> Vec<OptionItem> {
-    opts.sort_by(|a, b| {
-        match a.order_index.cmp(&b.order_index) {
-            core::cmp::Ordering::Equal => a.option_id.cmp(&b.option_id),
-            o => o,
-        }
-    });
-    opts
-}
+/* ---------- convenience on the bundle ---------- */
 
-/// Reorder the **unit's** tally options to reflect the registry’s canonical order.
-fn normalize_tally_options_unit(u: &mut UnitTotals, reg_opts: &[OptionItem]) {
-    let mut map: BTreeMap<&OptionId, u64> = BTreeMap::new();
-    for oc in &u.options {
-        // If duplicates in the tally, later entries overwrite — upstream should prevent this.
-        map.insert(&oc.option_id, oc.count);
+#[cfg(feature = "serde")]
+impl LoadedBundle {
+    /// Convenience to re-run expectation checks using the bundle's manifest.
+    pub fn assert_expectations(
+        &self,
+        actual_formula_id: Option<&str>,
+        actual_engine_version: Option<&str>,
+    ) -> IoResult<()> {
+        check_manifest_expectations(&self.manifest, actual_formula_id, actual_engine_version)
     }
-    let mut out = Vec::with_capacity(reg_opts.len());
-    for ro in reg_opts {
-        if let Some(&cnt) = map.get(&ro.option_id) {
-            out.push(OptionCount { option_id: ro.option_id.clone(), count: cnt });
-        } else {
-            // If a registry option has no count in tally, treat as zero (common in sparse tallies).
-            out.push(OptionCount { option_id: ro.option_id.clone(), count: 0 });
-        }
-    }
-    u.options = out;
 }
-
-/// Public wrapper kept for API parity (kept for future multi-unit reorder helpers).
-pub fn normalize_tally_options(t: &mut UnitTallies, _order: &[OptionItem]) {
-    // Intentionally no-op: we reorder per-unit using the registry’s per-unit option list
-    // inside `load_all_from_manifest` where we have access to each unit's options.
-}
-
-/// Cross-file referential checks (lightweight, early failures).
-pub

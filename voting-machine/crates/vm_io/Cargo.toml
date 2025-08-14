@@ -2,40 +2,31 @@
 name = "vm_io"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.77"
-license = "Apache-2.0 OR MIT"
-description = "I/O, canonical JSON, JSON Schema validation (2020-12), and SHA-256 hashing for the VM engine."
-# repository = "."; readme = "README.md"
-
-[lib]
-name = "vm_io"
-path = "src/lib.rs"
-crate-type = ["rlib"]
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+description = "Canonical JSON I/O, schema validation, and input digests for VM pipeline"
+repository = "https://example.invalid/repo"
 
 [features]
-default = ["std", "serde", "schemaval", "hash", "path_utf8"]
-std = []
-serde = ["dep:serde", "dep:serde_json"]
-schemaval = ["dep:jsonschema"]
-hash = ["dep:sha2", "dep:digest"]
-path_utf8 = ["dep:camino"]
+# Keep these feature names for compatibility, but they do nothing now.
+# The corresponding crates are non-optional because they are used unconditionally in code.
+default = []
+path_utf8 = []
+hash = []
+serde = []
 
 [dependencies]
-vm_core     = { path = "../vm_core" } # adjust if your workspace layout differs
+camino = "1.1"                       # Utf8Path / Utf8PathBuf used in public structs
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"                   # used throughout canonical_json.rs, loader.rs, manifest.rs
+thiserror = "1.0"                    # error types in loader/manifest
+sha2 = "0.10"                        # verify_digests in manifest.rs
+digest = "0.10"                      # sha2 trait dependency; explicit for clarity
+itertools = "0.13"                   # if used by mapping/normalization helpers (retain if present)
 
-serde       = { version = "1", features = ["derive"], optional = true, default-features = false }
-serde_json  = { version = "1", optional = true }                      # std only; used for parse/write
-
-jsonschema  = { version = "0.17", optional = true, default-features = false, features = ["draft2020-12"] }
-
-sha2        = { version = "0.10", optional = true, default-features = false }
-digest      = { version = "0.10", optional = true, default-features = false }
-hex         = { version = "0.4",  default-features = false }
-
-camino      = { version = "1", optional = true, default-features = false }
-
-thiserror   = { version = "1", default-features = false }
+# If you have schema validation helpers or other internal crates, keep them here:
+# schemars = "0.8"                   # (only if actually used)
+# regex = "1"                        # (only if actually used)
 
 [dev-dependencies]
-assert_json_diff = "2"
-tempfile         = "3"
+serde_json = { version = "1.0", features = ["preserve_order"] }
