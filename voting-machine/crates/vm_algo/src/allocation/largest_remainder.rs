@@ -1,8 +1,8 @@
 //! Largest Remainder (LR) allocation per unit with selectable quota
-//! (Hare, Droop, Imperiali), after applying an entry threshold.
+//! (Hare, Droop, Imperiali).
 //!
-//! Contract (Doc 1 / Annex A aligned):
-//! - Threshold is applied to natural totals (plurality votes, approvals, score sums).
+//! Contract (Doc 4 / Doc 5 aligned):
+//! - Thresholding happens upstream; this function assumes `scores` already filtered.
 //! - Quota kinds:
 //!     * Hare:      floor(V / m)
 //!     * Droop:     floor(V / (m + 1)) + 1
@@ -10,23 +10,21 @@
 //! - Floors are v_i / q (integer div); remainders are v_i % q.
 //! - If q == 0 (tiny totals), floors are 0 and remainders are raw scores.
 //! - If sum_floors < seats → distribute leftovers by largest remainder
-//!   (tie keys: remainder ↓, raw score ↓, then canonical (order_index, id);
-//!   StatusQuo policy falls back to deterministic due to no SQ flag here).
+//!   (tie keys: remainder ↓, raw score ↓, then canonical order).
 //! - If sum_floors > seats (Imperiali edge) → trim from smallest remainder
-//!   (inverse ordering; same tie-policy rules).
+//!   (remainder ↑, raw score ↑, then canonical order).
 //!
 //! Determinism:
-//! - All scans follow canonical option order provided by `options`.
-//! - Random ties depend *only* on the injected `TieRng` stream.
+//! - No RNG or policy here (S4); deterministic tie-breaking only.
 
-use std::collections::{BTreeMap, BTreeSet};
+#![cfg_attr(not(feature = "std"), no_std)]
 
-use vm_core::{
-    ids::OptionId,
-    entities::OptionItem,
-    rng::TieRng,
-    variables::TiePolicy,
-};
+extern crate alloc;
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+
+use vm_core::ids::OptionId;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum QuotaKind {
@@ -37,98 +35,58 @@ pub enum QuotaKind {
 
 #[derive(Debug)]
 pub enum AllocError {
-    /// After threshold filtering, no options remain eligible while seats > 0.
+    /// No eligible options (empty `scores`) while seats > 0.
     NoEligibleOptions,
-    /// Policy was Random but no RNG was supplied (and seats > 0).
-    MissingRngForRandomPolicy,
 }
 
-/// Allocate seats using Largest Remainder with a selected quota.
-///
-/// Notes:
-/// - If `seats == 0`, returns an empty map.
-/// - Keys missing from `scores` are treated as 0 (they rarely pass a positive threshold).
+/// Public API expected by the pipeline (kept stable).
+/// Breaks LR ties by: remainder ↓, raw score ↓, then `OptionId` ascending.
+/// If canonical order differs from `OptionId`, prefer the `*_with_order` variant below.
 pub fn allocate_largest_remainder(
     seats: u32,
     scores: &BTreeMap<OptionId, u64>,
-    options: &[OptionItem], // canonical (order_index, id)
-    threshold_pct: u8,
     quota: QuotaKind,
-    tie_policy: TiePolicy,
-    mut rng: Option<&mut TieRng>,
 ) -> Result<BTreeMap<OptionId, u32>, AllocError> {
+    allocate_largest_remainder_with_order(seats, scores, quota, None)
+}
+
+/// Variant that accepts a canonical order (slice of OptionIds). When provided,
+/// ties use that order as the final key (ascending index in the slice).
+pub fn allocate_largest_remainder_with_order(
+    seats: u32,
+    scores: &BTreeMap<OptionId, u64>,
+    quota: QuotaKind,
+    canonical_order: Option<&[OptionId]>,
+) -> Result<BTreeMap<OptionId, u32>, AllocError> {
+    // Trivial cases
     if seats == 0 {
         return Ok(BTreeMap::new());
     }
-    if matches!(tie_policy, TiePolicy::Random) && rng.is_none() {
-        return Err(AllocError::MissingRngForRandomPolicy);
-    }
-
-    let eligible = filter_by_threshold(scores, threshold_pct);
-    if eligible.is_empty() {
+    if scores.is_empty() {
         return Err(AllocError::NoEligibleOptions);
     }
 
-    let total: u128 = eligible.values().map(|&v| v as u128).sum();
+    let total: u128 = scores.values().map(|&v| v as u128).sum();
     let q = compute_quota(total, seats as u128, quota);
 
-    let (mut alloc, remainders) = floors_and_remainders(&eligible, q);
+    let (mut alloc, remainders) = floors_and_remainders(scores, q);
 
-    // Sum floors (u128 to avoid intermediate growth) and compare with seats.
+    // Sum floors and compare to target seats.
     let sum_floors: u128 = alloc.values().map(|&s| s as u128).sum();
 
     if sum_floors < seats as u128 {
+        // Assign remaining seats by static LR ranking (deterministic).
         let needed = (seats as u128 - sum_floors) as u32;
-        distribute_leftovers(
-            needed,
-            &mut alloc,
-            &remainders,
-            &eligible,
-            options,
-            tie_policy,
-            rng.as_deref_mut(),
-        );
+        distribute_leftovers(needed, &mut alloc, &remainders, scores, canonical_order);
     } else if sum_floors > seats as u128 {
-        // Imperiali (or degenerate q) may over-allocate in floors.
-        trim_over_allocation_if_needed(
-            seats,
-            &mut alloc,
-            &remainders,
-            &eligible,
-            options,
-            tie_policy,
-            rng.as_deref_mut(),
-        );
+        // Imperiali edge (or degenerate quota): remove seats based on inverse LR ranking.
+        trim_over_allocation(seats, &mut alloc, &remainders, scores, canonical_order);
     }
 
-    debug_assert_eq!(
-        alloc.values().map(|&s| s as u128).sum::<u128>(),
-        seats as u128
-    );
+    // Always recompute final sum to avoid stale assertions.
+    let sum: u128 = alloc.values().map(|&s| s as u128).sum();
+    debug_assert_eq!(sum, seats as u128);
     Ok(alloc)
-}
-
-/// Keep options whose natural share meets threshold: 100*v >= threshold_pct*total (u128 math).
-fn filter_by_threshold(
-    scores: &BTreeMap<OptionId, u64>,
-    threshold_pct: u8,
-) -> BTreeMap<OptionId, u64> {
-    let total: u128 = scores.values().map(|&v| v as u128).sum();
-    if threshold_pct == 0 {
-        return scores.clone();
-    }
-    let t = threshold_pct as u128;
-    scores
-        .iter()
-        .filter_map(|(k, &v)| {
-            let v128 = v as u128;
-            if v128.saturating_mul(100) >= t.saturating_mul(total) {
-                Some((k.clone(), v))
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 /// Integer-only quota.
@@ -141,7 +99,7 @@ fn compute_quota(total: u128, seats: u128, quota: QuotaKind) -> u128 {
             if seats == 0 { 0 } else { total / seats }
         }
         QuotaKind::Droop => {
-            // floor(V/(m+1)) + 1 ; seats > 0 in caller
+            // floor(V/(m+1)) + 1 ; m>0 guaranteed by caller
             (total / (seats + 1)) + 1
         }
         QuotaKind::Imperiali => {
@@ -153,13 +111,13 @@ fn compute_quota(total: u128, seats: u128, quota: QuotaKind) -> u128 {
 
 /// Compute floors and remainders given quota q (u128 math; q==0 handled).
 fn floors_and_remainders(
-    eligible: &BTreeMap<OptionId, u64>,
+    scores: &BTreeMap<OptionId, u64>,
     q: u128,
 ) -> (BTreeMap<OptionId, u32>, BTreeMap<OptionId, u128>) {
     let mut floors: BTreeMap<OptionId, u32> = BTreeMap::new();
     let mut rems: BTreeMap<OptionId, u128> = BTreeMap::new();
 
-    for (id, &v) in eligible {
+    for (id, &v) in scores.iter() {
         let v128 = v as u128;
         if q == 0 {
             floors.insert(id.clone(), 0);
@@ -167,11 +125,7 @@ fn floors_and_remainders(
         } else {
             let f128 = v128 / q;
             // Saturate to u32::MAX; in practice seats bound this far below.
-            let f = if f128 > (u32::MAX as u128) {
-                u32::MAX
-            } else {
-                f128 as u32
-            };
+            let f = if f128 > (u32::MAX as u128) { u32::MAX } else { f128 as u32 };
             let r = v128 % q;
             floors.insert(id.clone(), f);
             rems.insert(id.clone(), r);
@@ -181,208 +135,132 @@ fn floors_and_remainders(
     (floors, rems)
 }
 
-/// Assign remaining seats by largest remainder; ties per policy
-/// (remainder ↓, raw score ↓, canonical (order_index, id); StatusQuo→deterministic; Random uses rng).
+/// Assign `target_extra` seats by largest remainder (deterministic ranking):
+/// remainder ↓, raw score ↓, then canonical order (if provided) else `OptionId` ↑.
 fn distribute_leftovers(
     target_extra: u32,
     alloc: &mut BTreeMap<OptionId, u32>,
     remainders: &BTreeMap<OptionId, u128>,
     scores: &BTreeMap<OptionId, u64>,
-    options: &[OptionItem],
-    tie_policy: TiePolicy,
-    mut rng: Option<&mut TieRng>,
+    canonical_order: Option<&[OptionId]>,
 ) {
-    for _ in 0..target_extra {
-        // Find max remainder among eligible keys.
-        let mut max_r: Option<u128> = None;
-        let mut max_ids: Vec<OptionId> = Vec::new();
+    if target_extra == 0 || remainders.is_empty() {
+        return;
+    }
 
-        for opt in options {
-            if let Some(&r) = remainders.get(&opt.option_id) {
-                match max_r {
-                    None => {
-                        max_r = Some(r);
-                        max_ids.clear();
-                        max_ids.push(opt.option_id.clone());
-                    }
-                    Some(mr) => {
-                        if r > mr {
-                            max_r = Some(r);
-                            max_ids.clear();
-                            max_ids.push(opt.option_id.clone());
-                        } else if r == mr {
-                            max_ids.push(opt.option_id.clone());
-                        }
-                    }
+    // Build canonical index lookup if provided.
+    let order_ix: BTreeMap<OptionId, usize> = match canonical_order {
+        Some(slice) => slice
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect(),
+        None => BTreeMap::new(),
+    };
+
+    // Build a stable ranking once; reuse cyclically if target_extra > candidates.
+    let mut ranking: Vec<(OptionId, u128, u64, usize)> = remainders
+        .iter()
+        .map(|(id, &r)| {
+            let sc = *scores.get(id).unwrap_or(&0);
+            let ix = order_ix.get(id).cloned().unwrap_or(usize::MAX);
+            (id.clone(), r, sc, ix)
+        })
+        .collect();
+
+    ranking.sort_by(|a, b| {
+        // r desc, score desc, canonical asc (or OptionId asc if no canonical index)
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| {
+                match (a.3, b.3) {
+                    (usize::MAX, usize::MAX) => a.0.cmp(&b.0), // fall back to OptionId
+                    (ia, ib) => ia.cmp(&ib),
                 }
-            }
+            })
+    });
+
+    if ranking.is_empty() {
+        return;
+    }
+
+    let n = ranking.len();
+    let mut given = 0u32;
+    let mut idx = 0usize;
+
+    while given < target_extra {
+        let (ref id, _, _, _) = ranking[idx];
+        *alloc.entry(id.clone()).or_insert(0) += 1;
+        given += 1;
+        idx += 1;
+        if idx == n {
+            idx = 0; // cycle if more seats than candidates (degenerate quotas)
         }
-
-        let winner = if max_ids.len() <= 1 {
-            max_ids[0].clone()
-        } else {
-            // Narrow by raw score desc
-            let mut best_score: Option<u64> = None;
-            let mut narrowed: Vec<OptionId> = Vec::new();
-            for id in &max_ids {
-                let sc = *scores.get(id).unwrap_or(&0);
-                match best_score {
-                    None => {
-                        best_score = Some(sc);
-                        narrowed.clear();
-                        narrowed.push(id.clone());
-                    }
-                    Some(bs) => {
-                        if sc > bs {
-                            best_score = Some(sc);
-                            narrowed.clear();
-                            narrowed.push(id.clone());
-                        } else if sc == bs {
-                            narrowed.push(id.clone());
-                        }
-                    }
-                }
-            }
-            if narrowed.len() <= 1 {
-                narrowed[0].clone()
-            } else {
-                match tie_policy {
-                    TiePolicy::StatusQuo => status_quo_pick(&narrowed, options),
-                    TiePolicy::DeterministicOrder => deterministic_pick(&narrowed, options),
-                    TiePolicy::Random => {
-                        let n = narrowed.len() as u64;
-                        let idx = rng
-                            .as_deref_mut()
-                            .expect("rng must be provided for Random policy")
-                            .gen_range(n)
-                            .unwrap_or(0) as usize;
-                        narrowed[idx].clone()
-                    }
-                }
-            }
-        };
-
-        *alloc.entry(winner).or_insert(0) += 1;
     }
 }
 
-/// Imperiali edge: if floors sum > target, trim from smallest remainder until sum == target.
-/// Ties resolved using inverse of distribute ranking (remainder ↑, raw score ↑, then canonical),
-/// with StatusQuo→deterministic; Random uses rng.
-fn trim_over_allocation_if_needed(
+/// Trim seats when floors over-allocate (Imperiali edge) using inverse LR ranking:
+/// remainder ↑, raw score ↑, then canonical order (if provided) else `OptionId` ↑.
+fn trim_over_allocation(
     target_seats: u32,
     alloc: &mut BTreeMap<OptionId, u32>,
     remainders: &BTreeMap<OptionId, u128>,
     scores: &BTreeMap<OptionId, u64>,
-    options: &[OptionItem],
-    tie_policy: TiePolicy,
-    mut rng: Option<&mut TieRng>,
-) -> bool {
-    let mut changed = false;
-
+    canonical_order: Option<&[OptionId]>,
+) {
     let mut total: u128 = alloc.values().map(|&s| s as u128).sum();
+    if total <= target_seats as u128 {
+        return;
+    }
+
+    let order_ix: BTreeMap<OptionId, usize> = match canonical_order {
+        Some(slice) => slice
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect(),
+        None => BTreeMap::new(),
+    };
+
+    // Consider only options with at least one seat.
+    let mut ranking: Vec<(OptionId, u128, u64, usize)> = alloc
+        .iter()
+        .filter_map(|(id, &s)| (s > 0).then(|| {
+            let r = *remainders.get(id).unwrap_or(&0);
+            let sc = *scores.get(id).unwrap_or(&0);
+            let ix = order_ix.get(id).cloned().unwrap_or(usize::MAX);
+            (id.clone(), r, sc, ix)
+        }))
+        .collect();
+
+    ranking.sort_by(|a, b| {
+        // r asc, score asc, canonical asc (or OptionId asc if no canonical index)
+        a.1.cmp(&b.1)
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| {
+                match (a.3, b.3) {
+                    (usize::MAX, usize::MAX) => a.0.cmp(&b.0), // fall back to OptionId
+                    (ia, ib) => ia.cmp(&ib),
+                }
+            })
+    });
+
+    if ranking.is_empty() {
+        return;
+    }
+
+    let mut idx = 0usize;
     while total > target_seats as u128 {
-        // Consider only options with at least one seat to trim.
-        let mut min_r: Option<u128> = None;
-        let mut cand_ids: Vec<OptionId> = Vec::new();
-
-        for opt in options {
-            if let Some(&s) = alloc.get(&opt.option_id) {
-                if s == 0 {
-                    continue;
-                }
-                let r = *remainders.get(&opt.option_id).unwrap_or(&0);
-                match min_r {
-                    None => {
-                        min_r = Some(r);
-                        cand_ids.clear();
-                        cand_ids.push(opt.option_id.clone());
-                    }
-                    Some(mr) => {
-                        if r < mr {
-                            min_r = Some(r);
-                            cand_ids.clear();
-                            cand_ids.push(opt.option_id.clone());
-                        } else if r == mr {
-                            cand_ids.push(opt.option_id.clone());
-                        }
-                    }
-                }
+        let (ref id, _, _, _) = ranking[idx];
+        if let Some(s) = alloc.get_mut(id) {
+            if *s > 0 {
+                *s -= 1;
+                total -= 1;
             }
         }
-
-        // On tie, prefer smaller raw score (inverse of leftovers), then canonical order.
-        let loser = if cand_ids.len() <= 1 {
-            cand_ids[0].clone()
-        } else {
-            let mut best_score: Option<u64> = None; // but now "best" means *smallest*
-            let mut narrowed: Vec<OptionId> = Vec::new();
-            for id in &cand_ids {
-                let sc = *scores.get(id).unwrap_or(&0);
-                match best_score {
-                    None => {
-                        best_score = Some(sc);
-                        narrowed.clear();
-                        narrowed.push(id.clone());
-                    }
-                    Some(bs) => {
-                        if sc < bs {
-                            best_score = Some(sc);
-                            narrowed.clear();
-                            narrowed.push(id.clone());
-                        } else if sc == bs {
-                            narrowed.push(id.clone());
-                        }
-                    }
-                }
-            }
-            if narrowed.len() <= 1 {
-                narrowed[0].clone()
-            } else {
-                match tie_policy {
-                    TiePolicy::StatusQuo => status_quo_pick(&narrowed, options),
-                    TiePolicy::DeterministicOrder => deterministic_pick(&narrowed, options),
-                    TiePolicy::Random => {
-                        let n = narrowed.len() as u64;
-                        let idx = rng
-                            .as_deref_mut()
-                            .expect("rng must be provided for Random policy")
-                            .gen_range(n)
-                            .unwrap_or(0) as usize;
-                        narrowed[idx].clone()
-                    }
-                }
-            }
-        };
-
-        if let Some(s) = alloc.get_mut(&loser) {
-            *s -= 1;
-            changed = true;
-            total -= 1;
-        } else {
-            // Should not happen; defensive break to avoid infinite loop.
-            break;
+        idx += 1;
+        if idx == ranking.len() {
+            idx = 0; // cycle defensively; should rarely happen
         }
     }
-
-    changed
-}
-
-// ----------------- tie helpers -----------------
-
-/// Deterministic pick: first in canonical `(order_index, option_id)` among `tied`.
-fn deterministic_pick(tied: &[OptionId], options: &[OptionItem]) -> OptionId {
-    let set: BTreeSet<&OptionId> = tied.iter().collect();
-    for o in options {
-        if set.contains(&o.option_id) {
-            return o.option_id.clone();
-        }
-    }
-    // Defensive fallback (should not occur given inputs).
-    tied.iter().min().cloned().expect("non-empty tied")
-}
-
-/// Status-quo resolver: core `OptionItem` has no SQ flag, so fall back to deterministic.
-fn status_quo_pick(tied: &[OptionId], options: &[OptionItem]) -> OptionId {
-    deterministic_pick(tied, options)
 }

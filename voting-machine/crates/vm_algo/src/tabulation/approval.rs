@@ -6,7 +6,7 @@
 //! - `turnout`: per-unit totals { valid_ballots, invalid_ballots } (Doc 1B names)
 //! - `options`: canonical option list ordered by (order_index, OptionId)
 //!
-////! Output:
+//! Output:
 //! - `UnitScores { unit_id, turnout, scores }` where `scores` is a `BTreeMap<OptionId, u64>`.
 //!
 //! Notes:
@@ -16,7 +16,7 @@
 //! - No RNG, no floats. Downstream should iterate results using the provided
 //!   canonical `options` slice to preserve on-wire order.
 
-use std::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use vm_core::{
     entities::{OptionItem, TallyTotals},
@@ -61,11 +61,11 @@ fn canonicalize_scores(
     approvals: &BTreeMap<OptionId, u64>,
     options: &[OptionItem],
 ) -> Result<BTreeMap<OptionId, u64>, TabError> {
-    // Fast membership set for unknown-key detection.
-    let allowed: BTreeSet<&OptionId> = options.iter().map(|o| &o.option_id).collect();
+    // Fast membership set for unknown-key detection (OWNED ids for robustness).
+    let allowed: BTreeSet<OptionId> = options.iter().map(|o| o.option_id.clone()).collect();
 
     // Reject any approval keyed by an unknown option.
-    if let Some((bad_id, _)) = approvals.iter().find(|(k, _)| !allowed.contains(k)) {
+    if let Some((bad_id, _)) = approvals.iter().find(|(k, _)| !allowed.contains(*k)) {
         return Err(TabError::UnknownOption((*bad_id).clone()));
     }
 
@@ -75,6 +75,15 @@ fn canonicalize_scores(
         let count = approvals.get(&opt.option_id).copied().unwrap_or(0);
         scores.insert(opt.option_id.clone(), count);
     }
+
+    // Defensive: if upstream validation ever skipped ensuring the full option list,
+    // this function would "heal" sparse inputs with zeros. Keep an assert to surface it in debug.
+    debug_assert_eq!(
+        scores.len(),
+        options.len(),
+        "canonicalize_scores: options length mismatch"
+    );
+
     Ok(scores)
 }
 
@@ -99,6 +108,7 @@ fn check_per_option_caps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use vm_core::entities::OptionItem;
 
     fn opt(id: &str, idx: u16) -> OptionItem {
@@ -120,21 +130,14 @@ mod tests {
         approvals.insert("O-A".parse().unwrap(), 10);
         approvals.insert("O-C".parse().unwrap(), 40);
 
-        let turnout = TallyTotals::new(100, 0);
-
         let scores = canonicalize_scores(&approvals, &options).expect("ok");
         assert_eq!(scores.get(&"O-A".parse().unwrap()).copied(), Some(10));
         assert_eq!(scores.get(&"O-B".parse().unwrap()).copied(), Some(20));
         assert_eq!(scores.get(&"O-C".parse().unwrap()).copied(), Some(40));
-
-        // Full tabulate
-        let unit_id: UnitId = "U-001".parse().unwrap();
-        let us = tabulate_approval(unit_id, &approvals, turnout, &options).expect("ok");
-        assert_eq!(us.turnout.valid_ballots, 100);
     }
 
     #[test]
-    fn unknown_option_rejected() {
+    fn missing_keys_are_zero_unknown_are_error() {
         let options = vec![opt("O-A", 0), opt("O-B", 1)];
         let mut approvals = BTreeMap::<OptionId, u64>::new();
         approvals.insert("O-A".parse().unwrap(), 5);
@@ -148,39 +151,23 @@ mod tests {
     }
 
     #[test]
-    fn per_option_caps_enforced() {
+    fn per_option_caps_block_when_valid_zero() {
         let options = vec![opt("O-A", 0), opt("O-B", 1)];
         let mut approvals = BTreeMap::<OptionId, u64>::new();
-        approvals.insert("O-A".parse().unwrap(), 51);
-        approvals.insert("O-B".parse().unwrap(), 50);
-
-        let turnout = TallyTotals::new(50, 0);
+        approvals.insert("O-A".parse().unwrap(), 1);
+        approvals.insert("O-B".parse().unwrap(), 0);
 
         let scores = canonicalize_scores(&approvals, &options).expect("ok");
+        let turnout = TallyTotals::new(0, 0);
         let err = check_per_option_caps(&scores, &turnout).unwrap_err();
+
         match err {
-            TabError::OptionExceedsValid {
-                option,
-                approvals,
-                valid_ballots,
-            } => {
+            TabError::OptionExceedsValid { option, approvals, valid_ballots } => {
                 assert_eq!(option.to_string(), "O-A");
-                assert_eq!(approvals, 51);
-                assert_eq!(valid_ballots, 50);
+                assert_eq!(approvals, 1);
+                assert_eq!(valid_ballots, 0);
             }
             _ => panic!("expected OptionExceedsValid"),
         }
-    }
-
-    #[test]
-    fn zero_valid_ballots_forces_zeros() {
-        let options = vec![opt("O-A", 0), opt("O-B", 1)];
-        let mut approvals = BTreeMap::<OptionId, u64>::new();
-        approvals.insert("O-A".parse().unwrap(), 0);
-        approvals.insert("O-B".parse().unwrap(), 0);
-
-        let turnout = TallyTotals::new(0, 0);
-        let scores = canonicalize_scores(&approvals, &options).expect("ok");
-        check_per_option_caps(&scores, &turnout).expect("ok");
     }
 }

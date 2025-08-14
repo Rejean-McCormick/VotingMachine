@@ -6,23 +6,28 @@
 //!     * StatusQuo  → attempt SQ pick (if flagged upstream), otherwise fall back to DeterministicOrder.
 //!     * DeterministicOrder → smallest by canonical option order (order_index, then option_id).
 //!     * Random → uniform choice using provided `TieRng`; if no RNG is provided, fall back to DeterministicOrder.
+//!       (Consumes k draws for a k-way tie; winner is min by (draw, option_id).)
 //! - Output encodes WTA as 100 “power” for the winner.
 //!
 //! Notes:
 //! - `OptionItem` in vm_core intentionally has no `is_status_quo` flag; if none is known,
 //!   StatusQuo policy deterministically falls back to canonical order.
 
-use std::collections::{BTreeMap, BTreeSet};
+#![forbid(unsafe_code)]
+
+extern crate alloc;
+
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec::Vec;
 
 use vm_core::{
-    ids::OptionId,
     entities::OptionItem,
+    ids::OptionId,
     rng::TieRng,
     variables::TiePolicy,
 };
 
-use crate::Allocation;
-use crate::UnitScores;
+use crate::{Allocation, UnitScores};
 
 /// Errors for WTA allocation.
 #[derive(Debug)]
@@ -50,7 +55,7 @@ pub fn allocate_wta(
 
     // Defensive: ensure no unknown option IDs appear in the score map.
     // (Upstream cross-ref in vm_io.loader should already guarantee this.)
-    let allowed: BTreeSet<&OptionId> = options.iter().map(|o| &o.option_id).collect();
+    let allowed: BTreeSet<OptionId> = options.iter().map(|o| o.option_id.clone()).collect();
     for k in scores.scores.keys() {
         if !allowed.contains(k) {
             return Err(AllocError::UnknownOption(k.clone()));
@@ -67,12 +72,11 @@ pub fn allocate_wta(
         break_tie_wta(&tied, options, tie_policy, rng.as_deref_mut())
     };
 
-    // Encode WTA: winner gets 100 "power".
+    // Encode WTA: winner gets 100 "power" (always pick a winner, even if all scores are zero).
     let mut seats_or_power: BTreeMap<OptionId, u32> = BTreeMap::new();
-    if max_score > 0 || !tied.is_empty() {
+    if !tied.is_empty() || max_score == 0 {
         seats_or_power.insert(winner.clone(), 100);
     } else {
-        // All zero scores but we still must choose deterministically; grant winner 100.
         seats_or_power.insert(winner.clone(), 100);
     }
 
@@ -118,15 +122,22 @@ fn break_tie_wta(
         TiePolicy::DeterministicOrder => pick_deterministic(tied, options),
         TiePolicy::Random => {
             if let Some(rng) = rng {
-                // Build index lookups into `tied` by canonical order to keep behavior stable.
-                // Draw uniformly in [0, tied.len()) via rejection sampling.
-                let n = tied.len() as u64;
-                if n == 0 {
-                    // Should not happen; fall back deterministically.
-                    return pick_deterministic(tied, options);
+                // Consume exactly k draws for k-way tie; choose min by (draw, option_id)
+                // to ensure stable deterministic behavior on equal tickets.
+                let mut best: Option<(u64, &OptionId)> = None;
+                for oid in tied {
+                    // Draw from a wide range to minimize equal-ticket collisions.
+                    let ticket = rng.gen_range(u64::MAX);
+                    match best {
+                        None => best = Some((ticket, oid)),
+                        Some((b_ticket, b_oid)) => {
+                            if (ticket, oid) < (b_ticket, b_oid) {
+                                best = Some((ticket, oid));
+                            }
+                        }
+                    }
                 }
-                let idx = rng.gen_range(n).unwrap_or(0) as usize;
-                tied[idx].clone()
+                best.map(|(_, oid)| oid.clone()).unwrap_or_else(|| pick_deterministic(tied, options))
             } else {
                 // No RNG supplied → deterministic fallback.
                 pick_deterministic(tied, options)
@@ -138,7 +149,7 @@ fn break_tie_wta(
 /// Deterministic tie-break: choose the earliest by canonical option order `(order_index, option_id)`.
 fn pick_deterministic(tied: &[OptionId], options: &[OptionItem]) -> OptionId {
     // Walk options in canonical order; return the first that is in `tied`.
-    let tied_set: BTreeSet<&OptionId> = tied.iter().collect();
+    let tied_set: BTreeSet<OptionId> = tied.iter().cloned().collect();
     for opt in options {
         if tied_set.contains(&opt.option_id) {
             return opt.option_id.clone();

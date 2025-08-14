@@ -1,373 +1,492 @@
-//! Condorcet tabulation (deterministic, integers-only, no RNG).
+//! Ranked Condorcet — Schulze method (deterministic, integers-only).
 //!
-//! Contract (Doc 1 / Annex A aligned):
-//! - Inputs are compressed ballot groups: (ranking, multiplicity).
-//! - Options come in canonical order: (order_index, option_id).
-//! - If a Condorcet winner exists (strictly beats every other), select it.
-//! - Otherwise resolve cycles via a deterministic completion rule
-//!   (default Schulze; Minimax supported). No RNG here.
+//! Scope (per specs):
+//! - Build pairwise win counts between options for a unit (no RNG, no floats).
+//! - Compute strongest paths using Schulze (Floyd–Warshall style).
+//! - Do not depend on map iteration order; always use canonical option order:
+//!   (order_index, then OptionId) as provided by the `options` slice.
 //!
-//! Output:
-//! - `UnitScores.scores` are **winner-only** tallies (winner gets V, others 0) in
-//!   canonical key order to keep downstream deterministic and simple.
-//! - `Pairwise` matrix is emitted for audit; `CondorcetLog` records rule + winner.
+//! Out of scope (wired by callers/pipeline):
+//! - Reading ballots / constructing pairwise from ballots.
+//! - Frontier, labels, presentation.
+//!
+//! Determinism:
+//! - No network, no time; all loops iterate by index over the canonical
+//!   `options` order; lookups are explicit by (OptionId, OptionId).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+#![allow(clippy::needless_pass_by_value)]
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 use vm_core::{
-    entities::{OptionItem, TallyTotals},
-    ids::{OptionId, UnitId},
-    variables::Params,
+    entities::OptionItem,
+    ids::OptionId,
 };
 
-use crate::UnitScores;
-
-/// Pairwise audit matrix: wins[(A,B)] = number of ballots that prefer A over B.
-#[derive(Debug, Clone)]
-pub struct Pairwise {
-    pub wins: BTreeMap<(OptionId, OptionId), u64>,
+/// Errors specific to Condorcet/Schulze handling.
+#[derive(Debug)]
+pub enum CondorcetError {
+    /// Attempted to reference an option that is not present in the canonical list.
+    UnknownOption(OptionId),
+    /// Internal invariant was violated (e.g., self comparison).
+    Invariant(&'static str),
 }
 
-/// Completion rule used when no strict Condorcet winner exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionRule {
-    Schulze,
-    Minimax,
-}
-
-/// Log for Condorcet tabulation.
-#[derive(Debug, Clone)]
-pub struct CondorcetLog {
-    pub completion_rule: CompletionRule,
-    pub winner: OptionId,
-    pub pairwise_summary: Pairwise,
-}
-
-/// Deterministic Condorcet tabulation.
+/// Pairwise win matrix: wins[(A,B)] = number of ballots preferring A over B.
 ///
-/// Returns `(UnitScores /*winner-only*/, Pairwise, CondorcetLog)`.
-pub fn tabulate_ranked_condorcet(
-    unit_id: UnitId,
-    ballots: &[(Vec<OptionId>, u64)],
-    options: &[OptionItem],
-    turnout: TallyTotals,
-    params: &Params, // used to choose completion rule; default Schulze
-) -> (UnitScores, Pairwise, CondorcetLog) {
-    // Canonical option list & index map (tie-break order).
-    let order: Vec<OptionId> = options.iter().map(|o| o.option_id.clone()).collect();
-    let ord_idx: HashMap<&OptionId, usize> = order
-        .iter()
-        .enumerate()
-        .map(|(i, id)| (id, i))
-        .collect();
-
-    // Build the pairwise matrix.
-    let pairwise = build_pairwise(ballots, &order);
-
-    // Zero-valid case: deterministic fallback to first option by canonical order.
-    let v = turnout.valid_ballots;
-    let (winner, rule_used) = if v == 0 {
-        (
-            order
-                .get(0)
-                .cloned()
-                .unwrap_or_else(|| "UNKNOWN".parse().unwrap_or_else(|_| OptionId::from("UNKNOWN"))),
-            CompletionRule::Schulze,
-        )
-    } else if let Some(w) = condorcet_winner(&pairwise, &order) {
-        (w, CompletionRule::Schulze) // rule is moot when strict winner exists
-    } else {
-        // Resolve via completion rule.
-        let rule = completion_rule_from_params(params).unwrap_or(CompletionRule::Schulze);
-        let w = match rule {
-            CompletionRule::Schulze => schulze_winner(&pairwise, &order, &ord_idx),
-            CompletionRule::Minimax => minimax_winner(&pairwise, &order, &ord_idx),
-        };
-        (w, rule)
-    };
-
-    // Winner-only scores map: winner gets V, others 0, in canonical key order.
-    let scores_map = winner_scores(&winner, v, options);
-
-    let scores = UnitScores {
-        unit_id,
-        turnout,
-        scores: scores_map,
-    };
-    let log = CondorcetLog {
-        completion_rule: rule_used,
-        winner: winner.clone(),
-        pairwise_summary: pairwise.clone(),
-    };
-    (scores, pairwise, log)
+/// Notes:
+/// - Keys are **owned** `(OptionId, OptionId)` to avoid lifetime pitfalls and
+///   enable deterministic canonicalization downstream.
+/// - Self pairs (A,A) are present and fixed at 0; callers should treat them as 0.
+#[derive(Clone, Default, Debug)]
+pub struct Pairwise {
+    wins: BTreeMap<(OptionId, OptionId), u64>,
 }
 
-/// Compute the pairwise matrix from ranked ballots in canonical option set `order`.
-pub fn build_pairwise(ballots: &[(Vec<OptionId>, u64)], order: &[OptionId]) -> Pairwise {
-    let allowed: BTreeSet<OptionId> = order.iter().cloned().collect();
-    let mut wins: BTreeMap<(OptionId, OptionId), u64> = BTreeMap::new();
-
-    for (ranking, count) in ballots {
-        if *count == 0 {
-            continue;
-        }
-        // Filter to unique, allowed options in ballot order (ignore unknowns/dups).
-        let mut seen = HashSet::<&OptionId>::new();
-        let mut seq: Vec<&OptionId> = Vec::with_capacity(ranking.len());
-        for id in ranking {
-            if allowed.contains(id) && !seen.contains(id) {
-                seen.insert(id);
-                seq.push(id);
-            }
-        }
-        // For each ordered pair (i < j), increment wins[(A,B)] by count.
+impl Pairwise {
+    /// Initialize all pairs to 0 for the given canonical option list.
+    pub fn new(options: &[OptionItem]) -> Self {
+        let mut wins = BTreeMap::new();
+        // Canonical order comes from `options`; we materialize owned ids.
+        let seq: Vec<OptionId> = seq_ids(options);
         for i in 0..seq.len() {
-            for j in (i + 1)..seq.len() {
+            for j in 0..seq.len() {
                 let a = seq[i].clone();
                 let b = seq[j].clone();
-                *wins.entry((a.clone(), b.clone())).or_insert(0) += *count;
+                wins.insert((a, b), if i == j { 0 } else { 0 });
             }
+        }
+        Self { wins }
+    }
+
+    /// Increment wins for A over B by `delta` (A != B).
+    pub fn increment(&mut self, a: &OptionId, b: &OptionId, delta: u64) -> Result<(), CondorcetError> {
+        if a == b {
+            return Err(CondorcetError::Invariant("increment on (A,A) is forbidden"));
+        }
+        let key = (a.clone(), b.clone());
+        // Absent keys mean unknown options relative to initialization.
+        match self.wins.get_mut(&key) {
+            Some(slot) => {
+                *slot = slot.saturating_add(delta);
+                Ok(())
+            }
+            None => Err(CondorcetError::UnknownOption(a.clone())),
         }
     }
 
-    Pairwise { wins }
+    /// Read wins for A over B (returns 0 if the pair is absent).
+    #[inline]
+    pub fn get(&self, a: &OptionId, b: &OptionId) -> u64 {
+        self.wins.get(&(a.clone(), b.clone())).copied().unwrap_or(0)
+    }
+
+    /// Expose immutable map (e.g., to feed Schulze).
+    pub fn as_map(&self) -> &BTreeMap<(OptionId, OptionId), u64> {
+        &self.wins
+    }
 }
 
-/// Return a strict Condorcet winner if one exists.
-pub fn condorcet_winner(pw: &Pairwise, order: &[OptionId]) -> Option<OptionId> {
-    for x in order {
-        let mut beats_all = true;
-        for y in order {
-            if x == y {
-                continue;
-            }
-            let xy = get_win(pw, x, y);
-            let yx = get_win(pw, y, x);
-            if xy <= yx {
-                beats_all = false;
-                break;
-            }
-        }
-        if beats_all {
-            return Some(x.clone());
-        }
-    }
-    None
+/// Produce an owned, canonical sequence of OptionIds from `options`.
+/// Order is the on-wire canonical `(order_index, OptionId)` provided upstream.
+#[inline]
+pub fn seq_ids(options: &[OptionItem]) -> Vec<OptionId> {
+    options.iter().map(|o| o.option_id.clone()).collect()
 }
 
-/// Schulze method winner (with deterministic tie-break by canonical order).
-pub fn schulze_winner(
-    pw: &Pairwise,
-    order: &[OptionId],
-    ord_idx: &HashMap<&OptionId, usize>,
-) -> OptionId {
-    // d[i][j] = wins(i,j) if wins(i,j) > wins(j,i), else 0
-    let n = order.len();
-    let mut d = vec![vec![0u64; n]; n];
-    for (i, a) in order.iter().enumerate() {
-        for (j, b) in order.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            let ab = get_win(pw, a, b);
-            let ba = get_win(pw, b, a);
-            d[i][j] = if ab > ba { ab } else { 0 };
-        }
-    }
-    // p[i][j] = strength of strongest path from i to j
-    let mut p = d.clone();
+/// Compute the Schulze strongest paths matrix `P` from pairwise wins.
+///
+/// Definitions (standard Schulze):
+/// - Let `d[A,B] = wins(A,B)` be pairwise preferences.
+/// - Initialize:
+///     P[A,B] = d[A,B] if d[A,B] > d[B,A], else 0 (for A != B); P[A,A] = 0.
+/// - For each intermediate `K`, update:
+///     P[A,B] = max(P[A,B], min(P[A,K], P[K,B])) for all A != B and A != K and B != K.
+///
+/// Determinism:
+/// - Loops are strictly `for k in 0..n { for i in 0..n { for j in 0..n { ... }}}`,
+///   which is the canonical order for Floyd–Warshall style updates.
+/// - Indices are **not** transposed; we always update P[i][j] from (i,k) & (k,j).
+pub fn schulze_strongest_paths(
+    options: &[OptionItem],
+    wins: &BTreeMap<(OptionId, OptionId), u64>,
+) -> BTreeMap<(OptionId, OptionId), u64> {
+    let seq: Vec<OptionId> = seq_ids(options);
+    let n = seq.len();
+
+    // Helper closures to access d(A,B) and P(A,B).
+    let d = |a: &OptionId, b: &OptionId| -> u64 {
+        wins.get(&(a.clone(), b.clone())).copied().unwrap_or(0)
+    };
+
+    // Initialize P.
+    let mut p: BTreeMap<(OptionId, OptionId), u64> = BTreeMap::new();
     for i in 0..n {
         for j in 0..n {
-            if i == j {
-                continue;
-            }
-            for k in 0..n {
-                if i == k || j == k {
-                    continue;
-                }
-                let via = std::cmp::min(p[j][i], p[i][k]);
-                if p[j][k] < via {
-                    p[j][k] = via;
+            let a = &seq[i];
+            let b = &seq[j];
+            let val = if i == j {
+                0
+            } else {
+                let dab = d(a, b);
+                let dba = d(b, a);
+                if dab > dba { dab } else { 0 }
+            };
+            p.insert((a.clone(), b.clone()), val);
+        }
+    }
+
+    // Floyd–Warshall style update: k → i → j
+    for k in 0..n {
+        for i in 0..n {
+            if i == k { continue; }
+            for j in 0..n {
+                if j == i || j == k { continue; }
+
+                let a = &seq[i];
+                let b = &seq[j];
+                let c = &seq[k];
+
+                // p[a,b] = max(p[a,b], min(p[a,c], p[c,b]))
+                let pab = *p.get(&(a.clone(), b.clone())).unwrap_or(&0);
+                let pac = *p.get(&(a.clone(), c.clone())).unwrap_or(&0);
+                let pcb = *p.get(&(c.clone(), b.clone())).unwrap_or(&0);
+                let candidate = core::cmp::min(pac, pcb);
+                if candidate > pab {
+                    p.insert((a.clone(), b.clone()), candidate);
                 }
             }
         }
     }
-    // Candidate i is a winner if for all j != i, p[i][j] >= p[j][i].
-    // Collect all winners, then choose the earliest in canonical order.
-    let mut winners: Vec<usize> = Vec::new();
-    'outer: for i in 0..n {
-        for j in 0..n {
-            if i != j && p[i][j] < p[j][i] {
-                continue 'outer;
-            }
-        }
-        winners.push(i);
-    }
-    // Deterministic tie-break: pick the one with smallest canonical order index.
-    let best = winners
-        .into_iter()
-        .min_by_key(|&i| ord_idx.get(&order[i]).copied().unwrap_or(usize::MAX))
-        .unwrap_or(0);
-    order[best].clone()
+
+    p
+}
+/// Result of Condorcet/Schulze tabulation for a single unit.
+#[derive(Clone, Debug)]
+pub struct CondorcetResult {
+    /// Schulze strongest paths P[(A,B)].
+    pub strongest_paths: BTreeMap<(OptionId, OptionId), u64>,
+    /// Deterministic total order of options (best → worst).
+    /// Ties (P[A,B] == P[B,A]) are resolved by canonical option order.
+    pub order: Vec<OptionId>,
+    /// All Condorcet winners (may be 0, 1, or >1 in case of cycles).
+    /// Preserves canonical option order among winners.
+    pub winners: Vec<OptionId>,
 }
 
-/// Minimax (aka Simpson/Smith) winner: pick candidate minimizing its maximum defeat.
-/// Tie-break deterministically by canonical order.
-pub fn minimax_winner(
-    pw: &Pairwise,
-    order: &[OptionId],
-    ord_idx: &HashMap<&OptionId, usize>,
-) -> OptionId {
-    let n = order.len();
-    // For each i, compute max defeat margin: max over j of max( wins(j,i) - wins(i,j), 0 )
-    let mut max_defeat: Vec<(u64, usize)> = Vec::with_capacity(n);
-    for (i, a) in order.iter().enumerate() {
-        let mut worst: u64 = 0;
-        for (j, b) in order.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            let ai = get_win(pw, a, b);
-            let ia = get_win(pw, b, a);
-            if ia > ai {
-                let margin = ia - ai;
-                if margin > worst {
-                    worst = margin;
-                }
-            }
-        }
-        let oi = ord_idx.get(a).copied().unwrap_or(usize::MAX);
-        max_defeat.push((worst, oi));
-    }
-    // Choose minimal (max_defeat, order_index)
-    let mut best_i = 0usize;
-    let mut best_key = (u64::MAX, usize::MAX);
-    for (i, key) in max_defeat.into_iter().enumerate() {
-        if key < best_key {
-            best_key = key;
-            best_i = i;
-        }
-    }
-    order[best_i].clone()
-}
-
-/// Winner-only scores: `{winner: V, others: 0}` in canonical key order.
-pub fn winner_scores(
-    winner: &OptionId,
-    valid_ballots: u64,
+/// Compute deterministic Schulze ranking from `strongest_paths`.
+/// Sort key: for A vs B, prefer larger P[A,B]; ties fall back to canonical order.
+pub fn schulze_order(
     options: &[OptionItem],
-) -> BTreeMap<OptionId, u64> {
-    let mut out = BTreeMap::<OptionId, u64>::new();
-    for opt in options {
-        let v = if &opt.option_id == winner {
-            valid_ballots
-        } else {
-            0
-        };
-        out.insert(opt.option_id.clone(), v);
+    strongest_paths: &BTreeMap<(OptionId, OptionId), u64>,
+) -> Vec<OptionId> {
+    let seq = seq_ids(options);
+
+    // Precompute canonical index for stable, deterministic tiebreaks.
+    let mut idx = BTreeMap::<OptionId, usize>::new();
+    for (i, id) in seq.iter().cloned().enumerate() {
+        idx.insert(id, i);
     }
+
+    let mut out = seq.clone();
+    out.sort_by(|a, b| {
+        use core::cmp::Ordering;
+
+        let ab = *strongest_paths
+            .get(&(a.clone(), b.clone()))
+            .unwrap_or(&0);
+        let ba = *strongest_paths
+            .get(&(b.clone(), a.clone()))
+            .unwrap_or(&0);
+
+        match ab.cmp(&ba).reverse() {
+            // Reverse so that larger ab ranks "earlier" (descending).
+            Ordering::Equal => {
+                // Canonical order fallback (by original options order).
+                let ia = *idx.get(a).expect("idx");
+                let ib = *idx.get(b).expect("idx");
+                ia.cmp(&ib)
+            }
+            non_eq => non_eq,
+        }
+    });
+
     out
 }
 
-/// Helper: get wins(A,B) from the matrix (0 if absent).
-#[inline]
-fn get_win(pw: &Pairwise, a: &OptionId, b: &OptionId) -> u64 {
-    *pw.wins.get(&(a.clone(), b.clone())).unwrap_or(&0)
+/// Return the (possibly multiple) Condorcet winners under Schulze:
+/// A is a winner if for every B != A, P[A,B] >= P[B,A].
+pub fn condorcet_winners(
+    options: &[OptionItem],
+    strongest_paths: &BTreeMap<(OptionId, OptionId), u64>,
+) -> Vec<OptionId> {
+    let seq = seq_ids(options);
+    let n = seq.len();
+    let mut winners = alloc::vec::Vec::new();
+
+    'outer: for i in 0..n {
+        let a = &seq[i];
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let b = &seq[j];
+            let pab = *strongest_paths
+                .get(&(a.clone(), b.clone()))
+                .unwrap_or(&0);
+            let pba = *strongest_paths
+                .get(&(b.clone(), a.clone()))
+                .unwrap_or(&0);
+            if pab < pba {
+                // A does not beat/tie B.
+                continue 'outer;
+            }
+        }
+        winners.push(a.clone());
+    }
+
+    winners
 }
 
-/// Read a completion rule from params; returns `None` if not specified/recognized.
-fn completion_rule_from_params(_params: &Params) -> Option<CompletionRule> {
-    // The reference spec keeps this per-release; we default to Schulze.
-    // If you later name a param (e.g., v005_aggregation_mode == "minimax"),
-    // wire it here (lowercase match).
-    None
+/// End-to-end Condorcet/Schulze tabulation from a prepared pairwise matrix.
+/// Deterministic; no RNG; ties resolved by canonical option order.
+///
+/// Callers are responsible for constructing `pairwise` from ballots in a way
+/// that respects canonical option order and validation rules upstream.
+pub fn tabulate_ranked_condorcet(
+    options: &[OptionItem],
+    pairwise: &Pairwise,
+) -> CondorcetResult {
+    let p = schulze_strongest_paths(options, pairwise.as_map());
+    let order = schulze_order(options, &p);
+    let winners = condorcet_winners(options, &p);
+
+    CondorcetResult {
+        strongest_paths: p,
+        order,
+        winners,
+    }
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_schulze {
     use super::*;
-    use vm_core::entities::OptionItem;
+    use alloc::vec;
 
     fn opt(id: &str, idx: u16) -> OptionItem {
         OptionItem::new(
             id.parse().expect("opt id"),
-            format!("Name {id}"),
+            "name".to_string(),
             idx,
         )
         .expect("option")
     }
 
     #[test]
-    fn strict_condorcet_exists() {
-        // A beats B and C; B beats C.
-        let options = vec![opt("A", 0), opt("B", 1), opt("C", 2)];
-        let ballots = vec![
-            (vec!["A".parse().unwrap(), "B".parse().unwrap(), "C".parse().unwrap()], 40),
-            (vec!["A".parse().unwrap(), "C".parse().unwrap(), "B".parse().unwrap()], 15),
-            (vec!["B".parse().unwrap(), "C".parse().unwrap(), "A".parse().unwrap()], 30),
-            (vec!["C".parse().unwrap(), "B".parse().unwrap(), "A".parse().unwrap()], 15),
-        ];
-        let turnout = TallyTotals::new(100, 0);
-        let params = Params::default();
+    fn schulze_trivial_singleton() {
+        let options = vec![opt("O-A", 0)];
+        let p = BTreeMap::new();
+        let order = schulze_order(&options, &p);
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0].to_string(), "O-A");
 
-        let (scores, _pw, log) = tabulate_ranked_condorcet(
-            "U-1".parse().unwrap(),
-            &ballots,
-            &options,
-            turnout,
-            &params,
-        );
-
-        assert_eq!(log.winner.to_string(), "A");
-        assert_eq!(*scores.scores.get(&"A".parse().unwrap()).unwrap(), 100);
-        assert_eq!(*scores.scores.get(&"B".parse().unwrap()).unwrap(), 0);
-        assert_eq!(*scores.scores.get(&"C".parse().unwrap()).unwrap(), 0);
+        let winners = condorcet_winners(&options, &p);
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].to_string(), "O-A");
     }
 
     #[test]
-    fn cycle_resolved_by_schulze_deterministically() {
-        // Rock-Paper-Scissors style cycle:
-        // A > B, B > C, C > A with equal margins; Schulze tie-break by canonical order.
-        let options = vec![opt("A", 0), opt("B", 1), opt("C", 2)];
-        let ballots = vec![
-            (vec!["A".parse().unwrap(), "B".parse().unwrap(), "C".parse().unwrap()], 34),
-            (vec!["B".parse().unwrap(), "C".parse().unwrap(), "A".parse().unwrap()], 33),
-            (vec!["C".parse().unwrap(), "A".parse().unwrap(), "B".parse().unwrap()], 33),
-        ];
-        let turnout = TallyTotals::new(100, 0);
-        let params = Params::default();
+    fn schulze_deterministic_tie_uses_canonical_order() {
+        let options = vec![opt("O-A", 0), opt("O-B", 1)];
+        let mut p: BTreeMap<(OptionId, OptionId), u64> = BTreeMap::new();
+        // Tie: P[A,B] == P[B,A]
+        p.insert(("O-A".parse().unwrap(), "O-B".parse().unwrap()), 3);
+        p.insert(("O-B".parse().unwrap(), "O-A".parse().unwrap()), 3);
 
-        let (_scores, _pw, log) = tabulate_ranked_condorcet(
-            "U-1".parse().unwrap(),
-            &ballots,
-            &options,
-            turnout,
-            &params,
+        let order = schulze_order(&options, &p);
+        assert_eq!(
+            order.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            alloc::vec!["O-A".to_string(), "O-B".to_string()]
         );
 
-        // With symmetric strengths, Schulze winners can tie; we pick the earliest by canonical order.
-        assert_eq!(log.winner.to_string(), "A");
-        assert!(matches!(log.completion_rule, CompletionRule::Schulze));
+        let winners = condorcet_winners(&options, &p);
+        // Both are winners under ≥ rule.
+        assert_eq!(winners.len(), 2);
+        assert_eq!(
+            winners.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            alloc::vec!["O-A".to_string(), "O-B".to_string()]
+        );
     }
 
     #[test]
-    fn zero_valid_ballots_fallback() {
-        let options = vec![opt("A", 0), opt("B", 1)];
-        let ballots: Vec<(Vec<OptionId>, u64)> = vec![];
-        let turnout = TallyTotals::new(0, 0);
-        let params = Params::default();
+    fn end_to_end_tabulate_ranked_condorcet() {
+        let options = vec![opt("O-A", 0), opt("O-B", 1), opt("O-C", 2)];
+        let mut pw = Pairwise::new(&options);
+        // Simple majority cycle A>B, B>C, C>A (classic rock-paper-scissors).
+        pw.increment(&"O-A".parse().unwrap(), &"O-B".parse().unwrap(), 6).unwrap();
+        pw.increment(&"O-B".parse().unwrap(), &"O-A".parse().unwrap(), 4).unwrap();
 
-        let (scores, _pw, log) = tabulate_ranked_condorcet(
-            "U-1".parse().unwrap(),
-            &ballots,
-            &options,
-            turnout,
-            &params,
+        pw.increment(&"O-B".parse().unwrap(), &"O-C".parse().unwrap(), 6).unwrap();
+        pw.increment(&"O-C".parse().unwrap(), &"O-B".parse().unwrap(), 4).unwrap();
+
+        pw.increment(&"O-C".parse().unwrap(), &"O-A".parse().unwrap(), 6).unwrap();
+        pw.increment(&"O-A".parse().unwrap(), &"O-C".parse().unwrap(), 4).unwrap();
+
+        let result = tabulate_ranked_condorcet(&options, &pw);
+
+        // There is a cycle, so winners will be all three (each ties/beats the others via P).
+        assert_eq!(result.winners.len(), 3);
+        // Order is deterministic by canonical order when pairwise strengths are symmetric.
+        assert_eq!(
+            result.order.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            alloc::vec!["O-A".to_string(), "O-B".to_string(), "O-C".to_string()]
         );
 
-        assert_eq!(log.winner.to_string(), "A");
-        for opt in &options {
-            assert_eq!(*scores.scores.get(&opt.option_id).unwrap(), 0);
+        // Strongest paths matrix is populated.
+        assert!(!result.strongest_paths.is_empty());
+    }
+}
+/// Validate that a `Pairwise` matrix is complete for the given `options`.
+/// Requirements:
+/// - Every (A,B) pair exists (owned OptionIds), including the diagonal.
+/// - Diagonal entries (A,A) are exactly 0.
+/// - No extraneous keys exist (i.e., all keys reference only `options`).
+pub fn validate_pairwise_complete(
+    options: &[OptionItem],
+    pairwise: &Pairwise,
+) -> Result<(), CondorcetError> {
+    let seq = seq_ids(options);
+    let set: alloc::collections::BTreeSet<OptionId> = seq.iter().cloned().collect();
+
+    // Check presence and diagonal zeros.
+    for a in &seq {
+        for b in &seq {
+            let key = (a.clone(), b.clone());
+            let v = pairwise.as_map().get(&key).copied().unwrap_or(u64::MAX);
+            if a == b {
+                if v != 0 {
+                    return Err(CondorcetError::Invariant("pairwise diagonal must be 0"));
+                }
+            } else if v == u64::MAX {
+                return Err(CondorcetError::Invariant("pairwise missing (A,B) entry"));
+            }
+        }
+    }
+
+    // Check there are no extraneous keys.
+    for (k, _) in pairwise.as_map().iter() {
+        if !set.contains(&k.0) || !set.contains(&k.1) {
+            return Err(CondorcetError::UnknownOption(
+                if !set.contains(&k.0) { k.0.clone() } else { k.1.clone() },
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Enumerate all ordered pairs (A,B) in **canonical** option order,
+/// including the diagonal (A,A). Useful for deterministic iteration.
+pub fn canonical_pairs(options: &[OptionItem]) -> alloc::vec::Vec<(OptionId, OptionId)> {
+    let seq = seq_ids(options);
+    let mut out = alloc::vec::Vec::with_capacity(seq.len() * seq.len());
+    for a in &seq {
+        for b in &seq {
+            out.push((a.clone(), b.clone()));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests_pairwise {
+    use super::*;
+    use alloc::vec;
+
+    fn opt(id: &str, idx: u16) -> OptionItem {
+        OptionItem::new(
+            id.parse().expect("opt id"),
+            "name".to_string(),
+            idx,
+        )
+        .expect("option")
+    }
+
+    #[test]
+    fn pairwise_new_is_complete_and_zero_diag() {
+        let options = vec![opt("O-A", 0), opt("O-B", 1), opt("O-C", 2)];
+        let pw = Pairwise::new(&options);
+        validate_pairwise_complete(&options, &pw).expect("complete");
+    }
+
+    #[test]
+    fn increment_rejects_diagonal_and_unknown() {
+        let options = vec![opt("O-A", 0), opt("O-B", 1)];
+        let mut pw = Pairwise::new(&options);
+
+        // Diagonal increment forbidden.
+        let err = pw.increment(&"O-A".parse().unwrap(), &"O-A".parse().unwrap(), 1).unwrap_err();
+        match err {
+            CondorcetError::Invariant(msg) => assert!(msg.contains("forbidden")),
+            _ => panic!("expected Invariant error"),
+        }
+
+        // Unknown option rejected.
+        let err = pw.increment(&"O-X".parse().unwrap(), &"O-B".parse().unwrap(), 1).unwrap_err();
+        match err {
+            CondorcetError::UnknownOption(id) => assert_eq!(id.to_string(), "O-X"),
+            _ => panic!("expected UnknownOption"),
+        }
+    }
+
+    #[test]
+    fn canonical_pairs_enumerates_in_canonical_order() {
+        let options = vec![opt("O-A", 0), opt("O-B", 1)];
+        let pairs = canonical_pairs(&options);
+        let as_strings: alloc::vec::Vec<(String, String)> = pairs
+            .into_iter()
+            .map(|(a,b)| (a.to_string(), b.to_string()))
+            .collect();
+        assert_eq!(
+            as_strings,
+            alloc::vec![
+                ("O-A".to_string(), "O-A".to_string()),
+                ("O-A".to_string(), "O-B".to_string()),
+                ("O-B".to_string(), "O-A".to_string()),
+                ("O-B".to_string(), "O-B".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_detects_missing_and_extraneous_keys() {
+        let options = vec![opt("O-A", 0), opt("O-B", 1)];
+        let mut pw = Pairwise::new(&options);
+
+        // Corrupt: remove one key.
+        let key = ("O-A".parse().unwrap(), "O-B".parse().unwrap());
+        assert!(pw.as_map().contains_key(&key));
+        // Unsafe: we need a mutable access; reconstruct a broken map for the test.
+        let mut broken = Pairwise { wins: pw.as_map().clone() };
+        broken.wins.remove(&key);
+
+        let err = validate_pairwise_complete(&options, &broken).unwrap_err();
+        match err {
+            CondorcetError::Invariant(msg) => assert!(msg.contains("missing")),
+            _ => panic!("expected Invariant(missing)"),
+        }
+
+        // Corrupt: introduce extraneous key.
+        let mut broken2 = Pairwise::new(&options);
+        broken2.wins.insert(
+            ("O-X".parse().unwrap(), "O-A".parse().unwrap()),
+            1,
+        );
+        let err = validate_pairwise_complete(&options, &broken2).unwrap_err();
+        match err {
+            CondorcetError::UnknownOption(id) => assert_eq!(id.to_string(), "O-X"),
+            _ => panic!("expected UnknownOption"),
         }
     }
 }

@@ -11,11 +11,16 @@
 //! - Iteration/scans run in canonical option order (the `options` slice).
 //! - Random ties depend *only* on the provided `TieRng` stream.
 
-use std::collections::{BTreeMap, BTreeSet};
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 use vm_core::{
-    ids::OptionId,
     entities::OptionItem,
+    ids::OptionId,
     rng::TieRng,
     variables::TiePolicy,
 };
@@ -37,7 +42,7 @@ pub enum AllocError {
 pub fn allocate_dhondt(
     seats: u32,
     scores: &BTreeMap<OptionId, u64>,
-    options: &[OptionItem],      // canonical (order_index, id)
+    options: &[OptionItem], // canonical (order_index, id)
     threshold_pct: u8,
     tie_policy: TiePolicy,
     mut rng: Option<&mut TieRng>,
@@ -49,18 +54,30 @@ pub fn allocate_dhondt(
         return Err(AllocError::MissingRngForRandomPolicy);
     }
 
+    // 1) Threshold on natural totals.
     let eligible_scores = filter_by_threshold(scores, threshold_pct);
-    if eligible_scores.is_empty() {
+
+    // 2) Establish eligible IDs in *canonical option order*.
+    let mut eligible_order: Vec<OptionId> = Vec::new();
+    for o in options {
+        if eligible_scores.contains_key(&o.option_id) {
+            eligible_order.push(o.option_id.clone());
+        }
+    }
+
+    if eligible_order.is_empty() {
+        // No eligible options appear in canonical list → cannot allocate.
         return Err(AllocError::NoEligibleOptions);
     }
 
-    // Initialize seat vector for eligible options only.
+    // 3) Initialize seat vector for eligible options only (preserve determinism).
     let mut alloc: BTreeMap<OptionId, u32> =
-        eligible_scores.keys().cloned().map(|id| (id, 0)).collect();
+        eligible_order.iter().cloned().map(|id| (id, 0)).collect();
 
+    // 4) Sequentially award seats using D’Hondt quotients.
     for _round in 0..seats {
-        let winner = next_award(&alloc, &eligible_scores, options, tie_policy, rng.as_deref_mut());
-        // Safe: by construction, winner is eligible.
+        let winner =
+            next_award(&alloc, &eligible_scores, &eligible_order, tie_policy, rng.as_deref_mut());
         *alloc.get_mut(&winner).expect("winner must be in alloc") += 1;
     }
 
@@ -74,7 +91,7 @@ fn filter_by_threshold(
     threshold_pct: u8,
 ) -> BTreeMap<OptionId, u64> {
     let total: u128 = scores.values().map(|&v| v as u128).sum();
-    // Fast path: threshold 0 keeps all.
+    // Fast path: threshold 0 keeps all known keys (missing keys treated as 0 and excluded).
     if threshold_pct == 0 {
         return scores.clone();
     }
@@ -83,7 +100,7 @@ fn filter_by_threshold(
         .iter()
         .filter_map(|(k, &v)| {
             let v128 = v as u128;
-            // Keep if share >= threshold.
+            // Keep if share >= threshold (cross-multiplied; integer math only).
             if v128.saturating_mul(100) >= t.saturating_mul(total) {
                 Some((k.clone(), v))
             } else {
@@ -94,64 +111,70 @@ fn filter_by_threshold(
 }
 
 /// Choose argmax of v/(s+1) across eligible; ties resolved per policy.
+/// `eligible_order` MUST be in canonical option order.
 fn next_award(
     seats_so_far: &BTreeMap<OptionId, u32>,
     eligible_scores: &BTreeMap<OptionId, u64>,
-    options: &[OptionItem],
+    eligible_order: &[OptionId],
     tie_policy: TiePolicy,
     rng: Option<&mut TieRng>,
 ) -> OptionId {
-    // Track the current best quotient and tied IDs in canonical order.
+    // Track the current best quotient and IDs (encounter order == canonical order).
     let mut best_ids: Vec<OptionId> = Vec::new();
     let mut best_v: u64 = 0;
     let mut best_s: u32 = 0;
     let mut have_best = false;
 
-    for opt in options {
-        if let Some(&v) = eligible_scores.get(&opt.option_id) {
-            let s = *seats_so_far.get(&opt.option_id).unwrap_or(&0);
-            if !have_best {
-                have_best = true;
-                best_v = v;
-                best_s = s;
-                best_ids.clear();
-                best_ids.push(opt.option_id.clone());
-            } else {
-                match cmp_quotients(v, s, best_v, best_s) {
-                    core::cmp::Ordering::Greater => {
-                        best_v = v;
-                        best_s = s;
-                        best_ids.clear();
-                        best_ids.push(opt.option_id.clone());
-                    }
-                    core::cmp::Ordering::Equal => {
-                        best_ids.push(opt.option_id.clone());
-                    }
-                    core::cmp::Ordering::Less => {} // keep current best
+    for id in eligible_order {
+        let v = *eligible_scores
+            .get(id)
+            .expect("eligible_order implies presence in eligible_scores");
+        let s = *seats_so_far.get(id).unwrap_or(&0);
+
+        if !have_best {
+            have_best = true;
+            best_v = v;
+            best_s = s;
+            best_ids.clear();
+            best_ids.push(id.clone());
+        } else {
+            match cmp_quotients(v, s, best_v, best_s) {
+                core::cmp::Ordering::Greater => {
+                    best_v = v;
+                    best_s = s;
+                    best_ids.clear();
+                    best_ids.push(id.clone());
+                }
+                core::cmp::Ordering::Equal => {
+                    best_ids.push(id.clone());
+                }
+                core::cmp::Ordering::Less => {
+                    // keep current best
                 }
             }
         }
     }
 
-    if best_ids.len() <= 1 {
-        return best_ids
-            .into_iter()
-            .next()
-            // Defensive fallback: if no eligible options were seen (shouldn't happen), pick earliest by options.
-            .unwrap_or_else(|| options.first().map(|o| o.option_id.clone()).unwrap_or_else(|| OptionId::from("UNKNOWN")));
+    debug_assert!(
+        !best_ids.is_empty(),
+        "eligible_order must contain at least one candidate"
+    );
+
+    if best_ids.len() == 1 {
+        return best_ids[0].clone();
     }
 
     // Resolve tie per policy.
     match tie_policy {
-        TiePolicy::StatusQuo => status_quo_pick(&best_ids, options),
-        TiePolicy::DeterministicOrder => deterministic_pick(&best_ids, options),
+        TiePolicy::StatusQuo | TiePolicy::DeterministicOrder => {
+            // First in canonical order (best_ids is built in canonical order).
+            best_ids[0].clone()
+        }
         TiePolicy::Random => {
-            // rng presence was enforced at entry when seats > 0.
-            let n = best_ids.len() as u64;
+            let n = best_ids.len() as u64; // n >= 2 here
             let idx = rng
                 .expect("rng must be provided for Random policy")
-                .gen_range(n)
-                .unwrap_or(0) as usize;
+                .gen_range(n) as usize; // uniform in [0, n)
             best_ids[idx].clone()
         }
     }
@@ -166,21 +189,4 @@ fn cmp_quotients(v_a: u64, s_a: u32, v_b: u64, s_b: u32) -> core::cmp::Ordering 
     let lhs = (v_a as u128) * db;
     let rhs = (v_b as u128) * da;
     lhs.cmp(&rhs)
-}
-
-/// Deterministic tie-break: pick earliest in canonical option order.
-fn deterministic_pick(tied: &[OptionId], options: &[OptionItem]) -> OptionId {
-    let set: BTreeSet<&OptionId> = tied.iter().collect();
-    for o in options {
-        if set.contains(&o.option_id) {
-            return o.option_id.clone();
-        }
-    }
-    // Fallback: lexicographic min (should not be needed).
-    tied.iter().min().cloned().unwrap_or_else(|| OptionId::from("UNKNOWN"))
-}
-
-/// Status-quo resolver: since `OptionItem` has no SQ flag in vm_core, fall back to deterministic.
-fn status_quo_pick(tied: &[OptionId], options: &[OptionItem]) -> OptionId {
-    deterministic_pick(tied, options)
 }
