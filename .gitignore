@@ -1,0 +1,62 @@
+# 05 - .gitignore — VM-ENGINE v0
+# Ignore build artifacts, caches, UI outputs, and local IDE/OS noise.
+# Keep all normative inputs (schemas, fixtures, vendor) tracked.
+
+# --- Rust / Cargo ---
+/target/
+**/target/
+**/*.rs.bk
+
+# Coverage / profiling (if used)
+*.profraw
+*.gcda
+*.gcno
+*.lcov
+
+# --- Workspace artifacts (transient) ---
+/artifacts/
+/dist/
+/tmp/
+/.cache/
+
+# --- Tauri (Rust side) ---
+# (Covered by **/target/, kept for clarity)
+crates/vm_app/src-tauri/target/
+crates/vm_app/src-tauri/.tauri-build
+crates/vm_app/src-tauri/.cargo-lock-backup
+
+# --- Frontend (Vite/Node) ---
+crates/vm_app/ui/node_modules/
+crates/vm_app/ui/.vite/
+crates/vm_app/ui/dist/
+crates/vm_app/ui/npm-debug.log*
+crates/vm_app/ui/yarn-error.log*
+# Lockfiles are tracked for reproducibility; do NOT ignore:
+!crates/vm_app/ui/pnpm-lock.yaml
+!crates/vm_app/ui/yarn.lock
+!crates/vm_app/ui/package-lock.json
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
+*.tmp
+*.bak
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# --- Test run byproducts (safety) ---
+**/*.assert.out
+**/*.assert.err
+
+# --- DO NOT IGNORE (documentation note) ---
+# Keep these versioned as canonical inputs:
+#   vendor/            (offline builds)
+#   schemas/           (normative JSON Schemas)
+#   fixtures/          (Annex B test data)
+#   crates/vm_app/ui/public/map/tiles/*.mbtiles (bundled tiles)
+# No patterns needed here since nothing above excludes them.

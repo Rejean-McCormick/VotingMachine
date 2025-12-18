@@ -1,0 +1,56 @@
+# 06 - .gitattributes — VM-ENGINE v0
+# Enforce LF line endings for canonical text; never normalize binaries.
+# Ensures byte-identical hashes for JSON/schemas/results across OS.
+
+# --- Canonical text (force LF) ---
+*.rs           text eol=lf
+*.toml         text eol=lf
+*.md           text eol=lf
+*.json         text eol=lf
+*.yml          text eol=lf
+*.yaml         text eol=lf
+*.txt          text eol=lf
+*.html         text eol=lf
+*.css          text eol=lf
+*.ts           text eol=lf
+*.tsx          text eol=lf
+*.js           text eol=lf
+*.csv          text eol=lf
+Makefile       text eol=lf
+*.sh           text eol=lf
+
+# Ensure schemas/fixtures/results are always LF (hash stability)
+schemas/**                 text eol=lf
+fixtures/**                text eol=lf
+artifacts/**/*.json        text eol=lf
+
+# --- Binary assets (never normalize or diff) ---
+*.png          binary
+*.jpg          binary
+*.jpeg         binary
+*.webp         binary
+*.ico          binary
+*.gif          binary
+*.pdf          binary
+*.zip          binary
+*.tar          binary
+*.tar.gz       binary
+*.tgz          binary
+*.wasm         binary
+*.mbtiles      binary   # map tiles DB
+*.ttf          binary
+*.otf          binary
+*.woff         binary
+*.woff2        binary
+
+# --- Lockfiles & vendor blobs ---
+Cargo.lock                              text eol=lf
+crates/vm_app/ui/package-lock.json      text eol=lf
+crates/vm_app/ui/pnpm-lock.yaml         text eol=lf
+crates/vm_app/ui/yarn.lock              text eol=lf
+
+# Keep exact upstream bytes in vendor/ (no normalization)
+vendor/**      -text
+
+# --- Optional: nicer diffs (enable if you configure diff drivers) ---
+# *.json diff=json

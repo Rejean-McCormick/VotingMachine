@@ -1,0 +1,1000 @@
+# bundle: data_tests
+
+--------------------------------------------------------------------------------
+FILE: tests/vm_tst_core.rs
+--------------------------------------------------------------------------------
+//! VM-ENGINE v0 — Core pipeline tests (skeleton)
+//!
+//! This file wires the **test intentions and signatures** for baseline behaviors
+//! across tabulation, allocation, gate denominators, and pipeline stop rules,
+//! aligned with Docs 4–7 and Annex-B Part-0 fixtures.
+//!
+//! Notes:
+//! - These tests are provided as an integration **skeleton**. They are marked
+//!   `#[ignore]` to avoid failing CI until the full engine wiring and fixtures
+//!   are present in the workspace.
+//! - Replace the `unimplemented!()` / `todo!()` calls with real orchestration
+//!   once `vm_pipeline`/`vm_io` are available and the Annex-B fixtures (69–73)
+//!   are checked into the repo at `fixtures/annex_b/part_0/`.
+
+use std::collections::BTreeMap;
+
+// --- Intentional imports (kept behind allow to avoid warnings until wired) ---
+#[allow(unused_imports)]
+use vm_core::ids::{OptionId, UnitId};
+#[allow(unused_imports)]
+use vm_core::variables::Params;
+#[allow(unused_imports)]
+use vm_core::rounding::ge_percent;
+#[allow(unused_imports)]
+use vm_pipeline::{
+    // Public API per component 49
+    run_from_manifest_path,
+    PipelineOutputs,
+};
+#[allow(unused_imports)]
+use vm_report as _; // report crate is not used directly here
+
+// -------- Test harness types (minimal mirror of intentions) --------
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum TestMode {
+    /// Drive via manifest: fixtures/annex_b/part_0/manifest.json
+    Manifest,
+    /// Drive via explicit paths (registry/params/tally)
+    Explicit,
+}
+
+#[derive(Clone, Debug)]
+struct TestArtifacts {
+    // Keep this lean; real engine types can be added as needed.
+    pub outputs: PipelineOutputs,
+}
+
+// Snapshots used by asserts (kept simple and engine-agnostic)
+#[derive(Clone, Debug)]
+struct GateSnapshot {
+    pub quorum_pass: bool,
+    pub majority_present: bool,
+    pub majority_pass: bool,
+    pub majority_threshold_pct: u8,
+    pub majority_num: u64,
+    pub majority_den: u64,
+}
+
+#[allow(dead_code)]
+fn run_with_part0_fixtures(_mode: TestMode) -> TestArtifacts {
+    // Resolve manifest path relative to workspace root
+    let _man_path = std::path::Path::new("fixtures/annex_b/part_0/manifest.json");
+
+    // When the pipeline is available, uncomment:
+    // let outputs = run_from_manifest_path(_man_path)
+    //     .expect("pipeline run from manifest should succeed for Part-0");
+    // TestArtifacts { outputs }
+
+    unimplemented!("Wire vm_pipeline::run_from_manifest_path and Part-0 fixtures");
+}
+
+#[allow(dead_code)]
+fn seats_of(_alloc: &BTreeMap<OptionId, u32>) -> Vec<(OptionId, u32)> {
+    // In the real engine, UnitAllocation exposes seats (PR) or power=100 (WTA).
+    // This helper converts the internal map into a stable (OptionId, seats) vec.
+    unimplemented!("Extract seats per option in stable order");
+}
+
+#[allow(dead_code)]
+fn power_of(_alloc: &BTreeMap<OptionId, u32>) -> Vec<(OptionId, u32)> {
+    // For WTA, return { winner → 100 }.
+    unimplemented!("Extract WTA 100% power vector");
+}
+
+#[allow(dead_code)]
+fn gate_values(_legit: &/* vm_pipeline::LegitimacyReport */ ()) -> GateSnapshot {
+    // Pull raw numerators/denominators and pass flags from LegitimacyReport.
+    // Majority must use approval_rate = approvals_for_change / valid_ballots.
+    unimplemented!("Map LegitimacyReport → GateSnapshot");
+}
+
+#[allow(dead_code)]
+fn label_of(_res: &/* vm_pipeline::ResultDoc */ ()) -> /* vm_pipeline::DecisivenessLabel */ () {
+    unimplemented!("Extract decisiveness label from Result");
+}
+
+#[allow(dead_code)]
+fn assert_sum_seats(seats: &[(OptionId, u32)], m: u32) {
+    let sum: u32 = seats.iter().map(|(_, s)| *s).sum();
+    assert_eq!(
+        sum, m,
+        "Σ seats must equal magnitude (expected {m}, got {sum})"
+    );
+}
+
+#[allow(dead_code)]
+fn assert_wta_power_100(power: &[(OptionId, u32)]) {
+    let sum: u32 = power.iter().map(|(_, p)| *p).sum();
+    assert_eq!(sum, 100, "WTA must sum to 100% power (got {sum})");
+}
+
+#[allow(dead_code)]
+fn assert_ge_majority(value_pp1: i32, threshold: i32) {
+    // value in tenths of a percent points vs integer threshold (pp)
+    assert!(
+        value_pp1 >= threshold * 10,
+        "majority must use ≥ comparison: value {value_pp1}/10 < {threshold}"
+    );
+}
+
+// --------------------- Core tests (ignored until wired) ----------------------
+
+#[test]
+#[ignore = "Enable once vm_pipeline + fixtures are wired"]
+fn vm_tst_001_pr_baseline_sainte_lague() {
+    // Arrange: approvals A/B/C/D=10/20/30/40; m=10; SL; threshold 0%
+    let _art = run_with_part0_fixtures(TestMode::Manifest);
+    // Act: extract unit allocation seats
+    // let seats = seats_of(...);
+    // Assert: 1/2/3/4 in canonical option order; Σ seats == 10
+    // assert_eq!(seats, vec![(opt_a,1),(opt_b,2),(opt_c,3),(opt_d,4)]);
+    // assert_sum_seats(&seats, 10);
+    todo!("Plug real extraction and assertions");
+}
+
+#[test]
+#[ignore = "Enable once vm_pipeline + fixtures are wired"]
+fn vm_tst_002_wta_winner_take_all_m1() {
+    // Arrange: plurality votes with D top; m=1; WTA
+    let _art = run_with_part0_fixtures(TestMode::Manifest);
+    // Act: extract WTA power vector
+    // let power = power_of(...);
+    // Assert: D → 100% power
+    // assert_eq!(power, vec![(opt_d, 100)]);
+    // assert_wta_power_100(&power);
+    todo!("Plug real extraction and assertions");
+}
+
+#[test]
+#[ignore = "Enable once vm_pipeline + fixtures are wired"]
+fn vm_tst_003_method_convergence_lr_vs_ha() {
+    // Arrange: shares 34/33/33; m=7; run SL, D’Hondt, LR
+    let _art = run_with_part0_fixtures(TestMode::Manifest);
+    // Act: seat vectors for each method
+    // Assert: each returns 3/2/2; Σ seats == 7 for each
+    todo!("Run three allocation methods on same tallies, assert 3/2/2");
+}
+
+#[test]
+#[ignore = "Enable once vm_pipeline + fixtures are wired"]
+fn vm_tst_004_gate_denominator_approval_rate() {
+    // Arrange: approval ballot, Change approvals / valid = 55.0%
+    let _art = run_with_part0_fixtures(TestMode::Manifest);
+    // Act: take LegitimacyReport → GateSnapshot
+    // let g = gate_values(&art.outputs.result.gates);
+    // Assert: majority uses approvals_for_change / valid_ballots; pass at ≥ 55
+    // assert!(g.majority_present && g.majority_pass);
+    // assert_eq!(g.majority_threshold_pct, 55);
+    // assert_eq!((g.majority_num, g.majority_den), (55, 100));
+    todo!("Extract majority gate; assert approval-rate denominator and ≥ rule");
+}
+
+#[test]
+#[ignore = "Enable once vm_pipeline + fixtures are wired"]
+fn vm_tst_005_pipeline_order_and_stop_rules() {
+    // Arrange A: craft a validation fail (e.g., hierarchy violation) → expect Invalid; skip TABULATE..FRONTIER
+    // Arrange B: a quorum-below-threshold case → expect Invalid; frontier skipped
+    // For A and B, ensure Result and RunRecord are still produced.
+    todo!("Run two scenarios and assert stop/continue semantics per Doc-5");
+}
+
+--------------------------------------------------------------------------------
+FILE: tests/vm_tst_gates.rs
+--------------------------------------------------------------------------------
+//! VM-ENGINE v0 — Gates & Denominators tests (skeleton)
+//!
+//! This file encodes the **test intentions and signatures** for legitimacy gates:
+//! Quorum → Majority/Supermajority → Double-majority → Symmetry, including the
+//! fixed **approval-rate** denominator rule (approvals_for_change / valid_ballots)
+//! and the pipeline stop/continue semantics when a gate fails.
+//!
+//! Until the full engine wiring + fixtures exist in the workspace, these tests
+//! are marked `#[ignore]`. Replace the `unimplemented!()`/`todo!()` stubs with
+//! real orchestration once `vm_pipeline`/`vm_io` and Annex-B gates fixtures are
+//! present (see fixture constants below).
+
+use std::fmt;
+
+// -----------------------------------------------------------------------------
+// Fixture paths (adjust to your repo layout if needed)
+// -----------------------------------------------------------------------------
+#[allow(dead_code)]
+const REG_004: &str = "fixtures/annex_b/gates/s004/division_registry.json";
+#[allow(dead_code)]
+const PS_004: &str = "fixtures/annex_b/gates/s004/parameter_set.json";
+#[allow(dead_code)]
+const TLY_004: &str = "fixtures/annex_b/gates/s004/ballots.json";
+
+#[allow(dead_code)]
+const REG_005: &str = "fixtures/annex_b/gates/s005/division_registry.json";
+#[allow(dead_code)]
+const PS_005: &str = "fixtures/annex_b/gates/s005/parameter_set.json";
+#[allow(dead_code)]
+const TLY_005: &str = "fixtures/annex_b/gates/s005/ballots.json";
+
+#[allow(dead_code)]
+const REG_006: &str = "fixtures/annex_b/gates/s006/division_registry.json";
+#[allow(dead_code)]
+const PS_006: &str = "fixtures/annex_b/gates/s006/parameter_set.json";
+#[allow(dead_code)]
+const TLY_006: &str = "fixtures/annex_b/gates/s006/ballots.json";
+
+#[allow(dead_code)]
+const REG_007A: &str = "fixtures/annex_b/gates/s007_a/division_registry.json"; // A→B
+#[allow(dead_code)]
+const PS_007A: &str = "fixtures/annex_b/gates/s007_a/parameter_set.json";
+#[allow(dead_code)]
+const TLY_007A: &str = "fixtures/annex_b/gates/s007_a/ballots.json";
+
+#[allow(dead_code)]
+const REG_007B: &str = "fixtures/annex_b/gates/s007_b/division_registry.json"; // B→A
+#[allow(dead_code)]
+const PS_007B: &str = "fixtures/annex_b/gates/s007_b/parameter_set.json";
+#[allow(dead_code)]
+const TLY_007B: &str = "fixtures/annex_b/gates/s007_b/ballots.json";
+
+// -----------------------------------------------------------------------------
+// Minimal gate view used by assertions (engine-agnostic placeholder)
+// -----------------------------------------------------------------------------
+#[derive(Clone, Copy, Debug, Default)]
+struct GateRowView {
+    pass: bool,
+    numerator: u64,
+    denominator: u64,
+    threshold_pct: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DoubleMajorityView {
+    national_pass: bool,
+    family_pass: bool,
+    national_num: u64,
+    national_den: u64,
+    family_num: u64,
+    family_den: u64,
+    national_threshold_pct: u8,
+    family_threshold_pct: u8,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GatePanelView {
+    quorum: GateRowView,
+    majority: GateRowView,
+    double_majority: Option<DoubleMajorityView>,
+    symmetry: Option<bool>,
+}
+
+impl fmt::Display for GateRowView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Pure integer one-decimal rendering for diagnostics only
+        // (tests compare structured values; this is just a helper string).
+        let tenths = if self.denominator == 0 {
+            0i128
+        } else {
+            ((self.numerator as i128) * 1000) / (self.denominator as i128)
+        };
+        write!(
+            f,
+            "{}.{:01}% vs {}% — {}",
+            tenths / 10,
+            (tenths % 10).abs(),
+            self.threshold_pct,
+            if self.pass { "Pass" } else { "Fail" }
+        )
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Public test API expectations (stubs to be implemented when wiring the engine)
+// -----------------------------------------------------------------------------
+
+/// Run full pipeline from explicit file paths; returns (Result, RunRecord, Frontier?).
+#[allow(dead_code)]
+fn run_pipeline(
+    _reg: &str,
+    _ps: &str,
+    _tly: &str,
+) -> Result<((), (), Option<()>), String> {
+    // Replace this with a real invocation that loads the three local files,
+    // runs the fixed pipeline, and returns concrete artifacts.
+    Err("run_pipeline is not wired yet".into())
+}
+
+/// Extract gate panel with raw numerators/denominators and pass/fail flags.
+#[allow(dead_code)]
+fn gate_panel(_res: &()) -> GatePanelView {
+    // Map engine LegitimacyReport → GatePanelView (deterministic).
+    unimplemented!("gate_panel stub: map Result.gates to GatePanelView")
+}
+
+/// Assert majority text “Support X.X% vs Y% — Pass/Fail”; X formatted to one decimal.
+#[allow(dead_code)]
+fn assert_majority_line(view: &GatePanelView, expect_pct_1dp: &str, threshold_pct: u32, expect_pass: bool) {
+    // Build a one-decimal string from majority row for human-friendly assert.
+    let m = view.majority;
+    let tenths = if m.denominator == 0 {
+        0i128
+    } else {
+        ((m.numerator as i128) * 1000) / (m.denominator as i128)
+    };
+    let observed_str = format!("{}.{:01}", tenths / 10, (tenths % 10).abs());
+    assert_eq!(
+        observed_str,
+        expect_pct_1dp,
+        "majority observed percent (1dp) mismatch"
+    );
+    assert_eq!(
+        m.threshold_pct as u32,
+        threshold_pct,
+        "majority threshold pct mismatch"
+    );
+    assert_eq!(m.pass, expect_pass, "majority pass/fail mismatch");
+}
+
+/// Assert pipeline skipped Frontier when gates failed.
+#[allow(dead_code)]
+fn assert_frontier_omitted(fr: &Option<()>) {
+    assert!(
+        fr.is_none(),
+        "Frontier must be omitted when a gate fails (MAP_FRONTIER skipped)"
+    );
+}
+
+/// Assert final label == "Decisive" | "Invalid" with reason substring.
+#[allow(dead_code)]
+fn assert_label(_res: &(), _expect: &str, _reason_contains: Option<&str>) {
+    // Extract {label, reason} from Result and compare.
+    unimplemented!("assert_label stub: inspect Result.label and reason");
+}
+
+// -----------------------------------------------------------------------------
+// Tests (ignored until engine + fixtures are available)
+// -----------------------------------------------------------------------------
+
+#[test]
+#[ignore = "Enable once vm_pipeline + gates fixtures are wired"]
+fn vm_tst_004_supermajority_edge_ge_rule() {
+    // 55.000% approvals_for_change / valid_ballots at the national level must PASS (≥ rule).
+    let (res, _run, fr) = match run_pipeline(REG_004, PS_004, TLY_004) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("run_pipeline stub: {e}");
+            return; // early return while ignored/wiring pending
+        }
+    };
+    let panel = gate_panel(&res);
+    assert_majority_line(&panel, "55.0", 55, true);
+    assert_label(&res, "Decisive", None);
+    // No assertion on frontier for a pass-case.
+    let _ = fr; // silence unused for now
+}
+
+#[test]
+#[ignore = "Enable once vm_pipeline + gates fixtures are wired"]
+fn vm_tst_005_quorum_failure_invalid() {
+    // Turnout Σ ballots_cast / Σ eligible_roll = 48% → Quorum FAIL → run Invalid; frontier omitted.
+    let (res, _run, fr) = match run_pipeline(REG_005, PS_005, TLY_005) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("run_pipeline stub: {e}");
+            return;
+        }
+    };
+    let panel = gate_panel(&res);
+    assert!(
+        panel.quorum.pass == false,
+        "expected quorum fail, got: {}",
+        panel.quorum
+    );
+    assert_label(&res, "Invalid", Some("Quorum"));
+    assert_frontier_omitted(&fr);
+}
+
+#[test]
+#[ignore = "Enable once vm_pipeline + gates fixtures are wired"]
+fn vm_tst_006_double_majority_family_fail() {
+    // National ≥ threshold but affected-family support below regional threshold ⇒ DM FAIL ⇒ Invalid.
+    let (res, _run, fr) = match run_pipeline(REG_006, PS_006, TLY_006) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("run_pipeline stub: {e}");
+            return;
+        }
+    };
+    let panel = gate_panel(&res);
+    let dm = panel
+        .double_majority
+        .expect("double-majority should be present in this scenario");
+    assert!(panel.majority.pass, "national majority should pass");
+    assert!(
+        dm.family_pass == false,
+        "family (regional) support should fail DM threshold"
+    );
+    assert_label(&res, "Invalid", Some("Regional"));
+    assert_frontier_omitted(&fr);
+}
+
+#[test]
+#[ignore = "Enable once vm_pipeline + gates fixtures are wired"]
+fn vm_tst_007_symmetry_mirrored_pass() {
+    // A→B and B→A mirrored runs at 56% both Pass; denominators/thresholds neutral.
+    let (res_a, _run_a, _fr_a) = match run_pipeline(REG_007A, PS_007A, TLY_007A) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("run_pipeline stub A: {e}");
+            return;
+        }
+    };
+    let (res_b, _run_b, _fr_b) = match run_pipeline(REG_007B, PS_007B, TLY_007B) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("run_pipeline stub B: {e}");
+            return;
+        }
+    };
+    let a = gate_panel(&res_a);
+    let b = gate_panel(&res_b);
+    assert!(a.majority.pass && b.majority.pass, "both should pass at 56%");
+    // Optionally assert that observed/threshold tuples are equal across mirrored runs.
+    assert_eq!(
+        (a.majority.numerator, a.majority.denominator, a.majority.threshold_pct),
+        (b.majority.numerator, b.majority.denominator, b.majority.threshold_pct),
+        "symmetry neutrality: denominators/thresholds must match between mirrored runs"
+    );
+}
+
+--------------------------------------------------------------------------------
+FILE: tests/vm_tst_ranked.rs
+--------------------------------------------------------------------------------
+//! VM-ENGINE v0 — Ranked methods tests (skeleton)
+//!
+//! Locks behavior for:
+//!   (a) IRV with exhaustion (reduce_continuing_denominator)
+//!   (b) Condorcet with Schulze completion.
+//!
+//! This file wires test *signatures* and deterministic assertions, but leaves the
+//! engine orchestration as TODO. Until the ranked fixtures + pipeline wiring land,
+//! the tests are `#[ignore]` so the crate compiles cleanly on all OSes.
+
+use anyhow::Result;
+
+// -----------------------------------------------------------------------------
+// Fixture paths (adjust to your repo layout if needed)
+// -----------------------------------------------------------------------------
+#[allow(dead_code)]
+const REG_IRV: &str = "fixtures/annex_b/part_3/vm_tst_010/division_registry.json";
+#[allow(dead_code)]
+const PS_IRV: &str = "fixtures/annex_b/part_3/vm_tst_010/parameter_set.json";
+#[allow(dead_code)]
+const TLY_IRV: &str = "fixtures/annex_b/part_3/vm_tst_010/ballots.json";
+
+#[allow(dead_code)]
+const REG_COND: &str = "fixtures/annex_b/part_3/vm_tst_011/division_registry.json";
+#[allow(dead_code)]
+const PS_COND: &str = "fixtures/annex_b/part_3/vm_tst_011/parameter_set.json";
+#[allow(dead_code)]
+const TLY_COND: &str = "fixtures/annex_b/part_3/vm_tst_011/ballots.json";
+
+// -----------------------------------------------------------------------------
+// Minimal placeholder types so this test module compiles before wiring
+// (replace with real vm_pipeline/vm_io artifact types when available)
+// -----------------------------------------------------------------------------
+type ResultDb = ();         // replace with concrete Result artifact type
+type RunRecordDb = ();      // replace with concrete RunRecord type
+type FrontierMapDb = ();    // replace with concrete FrontierMap type
+type UnitId = String;       // engine UnitId newtype/string
+type OptionId = String;     // engine OptionId newtype/string
+type PairwiseMatrix = ();   // replace with concrete pairwise type
+
+// -----------------------------------------------------------------------------
+// Public test API (to be implemented for real once the engine is wired)
+// -----------------------------------------------------------------------------
+
+/// Run full pipeline from explicit file paths; returns (Result, RunRecord, Frontier?).
+#[allow(dead_code)]
+fn run_pipeline(
+    _reg: &str,
+    _ps: &str,
+    _tly: &str,
+) -> Result<(ResultDb, RunRecordDb, Option<FrontierMapDb>)> {
+    Err(anyhow::anyhow!("run_pipeline stub: not wired yet"))
+}
+
+/// Return the first UnitId found in the Result (stable order).
+#[allow(dead_code)]
+fn first_unit_id(_res: &ResultDb) -> UnitId {
+    unimplemented!("first_unit_id: map Result → first UnitId")
+}
+
+/// Winner OptionId for a unit from ranked tabulation outcome.
+#[allow(dead_code)]
+fn winner_of(_res: &ResultDb, _unit: UnitId) -> OptionId {
+    unimplemented!("winner_of: extract ranked winner for unit")
+}
+
+/// Final tally for an option in a unit (IRV last round or Condorcet winner’s support as needed).
+#[allow(dead_code)]
+fn final_tally(_res: &ResultDb, _unit: UnitId, _opt: OptionId) -> u64 {
+    unimplemented!("final_tally: fetch unit/option final integer tally")
+}
+
+/// Pairwise assertion helper: ab vs ba tallies.
+#[allow(dead_code)]
+fn assert_pair(_pw: &PairwiseMatrix, _a: OptionId, _b: OptionId, _ab: u64, _ba: u64) {
+    unimplemented!("assert_pair: check pairwise matrix entry A>B and B>A")
+}
+
+/// Assert Result label == "Decisive".
+#[allow(dead_code)]
+fn assert_decisive(_res: &ResultDb) {
+    unimplemented!("assert_decisive: inspect Result.label == Decisive")
+}
+
+/// Convenience: map fixture symbol ("A","B","C","D") → OptionId.
+#[allow(dead_code)]
+fn opt(label: &str) -> OptionId {
+    label.to_string()
+}
+
+// -----------------------------------------------------------------------------
+// Tests (ignored until engine + ranked fixtures are wired)
+// -----------------------------------------------------------------------------
+
+/// VM-TST-010 — IRV with exhaustion (reduce_continuing_denominator).
+#[test]
+#[ignore = "Enable once vm_pipeline + ranked fixtures VM-TST-010 are wired"]
+fn run_irv_exhaustion_case() -> Result<()> {
+    let (res, _run, _fr) = match run_pipeline(REG_IRV, PS_IRV, TLY_IRV) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(()); // keep compiling/runnable; real assertions once wired
+        }
+    };
+
+    let unit = first_unit_id(&res);
+
+    // Round log expectations:
+    //   R1 tallies: A=35, B=40, C=25 → eliminate C
+    //   Transfers: 15 → B; 10 exhaust → continuing denominator 90
+    //
+    // Access via helpers (hide concrete types until wired):
+    assert_eq!(final_tally(&res, unit.clone(), opt("B")), 55, "IRV final B");
+    assert_eq!(final_tally(&res, unit.clone(), opt("A")), 35, "IRV final A");
+    assert_eq!(winner_of(&res, unit.clone()), opt("B"), "IRV winner");
+
+    // When wired, also assert IrvLog round count and exhausted=10 via a helper accessor.
+
+    assert_decisive(&res);
+    Ok(())
+}
+
+/// VM-TST-011 — Condorcet with Schulze completion (cycle resolved to B).
+#[test]
+#[ignore = "Enable once vm_pipeline + ranked fixtures VM-TST-011 are wired"]
+fn run_condorcet_schulze_cycle() -> Result<()> {
+    let (res, _run, _fr) = match run_pipeline(REG_COND, PS_COND, TLY_COND) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(());
+        }
+    };
+
+    let unit = first_unit_id(&res);
+
+    // Pairwise cycle (example target):
+    //   A > B : 55–45
+    //   B > C : 60–40
+    //   C > A : 60–40
+    // Schulze strongest paths → winner B.
+
+    // Retrieve the pairwise matrix view from the Result with a helper,
+    // then assert entries and winner. We keep the concrete type abstract here.
+    let pw: PairwiseMatrix = unimplemented!("obtain pairwise matrix from Result for {unit}");
+    assert_pair(&pw, opt("A"), opt("B"), 55, 45);
+    assert_pair(&pw, opt("B"), opt("C"), 60, 40);
+    assert_pair(&pw, opt("C"), opt("A"), 60, 40);
+
+    assert_eq!(winner_of(&res, unit), opt("B"), "Condorcet-Schulze winner");
+    assert_decisive(&res);
+    Ok(())
+}
+
+--------------------------------------------------------------------------------
+FILE: tests/vm_tst_mmp.rs
+--------------------------------------------------------------------------------
+//! VM-ENGINE v0 — MMP tests (skeleton)
+//!
+//! Locks the Mixed-Member Proportional (MMP) sequence and controls:
+//!   • seat targets, top-ups, correction level (national vs regional),
+//!   • overhang policy (not triggered here).
+//!
+//! NOTE: This file provides compile-safe stubs and ignored tests so the
+//! workspace builds before the pipeline wiring + fixtures land. Replace the
+//! placeholder types and helper bodies with real engine types/APIs.
+
+use anyhow::Result;
+use std::collections::BTreeMap;
+
+// -----------------------------------------------------------------------------
+// Fixture paths (adjust to your repo layout if needed)
+// -----------------------------------------------------------------------------
+#[allow(dead_code)]
+const REG: &str = "fixtures/annex_b/part_3/vm_tst_013/division_registry.json";
+#[allow(dead_code)]
+const TLY: &str = "fixtures/annex_b/part_3/vm_tst_013/ballots.json";
+#[allow(dead_code)]
+const PS_NAT: &str = "fixtures/annex_b/part_3/vm_tst_013/parameter_set_national.json";
+#[allow(dead_code)]
+const PS_REG: &str = "fixtures/annex_b/part_3/vm_tst_013/parameter_set_regional.json";
+
+// -----------------------------------------------------------------------------
+// Minimal placeholder types so this test module compiles before wiring
+// (replace with real vm_pipeline/vm_io artifact types when available)
+// -----------------------------------------------------------------------------
+type ResultDb = ();
+type RunRecordDb = ();
+type FrontierMapDb = ();
+type OptionId = String;
+
+// -----------------------------------------------------------------------------
+// Helper API (to be implemented for real once the engine is wired)
+// -----------------------------------------------------------------------------
+
+/// Run full pipeline from explicit file paths; returns (Result, RunRecord, Frontier?).
+#[allow(dead_code)]
+fn run_pipeline(
+    _reg: &str,
+    _ps: &str,
+    _tly: &str,
+) -> Result<(ResultDb, RunRecordDb, Option<FrontierMapDb>)> {
+    Err(anyhow::anyhow!("run_pipeline stub: not wired yet"))
+}
+
+/// Read aggregated final seats by option (after MMP correction).
+#[allow(dead_code)]
+fn totals_by_option(_res: &ResultDb) -> BTreeMap<OptionId, u32> {
+    unimplemented!("totals_by_option: extract final total seats per option")
+}
+
+/// Read aggregated *local* seats by option (pre-top-up SMD winners).
+#[allow(dead_code)]
+fn locals_by_option(_res: &ResultDb) -> BTreeMap<OptionId, u32> {
+    unimplemented!("locals_by_option: extract local/SMD seats per option")
+}
+
+/// Effective total seats in the chamber after MMP (T).
+#[allow(dead_code)]
+fn effective_total_seats(_res: &ResultDb) -> u32 {
+    unimplemented!("effective_total_seats: read total seats from aggregates/MMP")
+}
+
+/// Map fixture label ("A"/"B"/"C") → OptionId.
+#[allow(dead_code)]
+fn oid(label: &str) -> OptionId {
+    label.to_string()
+}
+
+/// Assert Result label == "Decisive".
+#[allow(dead_code)]
+fn assert_decisive(_res: &ResultDb) {
+    unimplemented!("assert_decisive: inspect Result.label == Decisive")
+}
+
+// -----------------------------------------------------------------------------
+// Tests (ignored until engine + MMP fixtures are wired)
+// -----------------------------------------------------------------------------
+
+/// VM-TST-013 — MMP national correction level
+/// Expected totals: A/B/C = 7/3/2; locals A/B/C = 2/2/2; T = 12.
+#[test]
+#[ignore = "Enable once vm_pipeline + MMP fixtures VM-TST-013 are wired"]
+fn vm_tst_013_mmp_national_level() -> Result<()> {
+    let (res, _run, _fr) = match run_pipeline(REG, PS_NAT, TLY) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(()); // keep suite compiling; real assertions once wired
+        }
+    };
+
+    let a = oid("A");
+    let b = oid("B");
+    let c = oid("C");
+
+    let total = totals_by_option(&res);
+    let local = locals_by_option(&res);
+
+    assert_eq!(local.get(&a).copied(), Some(2), "locals A");
+    assert_eq!(local.get(&b).copied(), Some(2), "locals B");
+    assert_eq!(local.get(&c).copied(), Some(2), "locals C");
+
+    assert_eq!(total.get(&a).copied(), Some(7), "total A");
+    assert_eq!(total.get(&b).copied(), Some(3), "total B");
+    assert_eq!(total.get(&c).copied(), Some(2), "total C");
+
+    assert_eq!(effective_total_seats(&res), 12, "effective T");
+    assert_decisive(&res);
+    Ok(())
+}
+
+/// VM-TST-013 — MMP regional correction level
+/// Expected totals: A/B/C = 8/2/2; locals A/B/C = 2/2/2; T = 12.
+#[test]
+#[ignore = "Enable once vm_pipeline + MMP fixtures VM-TST-013 are wired"]
+fn vm_tst_013_mmp_regional_level() -> Result<()> {
+    let (res, _run, _fr) = match run_pipeline(REG, PS_REG, TLY) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(());
+        }
+    };
+
+    let a = oid("A");
+    let b = oid("B");
+    let c = oid("C");
+
+    let total = totals_by_option(&res);
+    let local = locals_by_option(&res);
+
+    assert_eq!(local.get(&a).copied(), Some(2), "locals A");
+    assert_eq!(local.get(&b).copied(), Some(2), "locals B");
+    assert_eq!(local.get(&c).copied(), Some(2), "locals C");
+
+    assert_eq!(total.get(&a).copied(), Some(8), "total A");
+    assert_eq!(total.get(&b).copied(), Some(2), "total B");
+    assert_eq!(total.get(&c).copied(), Some(2), "total C");
+
+    assert_eq!(effective_total_seats(&res), 12, "effective T");
+    assert_decisive(&res);
+    Ok(())
+}
+
+--------------------------------------------------------------------------------
+FILE: tests/determinism.rs
+--------------------------------------------------------------------------------
+//! VM-ENGINE v0 — Determinism tests (skeleton)
+//!
+//! Proves byte-identical Result/RunRecord across repeat & cross-OS runs,
+//! canonical JSON invariants (UTF-8, sorted keys, LF, UTC), and absence of
+//! floating-point numbers in artifacts.
+//!
+//! NOTE: This file ships **compile-safe stubs** and marks tests as `#[ignore]`
+//! so the workspace builds before the pipeline wiring + fixtures land.
+//! Replace the placeholder types and helper bodies with real engine types/APIs,
+//! then remove the `#[ignore]` attributes to activate the suite.
+
+use anyhow::Result;
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::VecDeque;
+
+// -----------------------------------------------------------------------------
+// Fixture paths (edit to match your repo layout if needed)
+// -----------------------------------------------------------------------------
+#[allow(dead_code)]
+const REG_019: &str = "fixtures/annex_b/part_7/vm_tst_019/division_registry.json";
+#[allow(dead_code)]
+const TLY_019: &str = "fixtures/annex_b/part_7/vm_tst_019/ballots.json";
+#[allow(dead_code)]
+const PS_019: &str = "fixtures/annex_b/part_7/vm_tst_019/parameter_set.json";
+
+#[allow(dead_code)]
+const REG_020: &str = "fixtures/annex_b/part_0/division_registry.json";
+#[allow(dead_code)]
+const TLY_020: &str = "fixtures/annex_b/part_0/ballots.json";
+#[allow(dead_code)]
+const PS_020: &str = "fixtures/annex_b/part_0/parameter_set.json";
+
+// -----------------------------------------------------------------------------
+// Minimal placeholder types so this test module compiles before wiring
+// (replace with real vm_pipeline/vm_io artifact types when available)
+// -----------------------------------------------------------------------------
+type ResultDb = ();
+type RunRecordDb = ();
+type FrontierMapDb = ();
+
+// -----------------------------------------------------------------------------
+// Helpers (local, deterministic; swap for real vm_io canonical JSON + SHA-256)
+// -----------------------------------------------------------------------------
+
+/// Extremely small, dependency-free "canonicalizer":
+/// - Serializes with serde_json (expects your structs/maps already ordered)
+/// - Ensures a single trailing `\n`
+/// (Replace with `vm_io::canonical_json::to_canonical_bytes` when available.)
+fn to_canonical_bytes_local<T: Serialize>(v: &T) -> Vec<u8> {
+    let mut s = serde_json::to_string(v).unwrap_or_else(|_| String::from("{}"));
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s.into_bytes()
+}
+
+/// Tiny, deterministic checksum (Adler-32-like) purely for a compile-safe stub.
+/// (Replace with a real SHA-256 function like `vm_io::hasher::sha256_hex`.)
+fn hash_hex_local(bytes: &[u8]) -> String {
+    const MOD: u32 = 65_521;
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+    for &x in bytes {
+        a = (a + x as u32) % MOD;
+        b = (b + a) % MOD;
+    }
+    format!("{:08x}{:08x}", b, a)
+}
+
+fn canon_and_hash<T: Serialize>(v: &T) -> (Vec<u8>, String) {
+    let bytes = to_canonical_bytes_local(v);
+    let hex = hash_hex_local(&bytes);
+    (bytes, hex)
+}
+
+fn assert_single_lf(bytes: &[u8]) {
+    assert!(
+        bytes.ends_with(b"\n"),
+        "canonical JSON must end with a single LF"
+    );
+    assert!(
+        !bytes.contains(&b'\r'),
+        "canonical JSON must not contain CR characters"
+    );
+}
+
+fn assert_utc_strings_are_z(json: &Value) {
+    fn is_utc_z(s: &str) -> bool {
+        s.ends_with('Z') && s.contains('T')
+    }
+    // These pointers are placeholders; adjust to your RunRecord JSON shape.
+    let started = json.pointer("/run/started_utc").and_then(|v| v.as_str());
+    let finished = json.pointer("/run/finished_utc").and_then(|v| v.as_str());
+    if let (Some(a), Some(b)) = (started, finished) {
+        assert!(is_utc_z(a) && is_utc_z(b), "timestamps must be UTC '...Z'");
+    }
+}
+
+fn assert_no_floats(json: &Value) {
+    let mut q = VecDeque::from([json]);
+    while let Some(v) = q.pop_front() {
+        match v {
+            Value::Number(n) => {
+                assert!(
+                    !n.is_f64(),
+                    "no floating-point numbers allowed in artifacts: {n}"
+                );
+            }
+            Value::Array(a) => {
+                for x in a {
+                    q.push_back(x);
+                }
+            }
+            Value::Object(o) => {
+                for (_k, x) in o {
+                    q.push_back(x);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Run full pipeline from explicit file paths; returns (Result, RunRecord, Frontier?).
+/// Replace with wiring to your library entry (e.g., vm_pipeline).
+#[allow(dead_code)]
+fn run_pipeline(
+    _reg: &str,
+    _ps: &str,
+    _tly: &str,
+    _seed: Option<&str>,
+) -> Result<(ResultDb, RunRecordDb, Option<FrontierMapDb>)> {
+    Err(anyhow::anyhow!(
+        "run_pipeline stub: connect to vm_pipeline and return artifacts"
+    ))
+}
+
+// -----------------------------------------------------------------------------
+// Tests — initially ignored; un-ignore once wired
+// -----------------------------------------------------------------------------
+
+#[test]
+#[ignore = "Enable after run_pipeline is wired to vm_pipeline"]
+fn vm_tst_019_same_os_repeat_hashes_identical() -> Result<()> {
+    // First run
+    let (res1, run1, _fr1) = run_pipeline(REG_019, PS_019, TLY_019, None)?;
+    // Second run (same OS/process)
+    let (res2, run2, _fr2) = run_pipeline(REG_019, PS_019, TLY_019, None)?;
+
+    // Canonicalize & hash
+    let (res_b1, res_h1) = canon_and_hash(&res1);
+    let (run_b1, run_h1) = canon_and_hash(&run1);
+    let (res_b2, res_h2) = canon_and_hash(&res2);
+    let (run_b2, run_h2) = canon_and_hash(&run2);
+
+    // Hash equality
+    assert_eq!(res_h1, res_h2, "Result hashes must match on repeat");
+    assert_eq!(run_h1, run_h2, "RunRecord hashes must match on repeat");
+
+    // Canonical JSON invariants
+    assert_single_lf(&res_b1);
+    assert_single_lf(&run_b1);
+
+    // No floats in either artifact
+    let res_json: Value = serde_json::from_slice(&res_b1)?;
+    let run_json: Value = serde_json::from_slice(&run_b1)?;
+    assert_no_floats(&res_json);
+    assert_no_floats(&run_json);
+    Ok(())
+}
+
+#[test]
+#[ignore = "Enable after run_pipeline is wired to vm_pipeline"]
+fn vm_tst_020_cross_os_hashes_identical() -> Result<()> {
+    let seed = Some("424242"); // optional: ensures RNG path is fixed if triggered
+    let (res, run, _fr) = run_pipeline(REG_020, PS_020, TLY_020, seed)?;
+
+    let (res_b, res_h) = canon_and_hash(&res);
+    let (run_b, run_h) = canon_and_hash(&run);
+
+    // Echo for logs (CI can compare across OS)
+    eprintln!("Result HASH={}", res_h);
+    eprintln!("RunRecord HASH={}", run_h);
+
+    // Canonical invariants
+    assert_single_lf(&res_b);
+    assert_single_lf(&run_b);
+
+    // UTC timestamps & no floats
+    let res_json: Value = serde_json::from_slice(&res_b)?;
+    let run_json: Value = serde_json::from_slice(&run_b)?;
+    assert_utc_strings_are_z(&run_json);
+    assert_no_floats(&res_json);
+    assert_no_floats(&run_json);
+    Ok(())
+}
+
+#[test]
+#[ignore = "Enable after run_pipeline is wired to vm_pipeline"]
+fn canonical_json_sorted_keys_lf_utc() -> Result<()> {
+    let (res, run, _fr) = run_pipeline(REG_020, PS_020, TLY_020, None)?;
+
+    let (res_b, _) = canon_and_hash(&res);
+    let (run_b, _) = canon_and_hash(&run);
+
+    // Single LF, no CR
+    assert_single_lf(&res_b);
+    assert_single_lf(&run_b);
+
+    // Canonicalization idempotency (local stub)
+    let res_val: Value = serde_json::from_slice(&res_b)?;
+    let run_val: Value = serde_json::from_slice(&run_b)?;
+    let res_b2 = to_canonical_bytes_local(&res_val);
+    let run_b2 = to_canonical_bytes_local(&run_val);
+    assert_eq!(res_b, res_b2, "Result canonicalization must be idempotent");
+    assert_eq!(run_b, run_b2, "RunRecord canonicalization must be idempotent");
+
+    // UTC Z timestamps in run
+    let run_json: Value = serde_json::from_slice(&run_b)?;
+    assert_utc_strings_are_z(&run_json);
+    Ok(())
+}
+
+#[test]
+#[ignore = "Enable after run_pipeline is wired to vm_pipeline"]
+fn no_floats_anywhere_in_artifacts() -> Result<()> {
+    let (res, run, _fr) = run_pipeline(REG_020, PS_020, TLY_020, None)?;
+    let (res_b, _) = canon_and_hash(&res);
+    let (run_b, _) = canon_and_hash(&run);
+    let res_json: Value = serde_json::from_slice(&res_b)?;
+    let run_json: Value = serde_json::from_slice(&run_b)?;
+    assert_no_floats(&res_json);
+    assert_no_floats(&run_json);
+    Ok(())
+}

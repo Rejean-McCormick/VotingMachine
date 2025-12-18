@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/ballot_tally.schema.json",
+  "title": "BallotTally (Canonical Input)",
+  "description": "Canonical per-unit tallies aligned to the DivisionRegistry. Arrays are ordered deterministically; referential integrity and sums are enforced by validation/tests outside of JSON Schema.",
+  "$defs": {
+    "id_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+      "title": "IdToken",
+      "$comment": "Allowed: A–Z a–z 0–9 underscore _ hyphen - colon : dot ."
+    },
+    "unit_id": { "$ref": "#/$defs/id_token" },
+    "option_id": { "$ref": "#/$defs/id_token" },
+
+    "option_tally": {
+      "type": "object",
+      "title": "OptionTally",
+      "required": ["option_id", "votes"],
+      "properties": {
+        "option_id": { "$ref": "#/$defs/option_id" },
+        "votes": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+
+    "unit_tally": {
+      "type": "object",
+      "title": "UnitTally",
+      "required": ["unit_id", "totals", "options"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/unit_id" },
+        "totals": {
+          "type": "object",
+          "title": "UnitTotals",
+          "required": ["valid_ballots", "invalid_ballots"],
+          "properties": {
+            "valid_ballots": { "type": "integer", "minimum": 0 },
+            "invalid_ballots": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "options": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/option_tally" },
+          "$comment": "Order mirrors the Registry option order (by order_index; ties by option_id)."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+
+  "type": "object",
+  "required": ["schema_version", "units"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "units": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/unit_tally" },
+      "$comment": "Ordering contract (informative): units sorted by ascending unit_id. Enforced by conformance checks/tests, not by JSON Schema."
+    }
+  },
+  "additionalProperties": false,
+
+  "$comment": "Canonical JSON (UTF-8, LF, sorted keys) governs hashing/IDs. Referential integrity to the Registry and sum(options[].votes) ≤ totals.valid_ballots are validated by the engine/tests.",
+
+  "examples": [
+    {
+      "schema_version": "1.x",
+      "units": [
+        {
+          "unit_id": "U-001",
+          "totals": { "valid_ballots": 12345, "invalid_ballots": 67 },
+          "options": [
+            { "option_id": "O-A1", "votes": 6000 },
+            { "option_id": "O-B1", "votes": 5000 }
+          ]
+        }
+      ]
+    }
+  ]
+}

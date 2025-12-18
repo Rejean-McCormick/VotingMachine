@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/frontier_map.schema.json",
+  "title": "FrontierMap (Canonical Output)",
+  "description": "Per-unit frontier status & contiguity outcomes derived from a run. Inputs/manifest IDs live in RunRecord, not here.",
+  "$defs": {
+    "hex64": { "type": "string", "pattern": "^[0-9a-f]{64}$", "title": "Hex64Lower" },
+    "fr_id": { "type": "string", "pattern": "^FR:[0-9a-f]{64}$", "title": "FrontierMapId" },
+    "id_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+      "title": "IdToken",
+      "$comment": "Allowed: A–Z a–z 0–9 underscore _ hyphen - colon : dot ."
+    },
+    "edge": { "type": "string", "enum": ["land", "bridge", "water"] },
+    "band": {
+      "type": "object",
+      "title": "FrontierBand",
+      "required": ["status", "min_pct", "max_pct"],
+      "properties": {
+        "status": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "min_pct": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "max_pct": { "type": "integer", "minimum": 0, "maximum": 100 }
+      },
+      "allOf": [
+        {
+          "$comment": "Enforce min_pct ≤ max_pct using $data (validator extension).",
+          "properties": {
+            "max_pct": {
+              "type": "integer",
+              "minimum": { "$data": "1/min_pct" }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "flags": {
+      "type": "object",
+      "title": "UnitFlags",
+      "required": ["contiguity_ok", "mediation_flagged", "protected_override_used", "enclave"],
+      "properties": {
+        "contiguity_ok": { "type": "boolean" },
+        "mediation_flagged": { "type": "boolean" },
+        "protected_override_used": { "type": "boolean" },
+        "enclave": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "adjacency_summary": {
+      "type": "object",
+      "title": "AdjacencySummary",
+      "required": ["used_edges"],
+      "properties": {
+        "used_edges": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/edge" }
+        },
+        "corridor_used": { "type": "boolean" },
+        "reasons": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/id_token" },
+          "title": "ReasonCodes"
+        }
+      },
+      "additionalProperties": false
+    },
+    "unit_frontier": {
+      "type": "object",
+      "title": "UnitFrontier",
+      "required": ["unit_id", "support_share", "status", "flags"],
+      "properties": {
+        "unit_id": { "$ref": "#/$defs/id_token" },
+        "support_share": { "type": "number", "minimum": 0, "maximum": 1 },
+        "status": { "type": "string" },
+        "flags": { "$ref": "#/$defs/flags" },
+        "adjacency_summary": { "$ref": "#/$defs/adjacency_summary" }
+      },
+      "additionalProperties": false
+    },
+    "frontier_config": {
+      "type": "object",
+      "title": "FrontierConfigApplied",
+      "required": ["mode", "contiguity_edge_types", "frontier_strategy"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["none", "banded", "ladder"] },
+        "contiguity_edge_types": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/edge" },
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "frontier_strategy": {
+          "type": "string",
+          "enum": ["apply_on_entry", "apply_on_exit", "sticky"]
+        },
+        "bands": { "type": "array", "items": { "$ref": "#/$defs/band" } }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "none" } }, "required": ["mode"] },
+          "then": { "not": { "required": ["bands"] } }
+        },
+        {
+          "if": { "properties": { "mode": { "enum": ["banded", "ladder"] } }, "required": ["mode"] },
+          "then": { "required": ["bands"] }
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "required": ["schema_version", "frontier_map_id", "frontier_config", "units"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "frontier_map_id": { "$ref": "#/$defs/fr_id" },
+    "frontier_config": { "$ref": "#/$defs/frontier_config" },
+    "units": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/unit_frontier" },
+      "$comment": "Ordering (informative): units sorted by ascending unit_id. Enforced by validation/tests."
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "$comment": "If mode = none, every unit.status must be \"none\".",
+      "if": {
+        "properties": {
+          "frontier_config": {
+            "properties": { "mode": { "const": "none" } },
+            "required": ["mode"]
+          }
+        },
+        "required": ["frontier_config"]
+      },
+      "then": {
+        "properties": {
+          "units": {
+            "items": {
+              "properties": { "status": { "const": "none" } },
+              "required": ["status"]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$comment": "Arrays are canonicalized by the engine; JSON is UTF-8, LF, with sorted object keys. Status membership in bands when mode≠none is validated by the pipeline.",
+  "examples": [
+    {
+      "schema_version": "1.x",
+      "frontier_map_id": "FR:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "frontier_config": {
+        "mode": "banded",
+        "contiguity_edge_types": ["land", "bridge"],
+        "frontier_strategy": "apply_on_entry",
+        "bands": [
+          { "status": "frontier", "min_pct": 45, "max_pct": 55 },
+          { "status": "stable", "min_pct": 56, "max_pct": 100 }
+        ]
+      },
+      "units": [
+        {
+          "unit_id": "U-001",
+          "support_share": 0.532,
+          "status": "frontier",
+          "flags": {
+            "contiguity_ok": true,
+            "mediation_flagged": false,
+            "protected_override_used": false,
+            "enclave": false
+          },
+          "adjacency_summary": { "used_edges": ["land"] }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,82 @@
+{
+  "package": {
+    "productName": "VM Engine",
+    "version": "0.0.0"
+  },
+  "build": {
+    "beforeBuildCommand": "",
+    "beforeDevCommand": "",
+    "distDir": "../ui/dist",
+    "devPath": "../ui/dist"
+  },
+  "tauri": {
+    "macOSPrivateApi": false,
+    "bundle": {
+      "active": true,
+      "identifier": "org.vm.engine",
+      "targets": ["dmg", "msi", "appimage", "deb"],
+      "resources": [
+        "../ui/dist/**",
+        "../assets/**",
+        "../maps/**"
+      ],
+      "windows": {
+        "wix": { "language": "en-US" }
+      }
+    },
+    "updater": {
+      "active": false
+    },
+    "allowlist": {
+      "all": false,
+      "shell": { "all": false },
+      "http": { "all": false },
+      "net": { "all": false },
+      "process": { "all": false },
+      "notification": { "all": false },
+      "globalShortcut": { "all": false },
+      "os": { "all": false },
+      "path": { "all": false },
+      "dialog": {
+        "open": true,
+        "save": true
+      },
+      "fs": {
+        "all": false,
+        "readFile": true,
+        "writeFile": true,
+        "createDir": true,
+        "exists": true,
+        "scope": [
+          "$APP/**",
+          "$RESOURCE/**",
+          "$APPDATA/**",
+          "$HOME/Documents/VM/**"
+        ]
+      },
+      "window": {
+        "all": false,
+        "setTitle": true,
+        "show": true,
+        "hide": true,
+        "close": true
+      },
+      "event": { "all": true },
+      "clipboard": { "all": false }
+    },
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'; connect-src 'none'; frame-src 'none'; object-src 'none'"
+    },
+    "windows": [
+      {
+        "title": "VM Engine",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false,
+        "visible": true,
+        "center": true
+      }
+    ]
+  }
+}

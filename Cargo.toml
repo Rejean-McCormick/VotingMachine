@@ -1,0 +1,77 @@
+# 01 - Workspace Manifest Cargo.toml
+# Component: Workspace Manifest (virtual workspace)
+# Version/FormulaID: VM-ENGINE v0
+
+[workspace]
+resolver = "2"
+
+members = [
+  "crates/vm_core",
+  "crates/vm_io",
+  "crates/vm_algo",
+  "crates/vm_pipeline",
+  "crates/vm_report",
+  "crates/vm_cli",
+  # Tauri Rust crate (kept out of default-members by default)
+  "crates/vm_app/src-tauri",
+]
+
+# Build by default without the Tauri app; include it explicitly when needed.
+default-members = [
+  "crates/vm_core",
+  "crates/vm_io",
+  "crates/vm_algo",
+  "crates/vm_pipeline",
+  "crates/vm_report",
+  "crates/vm_cli",
+]
+
+# Centralized, optional shared deps. Leave empty unless you want to pin exact versions workspace-wide.
+# (Pinning is useful for reproducibility but must match per-crate needs.)
+[workspace.dependencies]
+# serde = { version = "1.0", default-features = false, features = ["derive"] }
+# serde_json = { version = "1.0", default-features = false }
+# anyhow = "1"
+# thiserror = "1"
+
+# Deterministic-oriented profiles (release is the canonical path used for artifacts)
+[profile.dev]
+opt-level = 0
+debug-assertions = true
+overflow-checks = true
+incremental = true        # Dev convenience; determinism guaranteed in release.
+lto = "off"
+panic = "unwind"
+codegen-units = 256
+
+[profile.release]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+lto = "fat"
+panic = "abort"
+codegen-units = 1
+# `strip` is supported on many targets; if your toolchain/target doesn't support it, remove this line.
+strip = true
+
+# Keep tests consistent and reasonably fast; no incremental for cleaner comparisons.
+[profile.test]
+opt-level = 0
+debug-assertions = true
+overflow-checks = true
+incremental = false
+lto = "off"
+panic = "unwind"
+codegen-units = 256
+
+# Optional: bench profile mirrors release for determinism
+[profile.bench]
+inherits = "release"
+
+# Non-normative metadata for internal traceability; does not affect FID.
+[workspace.metadata.vm_engine]
+version = "v0"
+determinism.release_profile = true
+default_members_exclude_ui = true
+notes = "Renderer/UI (Tauri) is opt-in; CLI/core are default. Build with `--locked`."

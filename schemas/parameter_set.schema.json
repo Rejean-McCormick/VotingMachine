@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/parameter_set.schema.json",
+  "title": "ParameterSet (Canonical VM-VAR Map)",
+  "description": "Canonical ParameterSet capturing effective VM-VAR values for a run. All Included (FID) variables are required; Excluded variables are optional. Unknown variables are rejected.",
+  "$defs": {
+    "bool": { "type": "boolean", "title": "Boolean" },
+    "nonneg_int": { "type": "integer", "minimum": 0, "title": "NonNegativeInteger" },
+    "pct_int": { "type": "integer", "minimum": 0, "maximum": 100, "title": "PercentInteger0..100" },
+    "share_precision_int": { "type": "integer", "minimum": 0, "maximum": 6, "title": "SharePrecision0..6" },
+    "id_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+      "title": "IdToken"
+    },
+    "tie_policy_enum": { "type": "string", "enum": ["status_quo", "deterministic_order", "random"] },
+    "frontier_mode_enum": { "type": "string", "enum": ["none", "banded", "ladder"] },
+    "frontier_strategy_enum": { "type": "string", "enum": ["apply_on_entry", "apply_on_exit", "sticky"] },
+    "label_policy_enum": { "type": "string", "enum": ["fixed", "dynamic_margin"] },
+    "run_scope": {
+      "oneOf": [
+        { "const": "all_units" },
+        { "type": "object" }
+      ],
+      "title": "RunScope"
+    },
+    "sym_ex_selector": { "$ref": "#/$defs/id_token" }
+  },
+  "type": "object",
+  "required": ["schema_version", "vars"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "vars": {
+      "type": "object",
+      "description": "Map of VM-VAR-### → value. All Included (FID) variables must be present. Excluded (non-FID) variables are optional.",
+      "required": [
+        "VM-VAR-001",
+        "VM-VAR-002",
+        "VM-VAR-003",
+        "VM-VAR-004",
+        "VM-VAR-005",
+        "VM-VAR-006",
+        "VM-VAR-007",
+
+        "VM-VAR-010",
+        "VM-VAR-011",
+        "VM-VAR-012",
+        "VM-VAR-013",
+        "VM-VAR-014",
+        "VM-VAR-015",
+        "VM-VAR-016",
+        "VM-VAR-017",
+
+        "VM-VAR-020",
+        "VM-VAR-021",
+        "VM-VAR-022",
+        "VM-VAR-023",
+        "VM-VAR-024",
+        "VM-VAR-025",
+        "VM-VAR-026",
+        "VM-VAR-027",
+        "VM-VAR-028",
+        "VM-VAR-029",
+        "VM-VAR-030",
+        "VM-VAR-031",
+
+        "VM-VAR-040",
+        "VM-VAR-041",
+        "VM-VAR-042",
+        "VM-VAR-045",
+        "VM-VAR-046",
+        "VM-VAR-047",
+        "VM-VAR-048",
+        "VM-VAR-049",
+
+        "VM-VAR-050",
+        "VM-VAR-073"
+      ],
+      "properties": {
+        /* -------- A. Global & family (Included/FID) -------- */
+        "VM-VAR-001": { "type": "string", "$comment": "algorithm_family — enum per release" },
+        "VM-VAR-002": { "type": "string", "$comment": "rounding_policy — enum per release" },
+        "VM-VAR-003": { "$ref": "#/$defs/share_precision_int", "$comment": "share_precision — integer 0..6" },
+        "VM-VAR-004": { "type": "string", "$comment": "denom_rule — enum per family" },
+        "VM-VAR-005": { "type": "string", "$comment": "aggregation_mode — enum per family" },
+        "VM-VAR-006": { "type": "string", "$comment": "seat_allocation_rule — enum per family" },
+        "VM-VAR-007": { "type": "string", "$comment": "tie_scope_model — enum per spec" },
+
+        /* -------- B. Thresholds & gates (Included/FID) -------- */
+        "VM-VAR-010": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-011": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-012": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-013": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-014": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-015": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-016": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-017": { "$ref": "#/$defs/pct_int" },
+
+        "VM-VAR-020": { "$ref": "#/$defs/pct_int", "$comment": "domain per variable definition" },
+        "VM-VAR-021": { "$ref": "#/$defs/run_scope" },
+        "VM-VAR-022": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-023": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-024": { "$ref": "#/$defs/bool", "$comment": "per release; boolean if applicable" },
+        "VM-VAR-025": { "$ref": "#/$defs/bool", "$comment": "per release; boolean if applicable" },
+        "VM-VAR-026": { "type": ["integer", "number"], "$comment": "per release" },
+        "VM-VAR-027": { "type": ["integer", "number"], "$comment": "per release" },
+        "VM-VAR-028": { "type": ["integer", "number"], "$comment": "per release" },
+        "VM-VAR-029": { "type": "array", "items": { "$ref": "#/$defs/sym_ex_selector" } },
+        "VM-VAR-030": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["unit_id", "mode"],
+            "properties": {
+              "unit_id": { "$ref": "#/$defs/id_token" },
+              "mode": { "type": "string", "enum": ["include", "exclude"] }
+            },
+            "additionalProperties": false
+          }
+        },
+        "VM-VAR-031": { "$ref": "#/$defs/pct_int" },
+
+        /* -------- C. Frontier & refinements (+ Protected/Autonomy) (Included/FID) -------- */
+        "VM-VAR-040": { "$ref": "#/$defs/frontier_mode_enum" },
+        "VM-VAR-041": { "type": ["number", "string"], "$comment": "frontier_cut — number/enum per mode" },
+        "VM-VAR-042": { "$ref": "#/$defs/frontier_strategy_enum" },
+        "VM-VAR-045": { "type": "string", "enum": ["deny", "allow"] },
+        "VM-VAR-046": { "type": "object", "$comment": "autonomy_package_map — deterministic keys; documented per release" },
+        "VM-VAR-047": { "type": "number", "minimum": 0, "maximum": 1 },
+        "VM-VAR-048": { "type": "string", "enum": ["none", "soften", "harden"] },
+        "VM-VAR-049": { "type": "string", "enum": ["strict", "lenient"] },
+
+        /* -------- D. Ties (Included vs Excluded) -------- */
+        "VM-VAR-050": { "$ref": "#/$defs/tie_policy_enum", "$comment": "Included (FID)" },
+        "VM-VAR-052": { "$ref": "#/$defs/nonneg_int", "$comment": "tie_seed — Excluded (non-FID), optional" },
+
+        /* -------- E. Presentation toggles (Excluded; optional) -------- */
+        "VM-VAR-032": { "type": "string", "enum": ["unit_id", "label_priority", "turnout"] },
+        "VM-VAR-033": { "type": "string", "enum": ["auto", "always", "never"] },
+        "VM-VAR-034": { "$ref": "#/$defs/bool" },
+        "VM-VAR-035": { "$ref": "#/$defs/bool" },
+        "VM-VAR-060": { "$ref": "#/$defs/pct_int" },
+        "VM-VAR-061": { "$ref": "#/$defs/label_policy_enum" },
+        "VM-VAR-062": { "type": "string", "$comment": "\"auto\" or IETF language tag" },
+
+        /* -------- F. Variant (Included/FID) -------- */
+        "VM-VAR-073": { "type": "string", "$comment": "algorithm_variant — enum per release" }
+      },
+      "additionalProperties": false,
+      "$comment": "Every Included (FID) variable is required. Excluded variables (032–035, 052, 060–062) are optional. Booleans are real JSON booleans."
+    }
+  },
+  "additionalProperties": false,
+  "$comment": "Canonical JSON (UTF-8, LF, sorted keys). FID is computed from Included variables only; VM-VAR-052 (tie_seed) is Excluded and only echoed in RunRecord if a random tie actually occurred.",
+  "examples": [
+    {
+      "schema_version": "1.x",
+      "vars": {
+        "VM-VAR-001": "family_v1",
+        "VM-VAR-002": "half_up",
+        "VM-VAR-003": 3,
+        "VM-VAR-004": "standard",
+        "VM-VAR-005": "sum",
+        "VM-VAR-006": "none",
+        "VM-VAR-007": "winner_only",
+
+        "VM-VAR-010": 0,
+        "VM-VAR-011": 0,
+        "VM-VAR-012": 0,
+        "VM-VAR-013": 0,
+        "VM-VAR-014": 0,
+        "VM-VAR-015": 0,
+        "VM-VAR-016": 0,
+        "VM-VAR-017": 0,
+
+        "VM-VAR-020": 0,
+        "VM-VAR-021": "all_units",
+        "VM-VAR-022": 55,
+        "VM-VAR-023": 55,
+        "VM-VAR-024": true,
+        "VM-VAR-025": true,
+        "VM-VAR-026": 0,
+        "VM-VAR-027": 0,
+        "VM-VAR-028": 0,
+        "VM-VAR-029": [],
+        "VM-VAR-030": [{ "unit_id": "U-001", "mode": "include" }],
+        "VM-VAR-031": 0,
+
+        "VM-VAR-040": "none",
+        "VM-VAR-041": 0.0,
+        "VM-VAR-042": "apply_on_entry",
+        "VM-VAR-045": "deny",
+        "VM-VAR-046": {},
+        "VM-VAR-047": 0.0,
+        "VM-VAR-048": "none",
+        "VM-VAR-049": "strict",
+
+        "VM-VAR-050": "status_quo",
+        "VM-VAR-073": "v1",
+
+        "VM-VAR-052": 0,
+        "VM-VAR-032": "unit_id",
+        "VM-VAR-033": "auto",
+        "VM-VAR-034": true,
+        "VM-VAR-035": false,
+        "VM-VAR-060": 55,
+        "VM-VAR-061": "dynamic_margin",
+        "VM-VAR-062": "auto"
+      }
+    }
+  ]
+}

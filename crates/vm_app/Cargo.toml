@@ -1,0 +1,28 @@
+[package]
+name = "vm_app"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Desktop app wrapper (meta); backend is in src-tauri/"
+# This crate should not pull the backend automatically.
+# Build the app explicitly with: cargo build -p vm_app/src-tauri --locked
+# Keep resolver v2 for correct feature unification across the workspace.
+resolver = "2"
+
+[features]
+# Intentionally empty arrays: real behavior is implemented in src-tauri.
+# These names are mirrored there; enable features on the backend crate.
+default = []
+frontier = []
+report-html = []
+
+# No dependencies here on purpose — prevents tauri/network deps from being pulled
+# unless the backend crate is explicitly built.
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

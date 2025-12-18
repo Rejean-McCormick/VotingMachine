@@ -1,0 +1,31 @@
+[package]
+name = "vm_algo"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "Apache-2.0 OR MIT"
+description = "Algorithm layer: tabulation, seat allocation, gates/frontier; depends only on vm_core."
+# repository = "..."; readme = "README.md"
+
+[lib]
+name = "vm_algo"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+# Keep this crate algorithmic-only; features gate families without changing public types.
+default     = ["std", "tab_ranked", "tab_score", "pr_methods", "mmp", "gates", "frontier"]
+std         = []
+tab_ranked  = []
+tab_score   = []
+pr_methods  = []
+mmp         = []
+gates       = []
+frontier    = []
+
+[dependencies]
+vm_core = { path = "../vm_core" }  # RNG and rounding come from vm_core
+
+[dev-dependencies]
+proptest    = "1"      # property tests
+rand_chacha = "0.3"    # tests only; runtime RNG is vm_core::rng

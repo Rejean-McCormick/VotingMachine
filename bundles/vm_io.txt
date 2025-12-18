@@ -1,0 +1,1507 @@
+# bundle: vm_io
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_io/Cargo.toml
+--------------------------------------------------------------------------------
+[package]
+name = "vm_io"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+description = "Canonical JSON I/O, schema validation, and input digests for VM pipeline"
+repository = "https://example.invalid/repo"
+
+[features]
+# Keep these feature names for compatibility, but they do nothing now.
+# The corresponding crates are non-optional because they are used unconditionally in code.
+default = []
+path_utf8 = []
+hash = []
+serde = []
+
+[dependencies]
+camino = "1.1"                       # Utf8Path / Utf8PathBuf used in public structs
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"                   # used throughout canonical_json.rs, loader.rs, manifest.rs
+thiserror = "1.0"                    # error types in loader/manifest
+sha2 = "0.10"                        # verify_digests in manifest.rs
+digest = "0.10"                      # sha2 trait dependency; explicit for clarity
+itertools = "0.13"                   # if used by mapping/normalization helpers (retain if present)
+
+# If you have schema validation helpers or other internal crates, keep them here:
+# schemars = "0.8"                   # (only if actually used)
+# regex = "1"                        # (only if actually used)
+
+[dev-dependencies]
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_io/src/lib.rs
+--------------------------------------------------------------------------------
+//! crates/vm_io/src/lib.rs — Part 1/2
+//! Minimal, single-source-of-truth I/O crate.
+//!
+//! - No inline implementations: we re-export the **file modules** to avoid drift.
+//! - Shared error type (`IoError`) with `From` conversions used across modules.
+//! - Public surface kept stable; details live in submodules.
+//!
+//! Part 2 adds a small prelude and convenience re-exports.
+
+#![forbid(unsafe_code)]
+
+use std::fmt;
+
+use serde::{de::Error as _, Deserialize, Serialize};
+use thiserror::Error;
+
+/// Unified error for vm_io (used by canonical_json/manifest/hasher/schema).
+#[derive(Debug, Error)]
+pub enum IoError {
+    /// Filesystem / path errors (create_dir_all, rename, fsync, etc.)
+    #[error("io/path error: {0}")]
+    Path(String),
+
+    /// JSON serialization/deserialization errors with an optional JSON Pointer.
+    #[error("json error at {pointer}: {msg}")]
+    Json {
+        pointer: String,
+        msg: String,
+    },
+
+    /// Hashing-related errors (e.g., feature disabled, read failures).
+    #[error("hash error: {0}")]
+    Hash(String),
+
+    /// Schema-related errors (JSON Schema validation failures).
+    #[error("schema error: {0}")]
+    Schema(String),
+
+    /// Generic validation / invariants.
+    #[error("invalid: {0}")]
+    Invalid(String),
+}
+
+pub type IoResult<T> = Result<T, IoError>;
+
+/* ---------------- From conversions (used by file modules) ---------------- */
+
+impl From<std::io::Error> for IoError {
+    fn from(e: std::io::Error) -> Self {
+        IoError::Path(e.to_string())
+    }
+}
+
+impl From<serde_json::Error> for IoError {
+    fn from(e: serde_json::Error) -> Self {
+        // If available, include a pointer-like hint; serde_json doesn't keep a pointer,
+        // so we default to root. Callers may enrich this at higher layers.
+        IoError::Json {
+            pointer: "/".to_string(),
+            msg: e.to_string(),
+        }
+    }
+}
+
+/* ---------------- Public modules (single source of truth) ----------------
+   IMPORTANT: These correspond to files:
+     - src/canonical_json.rs
+     - src/hasher.rs
+     - src/manifest.rs
+     - src/schema.rs
+   Remove ALL inline duplicates to prevent drift.
+------------------------------------------------------------------------- */
+
+pub mod canonical_json;
+pub mod hasher;
+pub mod manifest;
+pub mod schema;
+//! crates/vm_io/src/lib.rs — Part 2/2
+//! Prelude & convenience wrappers. Keep this file minimal; real logic lives in submodules.
+
+#![forbid(unsafe_code)]
+
+use crate::IoError;
+
+/* ---------------- Convenience: fallible hash wrapper ----------------
+   Rationale: some historical implementations returned an empty string when the
+   `hash` feature was disabled. That’s dangerous. Callers should prefer this
+   wrapper, which fails loudly when hashing isn’t available.
+--------------------------------------------------------------------- */
+
+/// Compute SHA-256 hex of `bytes` or return an error when hashing is unavailable.
+pub fn try_sha256_hex(bytes: &[u8]) -> Result<String, IoError> {
+    #[cfg(feature = "hash")]
+    {
+        Ok(crate::hasher::sha256_hex(bytes))
+    }
+    #[cfg(not(feature = "hash"))]
+    {
+        Err(IoError::Hash("hash feature disabled".into()))
+    }
+}
+
+/* ---------------- Optional helper: strict URL detector ----------------
+   Manifest loading in this crate follows a strict offline posture.
+   Use this helper when you need to reject any "<scheme>://" path early.
+--------------------------------------------------------------------- */
+
+/// Returns true if `s` looks like a URL (any `<scheme>://`, including `file://`).
+#[inline]
+pub fn looks_like_url_strict(s: &str) -> bool {
+    s.trim().contains("://")
+}
+
+/* ---------------- Public prelude ----------------
+   Lightweight re-exports so downstream crates can do:
+     use vm_io::prelude::*;
+------------------------------------------------- */
+
+pub mod prelude {
+    pub use crate::{IoError, IoResult, looks_like_url_strict, try_sha256_hex};
+
+    // Re-export modules (callers can choose granular imports from here)
+    pub use crate::canonical_json;
+    pub use crate::hasher;
+    pub use crate::manifest;
+    pub use crate::schema;
+
+    // Commonly used items (stable symbols used across the workspace)
+    pub use crate::canonical_json::to_canonical_bytes;
+    #[cfg(feature = "hash")]
+    pub use crate::hasher::sha256_hex;
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_io/src/canonical_json.rs
+--------------------------------------------------------------------------------
+//! Canonical JSON utilities (vm_io)
+//! - Objects: keys sorted lexicographically (UTF-8 codepoint order)
+//! - Arrays: order preserved (caller is responsible for stable ordering)
+//! - Output: compact (no extra spaces, no trailing newline)
+//! - Atomic write: temp file in same dir + fsync(temp) + rename; fsync(dir) on Unix
+//! - Fallback: if rename fails (e.g., cross-device), write directly to target,
+//!   fsync(target), then remove temp, fsync(dir).
+
+#![allow(clippy::needless_borrow)]
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+#[cfg(feature = "serde")]
+use serde_json::Value;
+
+#[cfg(feature = "serde")]
+/// Convert a serde_json `Value` to canonical JSON bytes (compact, no trailing newline).
+pub fn to_canonical_json_bytes(v: &Value) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1024);
+    write_canonical_value(v, &mut out);
+    out
+}
+
+#[cfg(feature = "serde")]
+/// Write canonical JSON to `path` atomically (with safe cross-device fallback).
+pub fn write_canonical_file(path: &Path, v: &Value) -> io::Result<()> {
+    let bytes = to_canonical_json_bytes(v);
+
+    // Ensure parent directory exists.
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    fs::create_dir_all(parent)?;
+
+    // Create a unique temp next to the destination (same directory).
+    let tmp = make_unique_tmp_path(path);
+    let mut tf = OpenOptions::new()
+        .write(true)
+        .create_new(true) // avoid clobbering another writer's temp
+        .open(&tmp)?;
+
+    // Write and fsync the temp file.
+    tf.write_all(&bytes)?;
+    tf.sync_all()?;
+    drop(tf);
+
+    // Try atomic rename first.
+    match fs::rename(&tmp, path) {
+        Ok(()) => {
+            // On Unix, also fsync the directory to persist the rename.
+            let _ = fsync_dir(parent);
+            Ok(())
+        }
+        Err(_e) => {
+            // Fallback: write directly to the target (handles cross-device cases).
+            let res: io::Result<()> = (|| {
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)?;
+                f.write_all(&bytes)?;
+                f.sync_all()?;
+                Ok(())
+            })();
+
+            if let Err(err) = res {
+                let _ = fs::remove_file(&tmp); // best-effort cleanup on error
+                return Err(err);
+            }
+
+            // Best-effort cleanup of the temp file on success.
+            let _ = fs::remove_file(&tmp);
+
+            // On Unix, fsync the directory as well.
+            let _ = fsync_dir(parent);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(feature = "serde"))]
+#[inline]
+pub fn write_canonical_file(_path: &Path, _v: &()) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "serde feature disabled for vm_io:canonical_json",
+    ))
+}
+
+#[cfg(feature = "serde")]
+fn write_canonical_value(v: &Value, out: &mut Vec<u8>) {
+    match v {
+        Value::Null => out.extend_from_slice(b"null"),
+        Value::Bool(b) => {
+            if *b {
+                out.extend_from_slice(b"true");
+            } else {
+                out.extend_from_slice(b"false");
+            }
+        }
+        Value::Number(n) => out.extend_from_slice(n.to_string().as_bytes()),
+        Value::String(s) => {
+            // Use serde_json to produce a correctly escaped JSON string literal.
+            let quoted = serde_json::to_string(s).expect("string serialization cannot fail");
+            out.extend_from_slice(quoted.as_bytes());
+        }
+        Value::Array(arr) => {
+            out.push(b'[');
+            let mut first = true;
+            for elem in arr {
+                if !first {
+                    out.push(b',');
+                }
+                first = false;
+                write_canonical_value(elem, out);
+            }
+            out.push(b']');
+        }
+        Value::Object(map) => {
+            out.push(b'{');
+            // Collect & sort keys lexicographically.
+            let mut keys: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
+            let mut first = true;
+            for k in keys {
+                if !first {
+                    out.push(b',');
+                }
+                first = false;
+                // Key
+                let quoted_key = serde_json::to_string(k).expect("key serialization cannot fail");
+                out.extend_from_slice(quoted_key.as_bytes());
+                out.push(b':');
+                // Value
+                write_canonical_value(&map[k], out);
+            }
+            out.push(b'}');
+        }
+    }
+}
+
+/// Create a unique temp path next to `target`: "<filename>.<pid>.<counter>.tmp"
+fn make_unique_tmp_path(target: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let pid = std::process::id();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let fname = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+
+    let tmp_name: OsString = OsString::from(format!("{fname}.{pid}.{n}.tmp"));
+
+    match target.parent() {
+        Some(dir) => dir.join(tmp_name),
+        None => PathBuf::from(tmp_name),
+    }
+}
+
+/// Fsync the directory containing the file (Unix only). No-op on other platforms.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    // Portable approach: open the directory for reading and sync it.
+    let df = OpenOptions::new().read(true).open(dir)?;
+    df.sync_all()
+}
+
+#[cfg(not(unix))]
+#[inline]
+fn fsync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+#[cfg(feature = "serde")]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn objects_are_sorted_arrays_preserved() {
+        let v = json!({
+            "b": 1,
+            "a": { "y": 1, "x": 2 },
+            "arr": [ {"k":2,"j":1}, 3, "z" ]
+        });
+        let s = String::from_utf8(to_canonical_json_bytes(&v)).unwrap();
+        assert_eq!(
+            s,
+            r#"{"a":{"x":2,"y":1},"arr":[{"j":1,"k":2},3,"z"],"b":1}"#
+        );
+    }
+
+    #[test]
+    fn no_trailing_newline() {
+        let v = json!({"a":1});
+        let bytes = to_canonical_json_bytes(&v);
+        assert!(!bytes.ends_with(b"\n"), "must not end with newline");
+    }
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_io/src/manifest.rs
+--------------------------------------------------------------------------------
+// crates/vm_io/src/manifest.rs — Part 1/2 (final patched)
+//
+// Scope of this half:
+// - Types (external Manifest, ResolvedManifest, optional digests/expectations)
+// - Error enum
+// - Helpers (scheme/hex/path utils)
+// - Validation of external manifest (shape & offline policy)
+// - Path resolution + existence/type checks (S0 preconditions)
+//
+// Alignment with the 10 refs (Docs 1–7 + Annexes A–C):
+// • S0 inputs are paths only: registry, tally, params (Doc 5B).
+// • Optional inputs: adjacency, autonomy (if supported).
+// • Offline-only: reject any path with a scheme ("://", "http:", "https:") (Doc 3).
+// • No legacy `ballots_path`: the canonical input is *tally*. We do NOT accept aliases.
+// • `id` is NOT required by spec; optional and ignored by canonical artifacts.
+// • Digests (if provided) must be 64-lower-hex and only for present inputs.
+// • Required inputs must exist and be files (not dirs).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+/// External manifest accepted by the loader.
+///
+/// `id` is optional and non-normative (not used in any canonical artifact).
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct Manifest {
+    /// Optional user-provided manifest identifier (non-normative).
+    pub id: Option<String>,
+
+    /// Required input paths (commonly relative to the manifest’s directory).
+    pub reg_path: String,
+    pub params_path: String,
+    pub ballot_tally_path: String,
+
+    /// Optional inputs.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub adjacency_path: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub autonomy_path: Option<String>,
+
+    /// Optional sha256 digests for inputs (lowercase 64-hex). If present,
+    /// verification happens over canonical JSON bytes (Part 2).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub inputs_sha256: Option<InputDigests>,
+
+    /// Optional expectations (engine/formula) — enforced in Part 2.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub expect: Option<Expectations>,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct InputDigests {
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub reg_path: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub params_path: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ballot_tally_path: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub adjacency_path: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub autonomy_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Expectations {
+    /// Expected engine version string (exact match).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub engine_version: Option<String>,
+    /// Expected formula ID (lowercase 64-hex).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub formula_id_hex: Option<String>,
+}
+
+/// Paths resolved against a base directory (usually the manifest’s dir).
+#[derive(Debug, Clone)]
+pub struct ResolvedManifest {
+    pub reg_path: PathBuf,
+    pub params_path: PathBuf,
+    pub ballot_tally_path: PathBuf,
+    pub adjacency_path: Option<PathBuf>,
+    pub autonomy_path: Option<PathBuf>,
+    pub digests: Option<InputDigests>,
+    pub expect: Option<Expectations>,
+}
+
+/// Loader/validation errors.
+#[derive(Debug)]
+pub enum ManifestError {
+    Missing(&'static str),
+    Empty(&'static str),
+    UrlPath(&'static str, String),
+    Io(&'static str, String),
+    NotAFile(&'static str, String),
+    /// Bad hex format / shape (used for 64-hex checks, not mismatches).
+    DigestShape(&'static str, String),
+    /// Provided digest doesn’t match computed canonical sha256.
+    DigestMismatch(&'static str, String),
+    /// Expectation (engine/formula) mismatch (used in Part 2).
+    ExpectationMismatch(&'static str, String),
+    /// Digest provided for an input that is not present in the manifest.
+    DigestForMissing(&'static str),
+}
+
+impl std::fmt::Display for ManifestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use ManifestError::*;
+        match self {
+            Missing(k) => write!(f, "missing required field: {}", k),
+            Empty(k) => write!(f, "field must not be empty: {}", k),
+            UrlPath(k, v) => write!(f, "path must be offline (no scheme) for {}: {}", k, v),
+            Io(k, v) => write!(f, "cannot access {}: {}", k, v),
+            NotAFile(k, v) => write!(f, "path is not a file for {}: {}", k, v),
+            DigestShape(k, v) => write!(f, "invalid sha256 format for {}: {}", k, v),
+            DigestMismatch(k, v) => write!(f, "sha256 mismatch for {}: {}", k, v),
+            ExpectationMismatch(k, v) => write!(f, "expectation mismatch for {}: {}", k, v),
+            DigestForMissing(k) => write!(f, "digest supplied for missing input: {}", k),
+        }
+    }
+}
+impl std::error::Error for ManifestError {}
+
+// ---------- helpers (pure) ----------
+
+#[inline]
+fn has_any_scheme(s: &str) -> bool {
+    // Generic scheme detection plus explicit http(s).
+    s.contains("://") || s.starts_with("http:") || s.starts_with("https:")
+}
+
+#[inline]
+fn is_lower_hex_64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| (b'0'..=b'9').contains(&b) || (b'a'..=b'f').contains(&b))
+}
+
+#[inline]
+fn join_under(base: &Path, rel: &str) -> PathBuf {
+    let p = Path::new(rel);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    }
+}
+
+// ---------- validation (shape, offline, digests present only for present paths) ----------
+
+/// Validate manifest *shape* and offline path policy. Does not perform I/O.
+/// Call `resolve_paths` afterwards to resolve and existence-check.
+pub fn validate_manifest(man: &Manifest) -> Result<(), ManifestError> {
+    // Required strings present and non-empty
+    if man.reg_path.is_empty() {
+        return Err(ManifestError::Empty("reg_path"));
+    }
+    if man.params_path.is_empty() {
+        return Err(ManifestError::Empty("params_path"));
+    }
+    if man.ballot_tally_path.is_empty() {
+        return Err(ManifestError::Empty("ballot_tally_path"));
+    }
+
+    // Offline-only for all present path fields
+    offline_check("reg_path", &man.reg_path)?;
+    offline_check("params_path", &man.params_path)?;
+    offline_check("ballot_tally_path", &man.ballot_tally_path)?;
+    if let Some(s) = &man.adjacency_path {
+        if s.is_empty() {
+            return Err(ManifestError::Empty("adjacency_path"));
+        }
+        offline_check("adjacency_path", s)?;
+    }
+    if let Some(s) = &man.autonomy_path {
+        if s.is_empty() {
+            return Err(ManifestError::Empty("autonomy_path"));
+        }
+        offline_check("autonomy_path", s)?;
+    }
+
+    // Digests (if any): lowercase 64-hex and only for present inputs
+    if let Some(d) = &man.inputs_sha256 {
+        if let Some(h) = &d.reg_path {
+            if !is_lower_hex_64(h) {
+                return Err(ManifestError::DigestShape("reg_path", h.clone()));
+            }
+        }
+        if let Some(h) = &d.params_path {
+            if !is_lower_hex_64(h) {
+                return Err(ManifestError::DigestShape("params_path", h.clone()));
+            }
+        }
+        if let Some(h) = &d.ballot_tally_path {
+            if !is_lower_hex_64(h) {
+                return Err(ManifestError::DigestShape("ballot_tally_path", h.clone()));
+            }
+        }
+        if let Some(h) = &d.adjacency_path {
+            if man.adjacency_path.is_none() {
+                return Err(ManifestError::DigestForMissing("adjacency_path"));
+            }
+            if !is_lower_hex_64(h) {
+                return Err(ManifestError::DigestShape("adjacency_path", h.clone()));
+            }
+        }
+        if let Some(h) = &d.autonomy_path {
+            if man.autonomy_path.is_none() {
+                return Err(ManifestError::DigestForMissing("autonomy_path"));
+            }
+            if !is_lower_hex_64(h) {
+                return Err(ManifestError::DigestShape("autonomy_path", h.clone()));
+            }
+        }
+    }
+
+    // Expectations (if present): basic format checks here; strict checks in Part 2
+    if let Some(exp) = &man.expect {
+        if let Some(fid) = &exp.formula_id_hex {
+            if !is_lower_hex_64(fid) {
+                return Err(ManifestError::DigestShape("formula_id_hex", fid.clone()));
+            }
+        }
+        // engine_version is free-form (exact match enforced in Part 2 if provided)
+        let _ = &exp.engine_version;
+    }
+
+    Ok(())
+}
+
+fn offline_check(label: &'static str, path: &str) -> Result<(), ManifestError> {
+    if has_any_scheme(path) {
+        return Err(ManifestError::UrlPath(label, path.to_string()));
+    }
+    Ok(())
+}
+
+// ---------- resolution (join base + existence/type checks) ----------
+
+/// Resolve manifest paths under `base_dir` (usually the directory of the manifest file),
+/// ensure required inputs exist and are files, and return a `ResolvedManifest`.
+///
+/// This performs *no* hashing or schema validation; Part 2 handles those steps.
+pub fn resolve_paths(base_dir: &Path, man: &Manifest) -> Result<ResolvedManifest, ManifestError> {
+    let reg = join_under(base_dir, &man.reg_path);
+    let params = join_under(base_dir, &man.params_path);
+    let tally = join_under(base_dir, &man.ballot_tally_path);
+    let adj = man.adjacency_path.as_ref().map(|s| join_under(base_dir, s));
+    let aut = man.autonomy_path.as_ref().map(|s| join_under(base_dir, s));
+
+    // Existence/type checks for required files
+    must_exist_file("reg_path", &reg)?;
+    must_exist_file("params_path", &params)?;
+    must_exist_file("ballot_tally_path", &tally)?;
+
+    // Optional files (if provided)
+    if let Some(p) = &adj {
+        must_exist_file("adjacency_path", p)?;
+    }
+    if let Some(p) = &aut {
+        must_exist_file("autonomy_path", p)?;
+    }
+
+    Ok(ResolvedManifest {
+        reg_path: reg,
+        params_path: params,
+        ballot_tally_path: tally,
+        adjacency_path: adj,
+        autonomy_path: aut,
+        digests: man.inputs_sha256.clone(),
+        expect: man.expect.clone(),
+    })
+}
+
+fn must_exist_file(label: &'static str, p: &Path) -> Result<(), ManifestError> {
+    let md = fs::metadata(p).map_err(|e| ManifestError::Io(label, format!("{} ({e})", p.display())))?;
+    if !md.is_file() {
+        return Err(ManifestError::NotAFile(label, p.display().to_string()));
+    }
+    Ok(())
+}
+
+// crates/vm_io/src/manifest.rs — Part 2/2 (final patched)
+//
+// Scope of this half:
+// - Canonical-JSON hashing (feature-gated: `hash`)
+// - Digest verification over *canonical* bytes
+// - Expectations enforcement (engine/formula)
+// - Public entrypoints to load → validate → resolve → verify
+//
+// Notes:
+// • Hashes are computed over canonical JSON (sorted keys, UTF-8) per Docs 1/Annex B.
+// • If `hash` feature is disabled, digest verification returns an error.
+// • Expectation mismatches return `ExpectationMismatch`.
+
+#[cfg(feature = "serde")]
+use serde_json::{self as json, Value as Json};
+
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+// ---------------------------- canonical JSON ----------------------------
+
+#[cfg(feature = "serde")]
+fn canonicalize_json(v: &Json) -> Json {
+    use json::map::Map;
+    match v {
+        Json::Null | Json::Bool(_) | Json::Number(_) | Json::String(_) => v.clone(),
+        Json::Array(a) => Json::Array(a.iter().map(canonicalize_json).collect()),
+        Json::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let mut out = Map::new();
+            for k in keys {
+                out.insert(k.clone(), canonicalize_json(&m[k]));
+            }
+            Json::Object(out)
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+fn canonical_json_bytes_from_file(p: &Path) -> Result<Vec<u8>, super::ManifestError> {
+    let mut buf = Vec::new();
+    let mut f = fs::File::open(p)
+        .map_err(|e| super::ManifestError::Io("read", format!("{} ({e})", p.display())))?;
+    f.read_to_end(&mut buf)
+        .map_err(|e| super::ManifestError::Io("read", format!("{} ({e})", p.display())))?;
+    let v: Json = json::from_slice(&buf)
+        .map_err(|e| super::ManifestError::Io("parse", format!("{} ({e})", p.display())))?;
+    let canon = canonicalize_json(&v);
+    let s =
+        json::to_string(&canon).map_err(|e| super::ManifestError::Io("canonicalize", format!("{e}")))?;
+    Ok(s.into_bytes())
+}
+
+#[cfg(feature = "hash")]
+fn sha256_hex(bytes: &[u8]) -> Result<String, super::ManifestError> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let d = h.finalize();
+    let mut out = String::with_capacity(64);
+    for b in d {
+        out.push("0123456789abcdef".as_bytes()[(b >> 4) as usize] as char);
+        out.push("0123456789abcdef".as_bytes()[(b & 0x0F) as usize] as char);
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "hash"))]
+fn sha256_hex(_bytes: &[u8]) -> Result<String, super::ManifestError> {
+    Err(super::ManifestError::Io(
+        "hash",
+        "sha256 requested but `hash` feature is disabled".to_string(),
+    ))
+}
+
+// ---------------------------- digests & expectations ----------------------------
+
+/// Verify provided digests over **canonical JSON** bytes.
+/// Only verifies keys that are present both in `digests` and as actual paths.
+/// Returns `Ok(())` when no digests were provided.
+pub fn verify_digests(resolved: &super::ResolvedManifest) -> Result<(), super::ManifestError> {
+    let Some(d) = &resolved.digests else { return Ok(()); };
+
+    #[cfg(feature = "serde")]
+    fn check_one(path: &Path, expect_hex: &str, label: &'static str) -> Result<(), super::ManifestError> {
+        let canon = canonical_json_bytes_from_file(path)?;
+        let got = sha256_hex(&canon)?;
+        if got != expect_hex {
+            return Err(super::ManifestError::DigestMismatch(
+                label,
+                format!("expected={} got={}", expect_hex, got),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "serde"))]
+    fn check_one(_path: &Path, _expect_hex: &str, _label: &'static str) -> Result<(), super::ManifestError> {
+        Err(super::ManifestError::Io(
+            "serde",
+            "digest verification requires `serde` feature".to_string(),
+        ))
+    }
+
+    if let Some(ref hex) = d.reg_path {
+        check_one(&resolved.reg_path, hex, "reg_path")?;
+    }
+    if let Some(ref hex) = d.params_path {
+        check_one(&resolved.params_path, hex, "params_path")?;
+    }
+    if let Some(ref hex) = d.ballot_tally_path {
+        check_one(&resolved.ballot_tally_path, hex, "ballot_tally_path")?;
+    }
+    if let (Some(ref p), Some(ref hex)) = (&resolved.adjacency_path, &d.adjacency_path) {
+        check_one(p, hex, "adjacency_path")?;
+    } else if d.adjacency_path.is_some() && resolved.adjacency_path.is_none() {
+        return Err(super::ManifestError::DigestForMissing("adjacency_path"));
+    }
+    if let (Some(ref p), Some(ref hex)) = (&resolved.autonomy_path, &d.autonomy_path) {
+        check_one(p, hex, "autonomy_path")?;
+    } else if d.autonomy_path.is_some() && resolved.autonomy_path.is_none() {
+        return Err(super::ManifestError::DigestForMissing("autonomy_path"));
+    }
+
+    Ok(())
+}
+
+/// Enforce expectations (engine version / formula id) if provided.
+pub fn enforce_expectations(
+    resolved: &super::ResolvedManifest,
+    actual_engine_version: &str,
+    actual_formula_id_hex: &str,
+) -> Result<(), super::ManifestError> {
+    let Some(exp) = &resolved.expect else { return Ok(()); };
+
+    if let Some(want) = &exp.engine_version {
+        if want != actual_engine_version {
+            return Err(super::ManifestError::ExpectationMismatch(
+                "engine_version",
+                format!("expected={} got={}", want, actual_engine_version),
+            ));
+        }
+    }
+
+    if let Some(want_fid) = &exp.formula_id_hex {
+        if want_fid != actual_formula_id_hex {
+            return Err(super::ManifestError::ExpectationMismatch(
+                "formula_id_hex",
+                format!("expected={} got={}", want_fid, actual_formula_id_hex),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------- top-level load/verify ----------------------------
+
+const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024; // align with CLI quick-check (4 MiB)
+
+/// Load a manifest JSON from `manifest_path`, validate, resolve under its directory,
+/// and return a `ResolvedManifest`. This does **not** verify digests or expectations.
+#[cfg(feature = "serde")]
+pub fn load_and_resolve_manifest(manifest_path: &Path) -> Result<super::ResolvedManifest, super::ManifestError> {
+    let mut f = fs::File::open(manifest_path)
+        .map_err(|e| super::ManifestError::Io("read", format!("{} ({e})", manifest_path.display())))?;
+    let mut buf = Vec::new();
+    f.by_ref()
+        .take(MAX_MANIFEST_BYTES as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| super::ManifestError::Io("read", format!("{} ({e})", manifest_path.display())))?;
+
+    let man: super::Manifest = serde_json::from_slice(&buf)
+        .map_err(|e| super::ManifestError::Io("parse", format!("{} ({e})", manifest_path.display())))?;
+
+    super::validate_manifest(&man)?;
+
+    let base = manifest_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    super::resolve_paths(&base, &man)
+}
+
+/// Convenience: full load+verify pipeline.
+/// - Loads/validates/resolves the manifest.
+/// - Verifies input digests if present (over canonical JSON).
+/// - Enforces expectations if present.
+#[cfg(feature = "serde")]
+pub fn load_verify_manifest(
+    manifest_path: &Path,
+    actual_engine_version: &str,
+    actual_formula_id_hex: &str,
+) -> Result<super::ResolvedManifest, super::ManifestError> {
+    let resolved = load_and_resolve_manifest(manifest_path)?;
+    verify_digests(&resolved)?;
+    enforce_expectations(&resolved, actual_engine_version, actual_formula_id_hex)?;
+    Ok(resolved)
+}
+
+#[cfg(not(feature = "serde"))]
+pub fn load_and_resolve_manifest(_manifest_path: &Path) -> Result<super::ResolvedManifest, super::ManifestError> {
+    Err(super::ManifestError::Io(
+        "serde",
+        "manifest loading requires `serde` feature".to_string(),
+    ))
+}
+
+#[cfg(not(feature = "serde"))]
+pub fn load_verify_manifest(
+    _manifest_path: &Path,
+    _actual_engine_version: &str,
+    _actual_formula_id_hex: &str,
+) -> Result<super::ResolvedManifest, super::ManifestError> {
+    Err(super::ManifestError::Io(
+        "serde",
+        "manifest loading requires `serde` feature".to_string(),
+    ))
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_io/src/hasher.rs
+--------------------------------------------------------------------------------
+//! crates/vm_io/src/hasher.rs
+//!
+//! Deterministic hashing and ID builders for canonical artifacts.
+//!
+//! Aligned with the 7 docs + 3 annexes:
+//! - Canonical JSON hashing: UTF-8, LF, **sorted object keys**, array order preserved.
+//! - IDs derive from canonical bytes: `RES:` (result), `FR:` (frontier map), and
+//!   `RUN:` uses an RFC3339-UTC timestamp plus a hash of canonical run bytes.
+//! - Hex digests are **lowercase**; no feature-gated fallbacks (always-on).
+//!
+//! Important distinctions:
+//! - Use `sha256_canonical(..)` for JSON **values/structs** (goes through canonical_json).
+//! - Use `sha256_hex(..)`, `sha256_stream(..)`, or `sha256_file(..)` for **raw bytes/files**.
+//!
+//! Notes on Normative Manifest (FID):
+//! - `nm_digest_from_value` assumes the **caller** provides only the *Included* variables
+//!   per Annex A (excludes presentation toggles and RNG seed).
+//! - If you want a safer helper, use `nm_digest_from_included_keys(value, &keys)`.
+
+#![forbid(unsafe_code)]
+
+use std::fs::File;
+use std::io::{Read, BufReader};
+use std::path::Path;
+
+use serde::Serialize;
+use serde_json::{self as sj, Value};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+// Use the canonicalization utilities provided by this crate.
+use crate::canonical_json::canonical_json_bytes;
+
+/* ----------------------------------- Errors ----------------------------------- */
+
+#[derive(Error, Debug)]
+pub enum HashError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("JSON serialization error: {0}")]
+    Serde(#[from] sj::Error),
+
+    #[error("canonicalization error: {0}")]
+    Canonical(String),
+
+    #[error("invalid hex (expected lowercase 64-hex): {0}")]
+    InvalidHex(String),
+
+    #[error("invalid timestamp (expected RFC3339 UTC like 2025-08-12T10:00:00Z): {0}")]
+    InvalidTimestamp(String),
+}
+
+/* ---------------------------------- Helpers ---------------------------------- */
+
+/// Encode bytes as **lowercase** hex without external deps.
+fn to_lower_hex(bytes: &[u8]) -> String {
+    const LUT: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(LUT[(b >> 4) as usize] as char);
+        out.push(LUT[(b & 0x0F) as usize] as char);
+    }
+    out
+}
+
+/// Validate a lowercase 64-hex string and optionally shorten to `n` chars.
+fn short_hex(hex64: &str, n: usize) -> Result<String, HashError> {
+    if hex64.len() != 64 || !hex64.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(HashError::InvalidHex(hex64.to_string()));
+    }
+    Ok(hex64[..n.min(64)].to_string())
+}
+
+/* -------------------------- Canonicalization bridge -------------------------- */
+
+/// Convert any serializable value to **canonical JSON bytes** by first
+/// converting to `serde_json::Value` and then delegating to `canonical_json_bytes`.
+fn to_canon_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, HashError> {
+    let v = sj::to_value(value)?;
+    canonical_json_bytes(&v).map_err(|e| HashError::Canonical(e.to_string()))
+}
+
+/* ---------------------------- Canonical hashing ---------------------------- */
+
+/// SHA-256 over **canonical JSON bytes** of any serializable value.
+pub fn sha256_canonical<T: Serialize>(value: &T) -> Result<String, HashError> {
+    let bytes = to_canon_bytes(value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(to_lower_hex(&hasher.finalize()))
+}
+
+/// SHA-256 over **canonical JSON Value** (already parsed).
+pub fn sha256_canonical_value(v: &Value) -> Result<String, HashError> {
+    let bytes = canonical_json_bytes(v).map_err(|e| HashError::Canonical(e.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(to_lower_hex(&hasher.finalize()))
+}
+
+/* ------------------------------- Raw hashing ------------------------------- */
+
+/// SHA-256 over raw bytes.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    to_lower_hex(&hasher.finalize())
+}
+
+/// SHA-256 over a reader stream (raw, not canonicalized).
+pub fn sha256_stream<R: Read>(reader: &mut R) -> Result<String, HashError> {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024]; // 256 KiB buffer
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Ok(to_lower_hex(&hasher.finalize()))
+}
+
+/// SHA-256 over a file’s raw bytes.
+pub fn sha256_file(path: &Path) -> Result<String, HashError> {
+    let f = File::open(path)?;
+    let mut r = BufReader::new(f);
+    sha256_stream(&mut r)
+}
+
+/* ---------------------------- Artifact ID builders ---------------------------- */
+
+/// `RES:<hex>` — ID for `result.json` derived from **canonical** bytes.
+pub fn res_id_from_canonical<T: Serialize>(value: &T) -> Result<String, HashError> {
+    let hex = sha256_canonical(value)?;
+    Ok(format!("RES:{hex}"))
+}
+
+/// `FR:<hex>` — ID for `frontier_map.json` derived from **canonical** bytes.
+pub fn fr_id_from_canonical<T: Serialize>(value: &T) -> Result<String, HashError> {
+    let hex = sha256_canonical(value)?;
+    Ok(format!("FR:{hex}"))
+}
+
+/* --------------------------------- RUN IDs --------------------------------- */
+
+/// Normalize a timestamp to canonical RFC3339 UTC seconds with trailing `Z`.
+/// Accepts:
+///   • `YYYY-MM-DDTHH:MM:SSZ`
+///   • `YYYY-MM-DDTHH:MM:SS.ssssssZ` (fractional seconds)
+///   • `YYYY-MM-DDTHH:MM:SS[.sss]±00:00` (normalized to `Z`)
+fn normalize_rfc3339_utc_seconds(ts: &str) -> Result<String, HashError> {
+    // Minimal strict parser: YYYY-MM-DDTHH:MM:SS[.frac](Z|+00:00|-00:00)
+    if ts.len() < 20 { return Err(HashError::InvalidTimestamp(ts.to_string())); }
+
+    // Core "YYYY-MM-DDTHH:MM:SS"
+    let (y, m, d, hh, mm, ss) = {
+        let y = ts.get(0..4).ok_or_else(|| HashError::InvalidTimestamp(ts.into()))?
+            .parse::<i32>().map_err(|_| HashError::InvalidTimestamp(ts.into()))?;
+        if &ts[4..5] != "-" { return Err(HashError::InvalidTimestamp(ts.into())); }
+        let m = ts.get(5..7).ok_or_else(|| HashError::InvalidTimestamp(ts.into()))?
+            .parse::<u32>().map_err(|_| HashError::InvalidTimestamp(ts.into()))?;
+        if &ts[7..8] != "-" { return Err(HashError::InvalidTimestamp(ts.into())); }
+        let d = ts.get(8..10).ok_or_else(|| HashError::InvalidTimestamp(ts.into()))?
+            .parse::<u32>().map_err(|_| HashError::InvalidTimestamp(ts.into()))?;
+        if &ts[10..11] != "T" { return Err(HashError::InvalidTimestamp(ts.into())); }
+        let hh = ts.get(11..13).ok_or_else(|| HashError::InvalidTimestamp(ts.into()))?
+            .parse::<u32>().map_err(|_| HashError::InvalidTimestamp(ts.into()))?;
+        if &ts[13..14] != ":" { return Err(HashError::InvalidTimestamp(ts.into())); }
+        let mm = ts.get(14..16).ok_or_else(|| HashError::InvalidTimestamp(ts.into()))?
+            .parse::<u32>().map_err(|_| HashError::InvalidTimestamp(ts.into()))?;
+        if &ts[16..17] != ":" { return Err(HashError::InvalidTimestamp(ts.into())); }
+        let ss = ts.get(17..19).ok_or_else(|| HashError::InvalidTimestamp(ts.into()))?
+            .parse::<u32>().map_err(|_| HashError::InvalidTimestamp(ts.into()))?;
+        (y, m, d, hh, mm, ss)
+    };
+
+    // Basic range checks (not full calendar validation)
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 59 {
+        return Err(HashError::InvalidTimestamp(ts.into()));
+    }
+
+    // Optional fractional seconds
+    let mut idx = 19;
+    if ts.get(idx..idx+1) == Some(".") {
+        // consume 1..9 fractional digits
+        idx += 1;
+        let start = idx;
+        while idx < ts.len() && ts.as_bytes()[idx].is_ascii_digit() {
+            idx += 1;
+            if idx - start > 9 { break; }
+        }
+        if idx == start {
+            return Err(HashError::InvalidTimestamp(ts.into()));
+        }
+    }
+
+    // Suffix: Z or ±00:00
+    let suffix = ts.get(idx..).ok_or_else(|| HashError::InvalidTimestamp(ts.into()))?;
+    let ok = matches!(suffix, "Z" | "+00:00" | "-00:00");
+    if !ok {
+        return Err(HashError::InvalidTimestamp(ts.into()));
+    }
+
+    Ok(format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z"))
+}
+
+/// `RUN:<timestamp>Z:<hex>` — ID for `run_record.json`.
+/// `timestamp_utc` must be RFC3339 UTC; it is normalized to seconds + `Z`.
+/// `run_bytes_canonical` must be canonical bytes of the run record payload you include in the ID.
+pub fn run_id_from_bytes(timestamp_utc: &str, run_bytes_canonical: &[u8]) -> Result<String, HashError> {
+    let ts = normalize_rfc3339_utc_seconds(timestamp_utc)?;
+    let mut hasher = Sha256::new();
+    hasher.update(run_bytes_canonical);
+    let hex = to_lower_hex(&hasher.finalize());
+    Ok(format!("RUN:{ts}:{hex}"))
+}
+
+/// Convenience: build a RUN id from a serializable run payload (canonicalized internally).
+pub fn run_id_from_canonical<T: Serialize>(timestamp_utc: &str, run_value: &T) -> Result<String, HashError> {
+    let bytes = to_canon_bytes(run_value)?;
+    run_id_from_bytes(timestamp_utc, &bytes)
+}
+
+/* ------------------------- Normative Manifest (FID) ------------------------- */
+
+/// Compute the digest of the **Normative Manifest** (caller must supply only *Included* vars).
+/// If you need filtering, see `nm_digest_from_included_keys`.
+pub fn nm_digest_from_value(nm_value_included_only: &Value) -> Result<String, HashError> {
+    sha256_canonical_value(nm_value_included_only)
+}
+
+/// Safer helper: filter a flat JSON object to the provided `included_keys` before hashing.
+/// - Keys not in `included_keys` are dropped.
+/// - Values are copied as-is (assumed deterministic/primitive).
+pub fn nm_digest_from_included_keys(value: &Value, included_keys: &[&str]) -> Result<String, HashError> {
+    let obj = value.as_object().ok_or_else(|| {
+        HashError::Serde(sj::Error::custom("normative manifest must be a JSON object"))
+    })?;
+    let set: std::collections::BTreeSet<&str> = included_keys.iter().copied().collect();
+    let mut filtered = sj::Map::new();
+    for (k, v) in obj {
+        if set.contains(k.as_str()) {
+            filtered.insert(k.clone(), v.clone());
+        }
+    }
+    sha256_canonical_value(&Value::Object(filtered))
+}
+
+/* ------------------------------------ Tests ------------------------------------ */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Serialize;
+    use serde_json::json;
+
+    #[test]
+    fn hex_encoding_is_lowercase() {
+        let h = sha256_hex(b"abc");
+        assert_eq!(h, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert!(short_hex(&h, 12).unwrap().chars().all(|c| c.is_ascii_hexdigit() && c.is_lowercase()));
+    }
+
+    #[test]
+    fn canonical_hashing_is_stable() {
+        #[derive(Serialize)]
+        struct T { b: u32, a: u32 }
+        let t = T { b: 2, a: 1 };
+        let h1 = sha256_canonical(&t).unwrap();
+        // same fields different order through Value, should match
+        let v = json!({"b":2,"a":1});
+        let h2 = sha256_canonical_value(&v).unwrap();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn run_id_normalizes_timestamp_and_fractional() {
+        let id1 = run_id_from_bytes("2025-08-12T10:00:00Z", b"payload").unwrap();
+        let id2 = run_id_from_bytes("2025-08-12T10:00:00.123Z", b"payload").unwrap();
+        let id3 = run_id_from_bytes("2025-08-12T10:00:00+00:00", b"payload").unwrap();
+        let id4 = run_id_from_bytes("2025-08-12T10:00:00-00:00", b"payload").unwrap();
+        assert_eq!(id1, id2);
+        assert_eq!(id1, id3);
+        assert_eq!(id1, id4);
+        assert!(id1.starts_with("RUN:2025-08-12T10:00:00Z:"));
+    }
+
+    #[test]
+    fn nm_digest_filtering() {
+        let v = json!({"050":"deterministic_order","052":52,"032":true,"x":"ignore"});
+        let h_all = nm_digest_from_value(&v).unwrap();
+        let h_inc = nm_digest_from_included_keys(&v, &["050"]).unwrap();
+        assert_ne!(h_all, h_inc); // filtering changed the digest
+    }
+}
+
+--------------------------------------------------------------------------------
+FILE: crates/vm_io/src/loader.rs
+--------------------------------------------------------------------------------
+//! crates/vm_io/src/loader.rs — Part 1/2 (fixed)
+//! High-level, **offline** JSON loaders with schema checks, size limits, and raw-byte digests.
+//!
+//! Alignment with Docs 1–7 + Annex A/B/C:
+//! - Resolve manifest-relative paths from the **manifest file’s directory**
+//! - Reject any URL-like path (any `<scheme>://`, plus `file:`/`data:` forms) for strict offline posture
+//! - Apply JSON Schema (Draft 2020-12) when the `schemaval` feature is enabled
+//! - Enforce bounded reads on untrusted files
+//! - Compute SHA-256 over **raw file bytes** for input digests (no JSON reformatting)
+//!
+//! Part 2 adds composition (`load_all`), expectation checks, and the bundle types.
+
+#![forbid(unsafe_code)]
+
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use crate::{IoError, IoResult};
+use crate::manifest::{Manifest, ResolvedPaths};
+
+use vm_core::{DivisionRegistry, Params};
+
+#[cfg(feature = "serde")]
+use serde_json::Value;
+
+/* ---------- constants ---------- */
+
+/// Maximum bytes allowed for any single JSON input (registry/params/tally).
+const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024; // 8 MiB
+
+/* ---------- helpers: strict offline, size-bounded reads, schema ---------- */
+
+/// Return true if `s` looks like a URL in a way we must reject for strict offline posture.
+/// - Matches `<scheme>://...` where scheme = `[A-Za-z][A-Za-z0-9+.-]*`
+/// - Also rejects `file:` and `data:` even without `//`
+/// - Intentionally does **not** match Windows drive letters like `C:\...`
+#[inline]
+fn looks_like_url_strict(s: &str) -> bool {
+    let t = s.trim();
+    if t.starts_with("file:") || t.starts_with("data:") {
+        return true;
+    }
+    if let Some(pos) = t.find("://") {
+        let scheme = &t[..pos];
+        if !scheme.is_empty()
+            && scheme.chars().next().unwrap().is_ascii_alphabetic()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn ensure_offline_path(path: &Path) -> IoResult<()> {
+    let s = path.to_string_lossy();
+    if looks_like_url_strict(&s) {
+        return Err(IoError::Invalid(format!("URL-like path is not allowed: {s}")));
+    }
+    Ok(())
+}
+
+/// Read a JSON file to `serde_json::Value` with a size cap and basic UTF-8 enforcement.
+#[cfg(feature = "serde")]
+fn read_json_value_bounded(path: &Path) -> IoResult<Value> {
+    let meta = fs::metadata(path)?;
+    if meta.len() > MAX_JSON_BYTES {
+        return Err(IoError::Invalid("file too large".into()));
+    }
+    let mut f = fs::File::open(path)?;
+    let mut s = String::with_capacity(meta.len().min(1_000_000) as usize);
+    f.read_to_string(&mut s)?;
+    let v: Value = serde_json::from_str(&s)?;
+    Ok(v)
+}
+
+#[cfg(not(feature = "serde"))]
+#[allow(unused_variables)]
+fn read_json_value_bounded(_path: &Path) -> IoResult<()> {
+    Err(IoError::Canon("serde feature disabled".into()))
+}
+
+#[cfg(feature = "schemaval")]
+#[inline]
+fn validate_schema(kind: crate::schema::SchemaKind, v: &serde_json::Value) -> IoResult<()> {
+    crate::schema::validate_value(kind, v)
+}
+
+#[cfg(not(feature = "schemaval"))]
+#[inline]
+fn validate_schema(_: crate::schema::SchemaKind, _: &serde_json::Value) -> IoResult<()> {
+    Ok(())
+}
+
+/* ---------- digests (raw bytes) ---------- */
+
+/// Compute SHA-256 hex of a file’s **raw bytes** (preferred for input digests).
+fn sha256_of_file(path: &Path) -> IoResult<String> {
+    #[cfg(feature = "hash")]
+    {
+        crate::hasher::sha256_file(path)
+    }
+    #[cfg(not(feature = "hash"))]
+    {
+        Err(IoError::Hash("hash feature disabled".into()))
+    }
+}
+
+/* ---------- manifest: load + resolve (from manifest file path) ---------- */
+
+/// Load a manifest JSON and resolve all relative paths from the **manifest file’s directory**.
+pub fn load_manifest_and_resolve(manifest_path: &Path) -> IoResult<(Manifest, ResolvedPaths)> {
+    let manifest = crate::manifest::load_manifest(manifest_path)?;
+    let base = manifest_path
+        .parent()
+        .ok_or_else(|| IoError::Path(format!("manifest has no parent directory: {}", manifest_path.display())))?;
+
+    let resolved = crate::manifest::resolve_paths(base, &manifest)?;
+    // Strict offline posture (defense-in-depth; manifest loader already rejects common schemes)
+    ensure_offline_path(&resolved.reg)?;
+    ensure_offline_path(&resolved.params)?;
+    ensure_offline_path(&resolved.tally)?;
+    if let Some(adj) = &resolved.adjacency {
+        ensure_offline_path(adj)?;
+    }
+    Ok((manifest, resolved))
+}
+
+/* ---------- typed loaders (individual) ---------- */
+
+/// Load a DivisionRegistry from disk (schema-checked when enabled).
+#[cfg(feature = "serde")]
+pub fn load_registry(path: &Path) -> IoResult<DivisionRegistry> {
+    let v = read_json_value_bounded(path)?;
+    validate_schema(crate::schema::SchemaKind::DivisionRegistry, &v)?;
+    let reg: DivisionRegistry = serde_json::from_value(v)?;
+    Ok(reg)
+}
+
+#[cfg(not(feature = "serde"))]
+#[allow(unused_variables)]
+pub fn load_registry(_path: &Path) -> IoResult<DivisionRegistry> {
+    Err(IoError::Canon("serde feature disabled".into()))
+}
+
+/// Load a Params set from disk (schema-checked when enabled).
+#[cfg(feature = "serde")]
+pub fn load_params(path: &Path) -> IoResult<Params> {
+    let v = read_json_value_bounded(path)?;
+    validate_schema(crate::schema::SchemaKind::ParameterSet, &v)?;
+    let params: Params = serde_json::from_value(v)?;
+    Ok(params)
+}
+
+#[cfg(not(feature = "serde"))]
+#[allow(unused_variables)]
+pub fn load_params(_path: &Path) -> IoResult<Params> {
+    Err(IoError::Canon("serde feature disabled".into()))
+}
+
+/// Load a ballot tally from disk as raw JSON (schema-checked when enabled).
+/// NOTE: `vm_core` does not currently expose a `BallotTally` struct; callers may
+///       adapt the value or map it into their domain type later in the pipeline.
+#[cfg(feature = "serde")]
+pub fn load_tally_raw(path: &Path) -> IoResult<Value> {
+    let v = read_json_value_bounded(path)?;
+    validate_schema(crate::schema::SchemaKind::BallotTally, &v)?;
+    Ok(v)
+}
+
+#[cfg(not(feature = "serde"))]
+#[allow(unused_variables)]
+pub fn load_tally_raw(_path: &Path) -> IoResult<()> {
+    Err(IoError::Canon("serde feature disabled".into()))
+}
+
+/* ---------- digests for inputs (registry/params/tally[/adjacency]) ---------- */
+
+#[derive(Debug, Clone)]
+pub struct InputDigests {
+    pub reg_sha256: String,
+    pub params_sha256: String,
+    pub tally_sha256: String,
+    pub adjacency_sha256: Option<String>,
+}
+
+pub fn compute_input_digests(paths: &ResolvedPaths) -> IoResult<InputDigests> {
+    Ok(InputDigests {
+        reg_sha256: sha256_of_file(&paths.reg)?,
+        params_sha256: sha256_of_file(&paths.params)?,
+        tally_sha256: sha256_of_file(&paths.tally)?,
+        adjacency_sha256: match &paths.adjacency {
+            Some(p) => Some(sha256_of_file(p)?),
+            None => None,
+        },
+    })
+}
+
+//! crates/vm_io/src/loader.rs — Part 2/2 (fixed)
+//! Composition helpers (load_all), expectation checks, and bundle types.
+//!
+//! NOTE: Functions and types that carry raw JSON values are gated on `serde`.
+
+#![forbid(unsafe_code)]
+
+use std::path::Path;
+
+use crate::{IoError, IoResult};
+use crate::manifest::{Manifest, ResolvedPaths, verify_expectations};
+use super::{load_manifest_and_resolve, load_registry, load_params, load_tally_raw, compute_input_digests, InputDigests};
+
+use vm_core::{DivisionRegistry, Params};
+
+#[cfg(feature = "serde")]
+use serde_json::Value;
+
+/* ---------- loaded bundle types ---------- */
+
+#[cfg(feature = "serde")]
+#[derive(Debug)]
+pub struct LoadedInputs {
+    pub registry: DivisionRegistry,
+    pub params: Params,
+    /// Raw ballot tally JSON (typed mapping is pipeline-dependent)
+    pub tally: Value,
+}
+
+#[cfg(feature = "serde")]
+#[derive(Debug)]
+pub struct LoadedBundle {
+    pub manifest: Manifest,
+    pub paths: ResolvedPaths,
+    pub inputs: LoadedInputs,
+    pub digests: InputDigests,
+}
+
+/* ---------- composition ---------- */
+
+/// Load everything referenced by a manifest file:
+/// - parse + basic validation of the manifest
+/// - resolve relative paths from the manifest file's directory
+/// - strict offline checks on all resolved paths
+/// - schema-checked loads of registry/params/tally (when `schemaval` is on)
+/// - raw-byte SHA-256 digests for each input (and adjacency when present)
+/// - normalization of `Params` to stabilize FID (dedup/sort of order-sensitive lists)
+#[cfg(feature = "serde")]
+pub fn load_all(manifest_path: &Path) -> IoResult<LoadedBundle> {
+    let (manifest, paths) = load_manifest_and_resolve(manifest_path)?;
+
+    // Load each artifact with schema checks (feature-gated inside)
+    let registry = load_registry(&paths.reg)?;
+    let mut params = load_params(&paths.params)?;
+    let tally = load_tally_raw(&paths.tally)?;
+
+    // Normalize Params for FID stability (no-ops if already canonical)
+    params.normalize_for_fid();
+
+    // Raw-byte digests (match test-pack & Annex B)
+    let digests: InputDigests = compute_input_digests(&paths)?;
+
+    Ok(LoadedBundle {
+        manifest,
+        paths,
+        inputs: LoadedInputs { registry, params, tally },
+        digests,
+    })
+}
+
+#[cfg(not(feature = "serde"))]
+#[allow(unused_variables)]
+pub fn load_all(_manifest_path: &Path) -> IoResult<()> {
+    Err(IoError::Canon("serde feature disabled".into()))
+}
+
+/* ---------- expectations ---------- */
+
+/// Verify the optional `expect { formula_id, engine_version }` block from the manifest
+/// against the **actual** values computed/known by the caller (e.g., after FID calc).
+///
+/// Callers that don't have one or both values yet may pass `None` for that field.
+/// This function returns `Ok(()))` when there is no `expect` block.
+pub fn check_manifest_expectations(
+    manifest: &Manifest,
+    actual_formula_id: Option<&str>,
+    actual_engine_version: Option<&str>,
+) -> IoResult<()> {
+    verify_expectations(manifest, actual_formula_id, actual_engine_version)
+}
+
+/* ---------- convenience on the bundle ---------- */
+
+#[cfg(feature = "serde")]
+impl LoadedBundle {
+    /// Convenience to re-run expectation checks using the bundle's manifest.
+    pub fn assert_expectations(
+        &self,
+        actual_formula_id: Option<&str>,
+        actual_engine_version: Option<&str>,
+    ) -> IoResult<()> {
+        check_manifest_expectations(&self.manifest, actual_formula_id, actual_engine_version)
+    }
+}
