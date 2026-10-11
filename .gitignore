@@ -60,3 +60,4 @@ Desktop.ini
 #   fixtures/          (Annex B test data)
 #   crates/vm_app/ui/public/map/tiles/*.mbtiles (bundled tiles)
 # No patterns needed here since nothing above excludes them.
+/SmartSnap.pyw
